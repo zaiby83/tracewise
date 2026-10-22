@@ -2,9 +2,18 @@ import { SQSClient } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2 } from "aws-lambda";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const tenant = { tenant_id: "tenant-1", name: "Acme", status: "active", events_per_minute: 1000 };
-const tenants = vi.hoisted(() => ({ tenantForKey: vi.fn(), consumeQuota: vi.fn(), canWrite: (t: { scope?: string }) => (t.scope ?? "write") === "write" }));
+const tenants = vi.hoisted(() => ({
+	tenantForKey: vi.fn(),
+	consumeQuota: vi.fn(),
+	canWrite: (t: { scope?: string }) => (t.scope ?? "write") === "write",
+	secondsUntilUtcMidnight: () => 3600,
+}));
 vi.mock("../services/shared/tenants", () => tenants);
+const accounts = vi.hoisted(() => ({ touchKey: vi.fn() }));
+vi.mock("../services/shared/accounts", () => accounts);
+
+const { FREE_LIMITS } = await vi.importActual<typeof import("../services/shared/accounts")>("../services/shared/accounts");
+const tenant = { tenant_id: "tenant-1", org_id: "tenant-1", key_id: "k1", name: "Acme", status: "active", limits: FREE_LIMITS, rubric: null, evals_enabled: true };
 
 const { handler } = await import("../services/ingest/handler");
 const KEY = `tw_${"a".repeat(43)}`;
@@ -17,7 +26,7 @@ describe("ingest handler", () => {
 	let send: ReturnType<typeof vi.spyOn>;
 	beforeEach(() => {
 		tenants.tenantForKey.mockResolvedValue(tenant);
-		tenants.consumeQuota.mockResolvedValue(true);
+		tenants.consumeQuota.mockResolvedValue("ok");
 		send = vi.spyOn(SQSClient.prototype, "send").mockResolvedValue({ Failed: [] } as never);
 	});
 
@@ -43,11 +52,21 @@ describe("ingest handler", () => {
 		expect(send).not.toHaveBeenCalled();
 	});
 
-	it("returns 429 when the tenant is over quota", async () => {
-		tenants.consumeQuota.mockResolvedValue(false);
+	it.each([["minute", "60"], ["day", expect.stringMatching(/^\d+$/)]])("returns 429 naming the %s limit", async (limit, retry) => {
+		tenants.consumeQuota.mockResolvedValue(limit);
 		const res = await handler(request({ events: [event()] }));
 		expect(res.statusCode).toBe(429);
+		expect(res.headers).toMatchObject({ "x-tracewise-limit": limit, "retry-after": retry });
 		expect(send).not.toHaveBeenCalled();
+	});
+
+	it("stamps the key's last use after authenticating, and skips legacy tenants without a key id", async () => {
+		await handler(request({ events: [event()] }));
+		expect(accounts.touchKey).toHaveBeenCalledWith("tenant-1", "k1");
+		accounts.touchKey.mockClear();
+		tenants.tenantForKey.mockResolvedValue({ ...tenant, key_id: undefined });
+		await handler(request({ events: [event()] }));
+		expect(accounts.touchKey).not.toHaveBeenCalled();
 	});
 
 	it("retries partially failed SQS entries once, then asks the client to retry", async () => {

@@ -1,9 +1,10 @@
 import { SendMessageBatchCommand, SQSClient, type SendMessageBatchRequestEntry } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
+import { touchKey } from "../shared/accounts";
 import { json, log } from "../shared/http";
 import { bearerToken } from "../shared/keys";
 import { IngestRequest, validateEvents, type QueuedEvent } from "../shared/schema";
-import { canWrite, consumeQuota, tenantForKey } from "../shared/tenants";
+import { canWrite, consumeQuota, secondsUntilUtcMidnight, tenantForKey } from "../shared/tenants";
 
 const sqs = new SQSClient({});
 const SQS_BATCH = 10; // SendMessageBatch's maximum
@@ -17,6 +18,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	if (!key) return json(401, { error: "missing or malformed API key" });
 	const tenant = await tenantForKey(key);
 	if (!tenant) return json(401, { error: "invalid API key" });
+	if (tenant.key_id) touchKey(tenant.org_id, tenant.key_id);
 	if (!canWrite(tenant)) return json(403, { error: "this key is read-only" });
 
 	let body: unknown;
@@ -31,9 +33,13 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const { valid, rejected } = validateEvents(request.data.events);
 	if (valid.length === 0) return json(400, { error: "no valid events", rejected });
 
-	if (!(await consumeQuota(tenant, valid.length))) {
-		log("warn", "quota exceeded", { tenant_id: tenant.tenant_id, events: valid.length });
-		return json(429, { error: "events-per-minute quota exceeded" }, { "retry-after": "60" });
+	const quota = await consumeQuota(tenant, valid.length);
+	if (quota !== "ok") {
+		log("warn", "quota exceeded", { tenant_id: tenant.tenant_id, events: valid.length, limit: quota });
+		if (quota === "day") {
+			return json(429, { error: "daily event cap reached" }, { "retry-after": String(secondsUntilUtcMidnight()), "x-tracewise-limit": "day" });
+		}
+		return json(429, { error: "events-per-minute quota exceeded" }, { "retry-after": "60", "x-tracewise-limit": "minute" });
 	}
 
 	const received_at = new Date().toISOString();
