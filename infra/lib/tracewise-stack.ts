@@ -6,6 +6,7 @@ import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations
 import { Alarm, ComparisonOperator, TreatMissingData } from "aws-cdk-lib/aws-cloudwatch";
 import { SnsAction } from "aws-cdk-lib/aws-cloudwatch-actions";
 import { AttributeType, Billing, TableEncryptionV2, TableV2 } from "aws-cdk-lib/aws-dynamodb";
+import { PolicyStatement } from "aws-cdk-lib/aws-iam";
 import { Architecture, Runtime, Tracing } from "aws-cdk-lib/aws-lambda";
 import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 import { NodejsFunction, OutputFormat, type NodejsFunctionProps } from "aws-cdk-lib/aws-lambda-nodejs";
@@ -115,19 +116,31 @@ export class TracewiseStack extends Stack {
 				...extra,
 			});
 
+		// Every function that accepts an API key stamps the key's last_used_at (touchKey). The
+		// condition limits that UpdateItem to the key attributes and last_used_at, so none of
+		// them can change a profile, member or key otherwise.
+		const grantTouchKey = (f: NodejsFunction) =>
+			f.addToRolePolicy(
+				new PolicyStatement({
+					actions: ["dynamodb:UpdateItem"],
+					resources: [accountsTable.tableArn],
+					conditions: { "ForAllValues:StringEquals": { "dynamodb:Attributes": ["pk", "sk", "last_used_at"] } },
+				}),
+			);
+
 		const ingest = fn("Ingest", "ingest/handler.ts", { timeout: Duration.seconds(10) });
 		ingest.addEnvironment("QUEUE_URL", queue.queueUrl);
 		ingest.addEnvironment("TENANTS_TABLE", tenants.tableName);
 		ingest.addEnvironment("QUOTAS_TABLE", quotas.tableName);
 		ingest.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
 		// Least privilege: ingest can enqueue, read tenants and update quota counters. It
-		// cannot read or write traces. It reads keys and org profiles from Accounts; its
-		// one write there stamps a key's last_used_at.
+		// cannot read or write traces. It reads keys and org profiles from Accounts, and
+		// writes there only to stamp a key's last_used_at.
 		queue.grantSendMessages(ingest);
 		tenants.grantReadData(ingest);
 		quotas.grantReadWriteData(ingest);
 		accountsTable.grantReadData(ingest);
-		accountsTable.grant(ingest, "dynamodb:UpdateItem");
+		grantTouchKey(ingest);
 
 		const analytics = new Analytics(this, "Analytics");
 
@@ -155,6 +168,7 @@ export class TracewiseStack extends Stack {
 		traces.grantReadData(query);
 		tenants.grantReadData(query);
 		accountsTable.grantReadData(query); // membership checks and org profiles
+		grantTouchKey(query);
 
 		const summary = fn("Summary", "analytics/handler.ts", { timeout: Duration.seconds(29) });
 		summary.addEnvironment("TENANTS_TABLE", tenants.tableName);
@@ -164,6 +178,7 @@ export class TracewiseStack extends Stack {
 		summary.addEnvironment("GLUE_DATABASE", analytics.database);
 		tenants.grantReadData(summary);
 		accountsTable.grantReadData(summary);
+		grantTouchKey(summary);
 		// The only write: the per-org daily query counter (analytics_queries_per_day).
 		quotas.grant(summary, "dynamodb:UpdateItem");
 		analytics.grantQuery(summary);
@@ -186,6 +201,7 @@ export class TracewiseStack extends Stack {
 		tenants.grantReadData(evalsApi);
 		evals.table.grantReadData(evalsApi);
 		accountsTable.grantReadData(evalsApi);
+		grantTouchKey(evalsApi);
 		// The workflow lists orgs from their profiles (legacy key rows too, until migrated),
 		// and the sample step loads each org's rubric and records the night's sample count,
 		// which the console's usage route reads.

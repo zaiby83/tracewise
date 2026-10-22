@@ -12,6 +12,9 @@ beforeAll(() => {
 	template = Template.fromStack(new TracewiseStack(app, "Test", { alarmEmail: "alerts@example.com" }));
 }, 120_000);
 
+// The only Accounts write the data-plane functions get: touchKey's last_used_at stamp.
+const TOUCH_KEY_CONDITION = { "ForAllValues:StringEquals": { "dynamodb:Attributes": ["pk", "sk", "last_used_at"] } };
+
 // The IAM policies attached to the roles whose logical IDs match.
 const policiesFor = (re: RegExp) =>
 	Object.values(template.findResources("AWS::IAM::Policy")).filter((p) => re.test(JSON.stringify(p.Properties.Roles)));
@@ -125,14 +128,29 @@ describe("TracewiseStack", () => {
 		});
 	});
 
+	it("lets the API-key functions write Accounts only to stamp a key's last_used_at", () => {
+		for (const re of [/IngestServiceRole/, /QueryServiceRole/, /SummaryServiceRole/, /EvalsApiServiceRole/]) {
+			const statements = policiesFor(re).flatMap((p) => p.Properties.PolicyDocument.Statement as { Action: unknown; Resource: unknown }[]);
+			const accountWrites = statements.filter(
+				(st) => /Accounts/.test(JSON.stringify(st.Resource)) && /dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/.test(JSON.stringify(st.Action)),
+			);
+			expect(accountWrites, String(re)).toEqual([expect.objectContaining({ Action: "dynamodb:UpdateItem", Condition: TOUCH_KEY_CONDITION })]);
+		}
+	});
+
 	it("gives the analytics function read-only access to data, writing only its query counter", () => {
 		const statements = policiesFor(/SummaryServiceRole/).flatMap((p) => p.Properties.PolicyDocument.Statement as { Action: unknown; Resource: unknown }[]);
 		const writes = statements.filter((st) => /dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/.test(JSON.stringify(st.Action)));
-		// analytics_queries_per_day is counted in the Quotas table.
-		expect(writes).toHaveLength(1);
-		expect(writes[0]!.Action).toBe("dynamodb:UpdateItem");
-		expect(JSON.stringify(writes[0]!.Resource)).toMatch(/Quotas/);
-		expect(JSON.stringify(writes[0]!.Resource)).not.toMatch(/Traces|Accounts|Tenants/);
+		// analytics_queries_per_day is counted in the Quotas table, and an API key's
+		// last_used_at is stamped in Accounts. Nothing else.
+		expect(writes).toHaveLength(2);
+		for (const w of writes) expect(w.Action).toBe("dynamodb:UpdateItem");
+		const quota = writes.filter((w) => /Quotas/.test(JSON.stringify(w.Resource)));
+		expect(quota).toHaveLength(1);
+		expect(JSON.stringify(quota[0]!.Resource)).not.toMatch(/Traces|Accounts|Tenants/);
+		const stamp = writes.filter((w) => /Accounts/.test(JSON.stringify(w.Resource)));
+		expect(stamp).toHaveLength(1);
+		expect(stamp[0]).toMatchObject({ Condition: TOUCH_KEY_CONDITION });
 		const doc = JSON.stringify(statements);
 		expect(doc).not.toMatch(/glue:(Create|Update|Delete)/);
 		expect(doc).not.toMatch(/firehose:/);
