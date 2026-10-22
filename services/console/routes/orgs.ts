@@ -1,7 +1,7 @@
 import { CloudWatchClient, PutMetricDataCommand } from "@aws-sdk/client-cloudwatch";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { z } from "zod";
-import { GLOBAL_ORGS_PER_DAY, MAX_OWNED_ORGS, listUserOrgs } from "../../shared/accounts";
+import { GLOBAL_ORGS_PER_DAY, MAX_OWNED_ORGS, getProfile, listUserOrgs } from "../../shared/accounts";
 import { json, log } from "../../shared/http";
 import { consumeCounter, counterIds } from "../../shared/tenants";
 import type { Ctx, RouteTable } from "../handler";
@@ -50,7 +50,13 @@ async function create(ctx: Ctx) {
 export const orgRoutes: RouteTable = {
 	"GET /v1/orgs": {
 		access: "user",
-		run: async (ctx) => json(200, { orgs: await listUserOrgs(ctx.claims.sub) }),
+		run: async (ctx) => {
+			// Membership rows outlive an org's deletion until the deleter's last phase, so the profile
+			// decides: an org that is deleting, deleted or missing is not listed.
+			const rows = await listUserOrgs(ctx.claims.sub);
+			const profiles = await Promise.all(rows.map((r) => getProfile(r.org_id)));
+			return json(200, { orgs: rows.filter((_, i) => profiles[i]?.status === "active") });
+		},
 	},
 	"POST /v1/orgs": { access: "user", verified: true, run: create },
 	"GET /v1/orgs/{orgId}": {

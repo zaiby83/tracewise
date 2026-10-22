@@ -124,6 +124,15 @@ describe("orgs", () => {
 		expect(parse(res)).toEqual({ orgs: [{ org_id: "o1", name: "Acme", role: "owner" }] });
 		expect(accounts.listUserOrgs).toHaveBeenCalledWith("u1");
 	});
+	it("leaves out orgs that are being deleted or have no profile", async () => {
+		accounts.listUserOrgs.mockResolvedValue([
+			{ org_id: "o1", name: "Acme", role: "owner" },
+			{ org_id: "o2", name: "Going", role: "owner" },
+			{ org_id: "o3", name: "Gone", role: "member" },
+		]);
+		accounts.getProfile.mockImplementation(async (id: string) => (id === "o1" ? { ...profile } : id === "o2" ? { ...profile, org_id: "o2", status: "deleting" } : null));
+		expect(parse(await call("GET /v1/orgs"))).toEqual({ orgs: [{ org_id: "o1", name: "Acme", role: "owner" }] });
+	});
 	it("returns the profile with the caller's role and the default rubric, without table keys", async () => {
 		const res = await call("GET /v1/orgs/{orgId}", { params: { orgId: "o1" } });
 		const body = parse(res);
