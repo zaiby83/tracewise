@@ -168,7 +168,7 @@ describe("deleter: s3 phases", () => {
 		// Delivered 15 minutes later, after midnight: the window is still the original anchor's.
 		const next = await runPhase({ org_id: "o1", phase: "sweep", cursor: { anchor: "2026-10-22" } }, Date.parse("2026-10-23T00:05:00Z"));
 		expect(next).toEqual({ org_id: "o1", phase: "accounts" });
-		const pks = sent(QueryCommand).map((q) => q.input.ExpressionAttributeValues![":pk"]);
+		const pks = sent(QueryCommand).filter((q) => q.input.TableName === "traces").map((q) => q.input.ExpressionAttributeValues![":pk"]);
 		expect(pks).toHaveLength(30);
 		expect(new Set(pks.map((p) => String(p).split("#")[1]))).toEqual(new Set(["2026-10-23", "2026-10-22", "2026-10-21"]));
 		expect(sent(BatchWriteCommand)[0]!.input.RequestItems).toEqual({ traces: [{ DeleteRequest: { Key: { pk: "o1#2026-10-22#3", sk: "late" } } }] });
@@ -187,6 +187,40 @@ describe("deleter: s3 phases", () => {
 		await runPhase({ org_id: "o1", phase: "sweep", cursor: { anchor: "2026-10-22", token: "t1" } }, now);
 		expect(sent(QueryCommand)).toHaveLength(0);
 		expect(s3Sent(ListObjectsV2Command)[0]!.input).toMatchObject({ ContinuationToken: "t1" });
+	});
+	it("sweep re-deletes the org's eval runs, catching a run recorded after the evals phase", async () => {
+		ddbImpl(async (c) =>
+			c instanceof QueryCommand ? { Items: c.input.TableName === "evals" ? [{ tenant_id: "o1", run_at: "late" }] : [] } : { UnprocessedItems: {} },
+		);
+		s3Send.mockResolvedValue({ Contents: [], IsTruncated: false } as never);
+		const next = await runPhase({ org_id: "o1", phase: "sweep", cursor: { anchor: "2026-10-22" } }, now);
+		expect(next).toEqual({ org_id: "o1", phase: "accounts" });
+		const evalQueries = sent(QueryCommand).filter((q) => q.input.TableName === "evals");
+		expect(evalQueries).toHaveLength(1);
+		expect(evalQueries[0]!.input).toMatchObject({ ExpressionAttributeValues: { ":t": "o1" }, ConsistentRead: true });
+		expect(sent(BatchWriteCommand).map((c) => c.input.RequestItems)).toEqual([{ evals: [{ DeleteRequest: { Key: { tenant_id: "o1", run_at: "late" } } }] }]);
+		expect(s3Sent(ListObjectsV2Command)).toHaveLength(1);
+	});
+	it("sweep's eval-run pass is bounded, resumes from its own cursor, and skips the trace pass", async () => {
+		ddbImpl(async (c) =>
+			c instanceof QueryCommand
+				? c.input.TableName === "evals"
+					? { Items: Array.from({ length: 100 }, (_, i) => ({ tenant_id: "o1", run_at: String(i) })), LastEvaluatedKey: { tenant_id: "o1", run_at: "99" } }
+					: { Items: [] }
+				: { UnprocessedItems: {} },
+		);
+		const next = await runPhase({ org_id: "o1", phase: "sweep", cursor: { anchor: "2026-10-22" } }, now);
+		expect(next).toEqual({ org_id: "o1", phase: "sweep", cursor: { anchor: "2026-10-22", step: "evals", lastKey: { tenant_id: "o1", run_at: "99" } } });
+		expect(sent(BatchWriteCommand)).toHaveLength(20);
+		expect(s3Send).not.toHaveBeenCalled();
+
+		ddb.send.mockClear();
+		ddbImpl(async (c) => (c instanceof QueryCommand ? { Items: [] } : { UnprocessedItems: {} }));
+		s3Send.mockResolvedValue({ Contents: [], IsTruncated: false } as never);
+		expect(await runPhase(next!, now)).toEqual({ org_id: "o1", phase: "accounts" });
+		const queries = sent(QueryCommand);
+		expect(queries.map((q) => q.input.TableName)).toEqual(["evals"]);
+		expect(queries[0]!.input.ExclusiveStartKey).toEqual({ tenant_id: "o1", run_at: "99" });
 	});
 	it("schedules the sweep 15 minutes after the first S3 pass", async () => {
 		s3Send.mockResolvedValue({ Contents: [], IsTruncated: false } as never);

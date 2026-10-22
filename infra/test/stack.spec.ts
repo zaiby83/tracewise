@@ -179,6 +179,17 @@ describe("TracewiseStack", () => {
 		expect(states.EachTenant.ResultPath).toBeNull();
 	});
 
+	it("lets the record step read org profiles, so it skips orgs that stopped being active", () => {
+		const fns = Object.entries(template.findResources("AWS::Lambda::Function")).filter(([id]) => /EvalRecord/.test(id));
+		expect(fns).toHaveLength(1);
+		const accountsRef = fns[0]![1].Properties.Environment.Variables.ACCOUNTS_TABLE;
+		expect(JSON.stringify(accountsRef)).toMatch(/Accounts/);
+		const statements = policiesFor(/EvalRecordServiceRole/).flatMap((p) => p.Properties.PolicyDocument.Statement as { Action: unknown; Resource: unknown }[]);
+		const accounts = statements.filter((st) => /Accounts/.test(JSON.stringify(st.Resource)));
+		expect(JSON.stringify(accounts)).toContain("dynamodb:GetItem");
+		expect(JSON.stringify(accounts)).not.toMatch(/dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/);
+	});
+
 	it("scopes the judge to one Bedrock model and metrics to one namespace", () => {
 		const policies = JSON.stringify(template.findResources("AWS::IAM::Policy"));
 		expect(policies).toContain("inference-profile/us.amazon.nova-pro-v1:0");

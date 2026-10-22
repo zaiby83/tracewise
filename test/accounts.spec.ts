@@ -4,7 +4,7 @@ const ddb = vi.hoisted(() => ({ send: vi.fn() }));
 vi.mock("../services/shared/ddb", () => ({ ddb }));
 process.env.ACCOUNTS_TABLE = "accounts";
 
-const { FREE_LIMITS, getProfile, legacyLimits, listActiveProfiles, listUserOrgs, normalizeEmail, touchKey } =
+const { FREE_LIMITS, getProfile, legacyLimits, listActiveProfiles, listProfiles, listUserOrgs, normalizeEmail, touchKey } =
 	await import("../services/shared/accounts");
 
 describe("accounts", () => {
@@ -31,6 +31,15 @@ describe("accounts", () => {
 			.mockResolvedValueOnce({ Items: [{ sk: "PROFILE", org_id: "a", status: "active" }], LastEvaluatedKey: { pk: "x" } })
 			.mockResolvedValueOnce({ Items: [{ sk: "PROFILE", org_id: "b", status: "deleting" }] });
 		expect((await listActiveProfiles()).map((p) => p.org_id)).toEqual(["a"]);
+	});
+	it("listProfiles pages through every profile, whatever its status", async () => {
+		ddb.send
+			.mockReset()
+			.mockResolvedValueOnce({ Items: [{ sk: "PROFILE", org_id: "a", status: "active" }, { sk: "MEMBER#u", org_id: "a" }], LastEvaluatedKey: { pk: "x" } })
+			.mockResolvedValueOnce({ Items: [{ sk: "PROFILE", org_id: "b", status: "deleting" }] });
+		expect((await listProfiles()).map((p) => p.org_id)).toEqual(["a", "b"]);
+		expect(ddb.send.mock.calls[0]![0].input).toMatchObject({ FilterExpression: "sk = :p", ExpressionAttributeValues: { ":p": "PROFILE" } });
+		expect(ddb.send.mock.calls[1]![0].input.ExclusiveStartKey).toEqual({ pk: "x" });
 	});
 	it("touchKey writes at most once an hour per key, without throwing", async () => {
 		ddb.send.mockReset().mockRejectedValue(new Error("boom"));

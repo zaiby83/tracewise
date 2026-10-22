@@ -204,9 +204,12 @@ export class TracewiseStack extends Stack {
 		grantTouchKey(evalsApi);
 		// The workflow lists orgs from their profiles (legacy key rows too, until migrated),
 		// and the sample step loads each org's rubric and records the night's sample count,
-		// which the console's usage route reads.
+		// which the console's usage route reads. Sample and record both re-check the org is
+		// still active, since a deletion can start while the run is under way.
 		evals.listFn.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
 		accountsTable.grantReadData(evals.listFn);
+		evals.recordFn.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
+		accountsTable.grantReadData(evals.recordFn);
 		evals.sampleFn.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
 		evals.sampleFn.addEnvironment("QUOTAS_TABLE", quotas.tableName);
 		accountsTable.grantReadData(evals.sampleFn);

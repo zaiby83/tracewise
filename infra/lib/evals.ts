@@ -40,6 +40,7 @@ export class Evals extends Construct {
 	// Exposed so the stack can grant them the accounts and quota tables it owns.
 	readonly listFn: NodejsFunction;
 	readonly sampleFn: NodejsFunction;
+	readonly recordFn: NodejsFunction;
 
 	constructor(scope: Construct, id: string, props: EvalsProps) {
 		super(scope, id);
@@ -61,6 +62,7 @@ export class Evals extends Construct {
 		const record = props.fn("EvalRecord", entry, { handler: "record", timeout: Duration.seconds(30) });
 		this.listFn = list;
 		this.sampleFn = sample;
+		this.recordFn = record;
 
 		props.tenants.grantReadData(list);
 		props.traces.grantReadData(sample);

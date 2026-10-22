@@ -139,20 +139,31 @@ export async function listUserOrgs(sub: string): Promise<{ org_id: string; name:
 // A scan is fine here: the nightly jobs read it once, and profiles are a small slice of
 // the table. Suspended, deleting and deleted orgs are skipped.
 export async function listActiveProfiles(): Promise<OrgProfile[]> {
+	return scanProfiles(true);
+}
+
+// Every profile, whatever its status: the nightly list uses it to recognise an org's old-shape
+// key rows, so a deleting or suspended org isn't picked up again through them.
+export async function listProfiles(): Promise<OrgProfile[]> {
+	return scanProfiles(false);
+}
+
+async function scanProfiles(activeOnly: boolean): Promise<OrgProfile[]> {
 	const profiles: OrgProfile[] = [];
 	let startKey: Record<string, unknown> | undefined;
 	do {
 		const page = await ddb.send(
 			new ScanCommand({
 				TableName: process.env.ACCOUNTS_TABLE,
-				FilterExpression: "sk = :p AND #s = :active",
-				ExpressionAttributeNames: { "#s": "status" },
-				ExpressionAttributeValues: { ":p": "PROFILE", ":active": "active" },
+				FilterExpression: activeOnly ? "sk = :p AND #s = :active" : "sk = :p",
+				...(activeOnly
+					? { ExpressionAttributeNames: { "#s": "status" }, ExpressionAttributeValues: { ":p": "PROFILE", ":active": "active" } }
+					: { ExpressionAttributeValues: { ":p": "PROFILE" } }),
 				ExclusiveStartKey: startKey,
 			}),
 		);
 		// The filter already applies server-side; checking again keeps the contract local.
-		for (const item of page.Items ?? []) if (item.sk === "PROFILE" && item.status === "active") profiles.push(item as OrgProfile);
+		for (const item of page.Items ?? []) if (item.sk === "PROFILE" && (!activeOnly || item.status === "active")) profiles.push(item as OrgProfile);
 		startKey = page.LastEvaluatedKey;
 	} while (startKey);
 	return profiles;

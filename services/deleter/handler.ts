@@ -15,9 +15,10 @@ export interface DeletionMessage {
 	// anchor: the UTC date (YYYY-MM-DD) the first message ran on, carried through every phase
 	// so day offsets mean the same thing however late a message is delivered.
 	// dynamo and sweep: day (an offset back from the anchor, -1 being the day after) and shard
-	// to resume at, plus the query's lastKey. evals: lastKey. s3 and sweep: the ListObjectsV2
-	// continuation token (in sweep, its presence means the trace pass is already done).
-	cursor?: { anchor?: string; day?: number; shard?: number; lastKey?: Record<string, unknown>; token?: string };
+	// to resume at, plus the query's lastKey. evals: lastKey. sweep: step "evals" once its trace
+	// pass is done and the eval-run pass is resuming from lastKey. s3 and sweep: the ListObjectsV2
+	// continuation token (in sweep, its presence means the trace and eval-run passes are done).
+	cursor?: { anchor?: string; day?: number; shard?: number; lastKey?: Record<string, unknown>; token?: string; step?: "evals" };
 }
 
 const PHASES: readonly string[] = ["dynamo", "evals", "s3", "sweep", "accounts"];
@@ -62,13 +63,30 @@ export async function runPhase(msg: DeletionMessage, now = Date.now()): Promise<
 		case "dynamo":
 			return deleteTraces(msg, anchor, TRACE_DAYS, { org_id: msg.org_id, phase: "evals", cursor: { anchor } });
 		case "evals":
-			return deleteEvalRuns(msg, anchor);
+			return deleteEvalRuns(msg.org_id, msg.cursor?.lastKey, (lastKey) => ({ org_id: msg.org_id, phase: "evals", cursor: { anchor, lastKey } }), {
+				org_id: msg.org_id,
+				phase: "s3",
+				cursor: { anchor },
+			});
 		case "s3":
 			return deleteLakeObjects(msg, { org_id: msg.org_id, phase: "sweep", cursor: { anchor } });
 		case "sweep": {
 			// Records the processor or Firehose was still holding when the earlier passes ran.
 			if (msg.cursor?.token === undefined) {
-				const more = await deleteTraces(msg, anchor, SWEEP_DAYS, null);
+				const inEvals = msg.cursor?.step === "evals";
+				if (!inEvals) {
+					const more = await deleteTraces(msg, anchor, SWEEP_DAYS, null);
+					if (more) return more;
+				}
+				// The record step checks the org is active before writing, but a run that passed that
+				// check just before deletion started can land after the evals phase. Its write
+				// follows the check within seconds, well inside the sweep's 15-minute delay.
+				const more = await deleteEvalRuns(
+					msg.org_id,
+					inEvals ? msg.cursor?.lastKey : undefined,
+					(lastKey) => ({ org_id: msg.org_id, phase: "sweep", cursor: { anchor, step: "evals", lastKey } }),
+					null,
+				);
 				if (more) return more;
 			}
 			return deleteLakeObjects(msg, { org_id: msg.org_id, phase: "accounts" });
@@ -171,19 +189,25 @@ async function deleteTraces(msg: DeletionMessage, anchor: string, days: number[]
 	return done;
 }
 
-// evals phase: the org's runs share one partition (tenant_id), keyed by run_at.
-async function deleteEvalRuns(msg: DeletionMessage, anchor: string): Promise<DeletionMessage> {
+// evals phase, and again in the sweep: the org's runs share one partition (tenant_id), keyed
+// by run_at. Returns resume(lastKey) when the budget runs out, otherwise `done`.
+async function deleteEvalRuns(
+	orgId: string,
+	startKey: Record<string, unknown> | undefined,
+	resume: (lastKey: Record<string, unknown> | undefined) => DeletionMessage,
+	done: DeletionMessage | null,
+): Promise<DeletionMessage | null> {
 	const table = process.env.EVALS_TABLE!;
-	let lastKey = msg.cursor?.lastKey;
+	let lastKey = startKey;
 	const budget = { batches: BATCHES_PER_RUN };
 	do {
-		if (budget.batches <= 0) return { org_id: msg.org_id, phase: "evals", cursor: { anchor, lastKey } };
+		if (budget.batches <= 0) return resume(lastKey);
 		const page = await ddb.send(
 			new QueryCommand({
 				TableName: table,
 				KeyConditionExpression: "tenant_id = :t",
 				ProjectionExpression: "tenant_id, run_at",
-				ExpressionAttributeValues: { ":t": msg.org_id },
+				ExpressionAttributeValues: { ":t": orgId },
 				ExclusiveStartKey: lastKey,
 				Limit: budget.batches * DDB_BATCH,
 				ConsistentRead: true,
@@ -195,7 +219,7 @@ async function deleteEvalRuns(msg: DeletionMessage, anchor: string): Promise<Del
 		);
 		lastKey = page.LastEvaluatedKey;
 	} while (lastKey);
-	return { org_id: msg.org_id, phase: "s3", cursor: { anchor } };
+	return done;
 }
 
 // s3 and sweep phases: the same pass over traces/tenant_id=<org>/. The trailing slash

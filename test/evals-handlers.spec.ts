@@ -1,4 +1,5 @@
 import { CloudWatchClient, PutMetricDataCommand } from "@aws-sdk/client-cloudwatch";
+import { SNSClient } from "@aws-sdk/client-sns";
 import { GetCommand, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FREE_LIMITS } from "../services/shared/accounts";
@@ -17,6 +18,7 @@ Object.assign(process.env, {
 const { listTenants, sample, record } = await import("../services/evals/handlers");
 
 const cwSend = vi.spyOn(CloudWatchClient.prototype, "send");
+const snsSend = vi.spyOn(SNSClient.prototype, "send");
 const sent = <T>(ctor: new (...a: never[]) => T) => ddb.send.mock.calls.map((c) => c[0]).filter((c) => c instanceof ctor) as T[];
 const metric = () => cwSend.mock.calls.map((c) => c[0]).find((c) => c instanceof PutMetricDataCommand)?.input;
 
@@ -42,6 +44,7 @@ const scans = (accounts: unknown[], keys: unknown[] = []) =>
 beforeEach(() => {
 	ddb.send.mockReset();
 	cwSend.mockReset().mockResolvedValue({} as never);
+	snsSend.mockReset().mockResolvedValue({} as never);
 });
 afterEach(() => vi.useRealTimers());
 
@@ -78,6 +81,23 @@ describe("listTenants", () => {
 		);
 		const { tenants } = await listTenants({ day: "2026-10-21" });
 		expect(tenants.map((t) => t.tenant_id)).toEqual(["a", "t"]);
+	});
+
+	it("never evaluates an old key row of an org whose profile isn't active", async () => {
+		scans(
+			[profile("del", { status: "deleting" }), profile("gone", { status: "deleted" }), profile("sus", { status: "suspended" }), profile("a")],
+			[
+				{ tenant_id: "del", name: "Del", status: "active", events_per_minute: 600 },
+				{ tenant_id: "gone", name: "Gone", status: "active", events_per_minute: 600 },
+				{ tenant_id: "sus", name: "Sus", status: "active", events_per_minute: 600 },
+				{ tenant_id: "t", name: "Old", status: "active", events_per_minute: 600 },
+			],
+		);
+		const { tenants } = await listTenants({ day: "2026-10-21" });
+		expect(tenants.map((t) => t.tenant_id)).toEqual(["a", "t"]);
+		// Every profile is read, whatever its status, so the old rows above can be recognised.
+		const accountsScan = sent(ScanCommand).find((c) => c.input.TableName === "accounts")!;
+		expect(JSON.stringify(accountsScan.input)).not.toContain("active");
 	});
 
 	it("splits 2,000 judge calls across orgs and reports the cap", async () => {
@@ -144,6 +164,18 @@ describe("sample", () => {
 		expect(out.rubric).toBe("legacy");
 	});
 
+	for (const status of ["deleting", "deleted", "suspended"]) {
+		it(`grades nothing for a ${status} org, so the run ends at NothingToGrade`, async () => {
+			ddb.send.mockImplementation(async (c) =>
+				c instanceof QueryCommand ? { Items: [{ pk: "p", sk: "1" }] } : c instanceof GetCommand ? { Item: profile("a", { status, rubric: "r" }) } : {},
+			);
+			const ref = { tenant_id: "a", name: "A", rubric: null, day: "2026-10-21", sample_budget: 5, sample_limit: 20 };
+			expect(await sample(ref)).toEqual({ ...ref, rubric: null, keys: [] });
+			expect(sent(QueryCommand)).toHaveLength(0);
+			expect(sent(PutCommand)).toHaveLength(0);
+		});
+	}
+
 	it("records how many it actually took when fewer traces exist", async () => {
 		ddb.send.mockImplementation(async (c) => (c instanceof QueryCommand ? { Items: [{ pk: "p", sk: "1" }] } : {}));
 		const out = await sample({ tenant_id: "a", name: "A", rubric: null, day: "2026-10-21", sample_budget: 13, sample_limit: 20 });
@@ -153,6 +185,24 @@ describe("sample", () => {
 });
 
 describe("record", () => {
+	const graded = [{ key: { pk: "p", sk: "1" }, event_id: "e1", route: "r", scores: { overall: 1, safety: 1, reason: "bad" } }];
+	for (const status of ["deleting", "deleted", "suspended"]) {
+		it(`writes, publishes and alerts nothing for a ${status} org`, async () => {
+			const info = vi.spyOn(console, "info").mockImplementation(() => {});
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			ddb.send.mockImplementation(async (c) => (c instanceof GetCommand ? { Item: profile("a", { status }) } : { Items: [] }));
+			await record({ tenant_id: "a", name: "A", rubric: null, day: "2026-10-21", sample_budget: 5, sample_limit: 20, results: graded as never });
+			expect(sent(GetCommand)[0]!.input).toMatchObject({ TableName: "accounts", Key: { pk: "ORG#a", sk: "PROFILE" } });
+			expect(sent(PutCommand)).toHaveLength(0);
+			expect(sent(QueryCommand)).toHaveLength(0);
+			expect(cwSend).not.toHaveBeenCalled();
+			expect(snsSend).not.toHaveBeenCalled();
+			expect([...info.mock.calls, ...warn.mock.calls].map((c) => String(c[0])).some((l) => l.includes("not active"))).toBe(true);
+			info.mockRestore();
+			warn.mockRestore();
+		});
+	}
+
 	it("records the shortfall on the run", async () => {
 		ddb.send.mockImplementation(async (c) => (c instanceof QueryCommand ? { Items: [] } : {}));
 		await record({ tenant_id: "a", name: "A", rubric: null, day: "2026-10-21", sample_budget: 13, sample_limit: 20, results: [] });
