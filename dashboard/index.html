@@ -9,85 +9,116 @@
 <link rel="stylesheet" href="app.css">
 <script type="module" src="app.js"></script>
 </head>
-<body>
-<header class="top">
-	<div class="brand">
-		<span class="logo" aria-hidden="true"></span>
-		<span class="name">Tracewise</span>
-	</div>
-	<div class="who">
-		<span id="tenant-name" class="tenant">Loading…</span>
-		<span id="mode-badge" class="badge" hidden></span>
-		<button id="key-button" class="ghost" type="button">Use your own key</button>
+<body class="first-load">
+<header class="bar">
+	<div class="bar-inner">
+		<a class="brand" href="./" aria-label="Tracewise home">
+			<svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M7 20l5-6 4 4 6-8 3 3"/></svg>
+			<span>Tracewise</span>
+		</a>
+		<div class="bar-right">
+			<span class="who"><span id="tenant-name" class="tenant">Loading…</span><span id="mode-badge" class="badge" hidden></span></span>
+			<button id="theme-button" class="icon-button" type="button" aria-label="Switch to dark theme" title="Toggle theme">
+				<svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+				<svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+			</button>
+			<button id="key-button" class="button" type="button">Use your own key</button>
+		</div>
 	</div>
 </header>
 
 <main>
-	<section class="intro" id="intro">
-		<p><strong>Tracewise</strong> records every call an app makes to an AI model, then shows what it costs, how fast it is, how often it's attacked, and whether answer quality is slipping. Graded nightly by an AI judge. You're looking at live demo data for a fictional company, <em>Acme Support</em>.</p>
-		<p class="links"><a href="https://github.com/zaiby83/tracewise">Code</a> · <a href="https://github.com/zaiby83/tracewise/blob/main/docs/design.md">Design doc</a> · <a href="https://github.com/zaiby83/tracewise/blob/main/docs/experiments.md">Experiments</a></p>
+	<section class="hero">
+		<p class="eyebrow">LLM observability on serverless AWS</p>
+		<h1>Is your AI getting better or worse?</h1>
+		<p class="lede">Tracewise records every call an app makes to an AI model, then shows what it costs, how fast it is, how often it's attacked, and whether answer quality is slipping, graded nightly by an AI judge. This is live demo data for a fictional company, <em>Acme Support</em>.</p>
+		<nav class="hero-links" aria-label="Project links">
+			<a class="chip" href="https://github.com/zaiby83/tracewise">Code</a>
+			<a class="chip" href="https://github.com/zaiby83/tracewise/blob/main/docs/design.md">Design doc</a>
+			<a class="chip" href="https://github.com/zaiby83/tracewise/blob/main/docs/experiments.md">Experiments</a>
+			<a class="chip" href="https://github.com/zaiby83/tracewise/blob/main/docs/blog-post.md">Write-up</a>
+		</nav>
 	</section>
 
-	<div class="filters" role="group" aria-label="Date range">
-		<button type="button" class="range" data-days="7" aria-pressed="true">Last 7 days</button>
-		<button type="button" class="range" data-days="30" aria-pressed="false">Last 30 days</button>
-		<span id="status" class="status" role="status"></span>
+	<div class="toolbar">
+		<div class="segmented" role="group" aria-label="Date range">
+			<button type="button" class="range" data-days="7" aria-pressed="true">7 days</button>
+			<button type="button" class="range" data-days="30" aria-pressed="false">30 days</button>
+		</div>
+		<div class="toolbar-right">
+			<span class="freshness" role="status"><span class="pulse" aria-hidden="true"></span><span id="status">Loading…</span></span>
+			<button id="refresh-button" class="icon-button" type="button" aria-label="Refresh now" title="Refresh now">
+				<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
+			</button>
+		</div>
 	</div>
 
-	<section class="tiles" id="tiles" aria-label="Summary"></section>
+	<div id="error" class="banner" role="alert" hidden>
+		<span id="error-text"></span>
+		<button id="retry-button" class="button" type="button">Retry</button>
+	</div>
+
+	<section class="tiles" id="tiles" aria-label="Summary">
+		<div class="tile skeleton"></div><div class="tile skeleton"></div><div class="tile skeleton"></div><div class="tile skeleton"></div><div class="tile skeleton"></div>
+	</section>
 
 	<section class="grid">
 		<article class="card">
-			<h2>Calls per day</h2>
-			<div class="chart" id="chart-calls"></div>
+			<header class="card-head"><h2>Answer quality</h2><p class="sub">Mean judge score per evaluated day, 1–5</p></header>
+			<div class="chart" id="chart-quality"><div class="chart-skeleton"></div></div>
+			<details><summary>View as table</summary><div id="table-quality"></div></details>
+		</article>
+		<article class="card">
+			<header class="card-head"><h2>Response time</h2><p class="sub">95th-percentile latency per day</p></header>
+			<div class="chart" id="chart-latency"><div class="chart-skeleton"></div></div>
+			<details><summary>View as table</summary><div id="table-latency"></div></details>
+		</article>
+		<article class="card">
+			<header class="card-head"><h2>Calls</h2><p class="sub">AI model calls per day</p></header>
+			<div class="chart" id="chart-calls"><div class="chart-skeleton"></div></div>
 			<details><summary>View as table</summary><div id="table-calls"></div></details>
 		</article>
 		<article class="card">
-			<h2>Model spend per day</h2>
-			<div class="chart" id="chart-cost"></div>
+			<header class="card-head"><h2>Model spend</h2><p class="sub">Inference cost per day</p></header>
+			<div class="chart" id="chart-cost"><div class="chart-skeleton"></div></div>
 			<details><summary>View as table</summary><div id="table-cost"></div></details>
 		</article>
 	</section>
 
 	<article class="card">
-		<h2>Answer quality <span class="sub">mean judge score, 1–5, per evaluated day</span></h2>
-		<div class="chart" id="chart-quality"></div>
-		<details><summary>View as table</summary><div id="table-quality"></div></details>
-	</article>
-
-	<article class="card">
-		<h2>By route and model</h2>
+		<header class="card-head"><h2>By route and model</h2><p class="sub">Each AI feature, ranked by traffic</p></header>
 		<div class="table-wrap" id="routes"></div>
 	</article>
 
-	<article class="card" id="worst-card">
-		<h2>Lowest-scoring answers <span class="sub" id="worst-day"></span></h2>
+	<article class="card">
+		<header class="card-head"><h2>Lowest-scoring answers</h2><p class="sub" id="worst-day"></p></header>
 		<ul class="worst" id="worst"></ul>
 	</article>
 
 	<article class="card">
-		<h2>Recent traces <span class="sub" id="traces-day"></span></h2>
+		<header class="card-head"><h2>Recent traces</h2><p class="sub" id="traces-day">Select a row to see the conversation</p></header>
 		<div class="table-wrap" id="traces"></div>
 	</article>
 </main>
 
 <footer>
-	Built on API Gateway, Lambda, SQS, DynamoDB, Data Firehose, S3, Athena, Step Functions, Bedrock and CloudFront. Deployed with AWS CDK.
+	<p>Built on API Gateway, Lambda, SQS, DynamoDB, Data Firehose, S3, Athena, Step Functions, Bedrock and CloudFront, defined in AWS CDK.</p>
+	<p><a href="https://github.com/zaiby83/tracewise">github.com/zaiby83/tracewise</a></p>
 </footer>
 
 <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
 
-<dialog id="key-dialog">
+<dialog id="key-dialog" aria-labelledby="key-title">
 	<form method="dialog" id="key-form">
-		<h2>View your own data</h2>
+		<h2 id="key-title">View your own data</h2>
 		<p>Paste a Tracewise API key. It stays in this browser tab only (session storage) and is sent only to this site's API.</p>
 		<label for="key-input">API key</label>
-		<input id="key-input" name="key" autocomplete="off" spellcheck="false" placeholder="tw_…" pattern="tw_[A-Za-z0-9_\-]{43}" required>
+		<input id="key-input" name="key" autocomplete="off" spellcheck="false" placeholder="tw_…" required>
 		<p id="key-error" class="error" hidden></p>
 		<div class="actions">
-			<button type="button" class="ghost" id="key-demo">Back to demo data</button>
-			<button type="button" class="ghost" id="key-cancel">Cancel</button>
-			<button type="submit" class="primary">View</button>
+			<button type="button" class="button" id="key-demo">Back to demo data</button>
+			<button type="button" class="button" id="key-cancel">Cancel</button>
+			<button type="submit" class="button primary">View</button>
 		</div>
 	</form>
 </dialog>
