@@ -1,14 +1,13 @@
 import { QueryCommand } from "@aws-sdk/lib-dynamodb";
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
 import { json } from "../shared/http";
-import { bearerToken } from "../shared/keys";
-import { ddb, tenantForKey } from "../shared/tenants";
+import { jwtClaims, resolveTenant } from "../shared/auth";
+import { ddb } from "../shared/tenants";
 
 // GET /v1/evals?limit=10: the tenant's most recent evaluation runs, newest first.
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStructuredResultV2> {
-	const key = bearerToken(event.headers.authorization);
-	const tenant = key ? await tenantForKey(key) : null;
-	if (!tenant) return json(401, { error: "invalid API key" });
+	const tenant = await resolveTenant(event);
+	if (!tenant) return jwtClaims(event) ? json(404, { error: "not found" }) : json(401, { error: "invalid API key" });
 
 	const limit = Math.min(Math.max(Number(event.queryStringParameters?.limit ?? 10) || 10, 1), 50);
 	const { Items } = await ddb.send(
