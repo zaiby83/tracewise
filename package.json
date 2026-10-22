@@ -8,7 +8,8 @@
 		"typecheck": "tsc --noEmit",
 		"synth": "cdk synth --quiet",
 		"deploy": "cdk deploy --require-approval broadening",
-		"tenant:create": "tsx scripts/create-tenant.ts"
+		"tenant:create": "tsx scripts/create-tenant.ts",
+		"tokens": "tsx scripts/build-tokens.ts"
 	},
 	"dependencies": {
 		"@aws-sdk/client-athena": "3.1155.0",
