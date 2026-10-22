@@ -1,26 +1,21 @@
-// Creates a tenant and prints its API key once. Only the key's hash is stored.
+// Creates an org with a write key and prints the key once. Only the key's hash is stored.
+// It is the same createOrg the console uses, with limits that keep an operator-created
+// tenant (a load test, a demo) at today's rates instead of the free tier's.
 // Usage: pnpm tenant:create "<tenant name>" [eventsPerMinute]
-import { randomUUID } from "node:crypto";
-import { CloudFormationClient, DescribeStacksCommand } from "@aws-sdk/client-cloudformation";
-import { PutCommand } from "@aws-sdk/lib-dynamodb";
-import { hashApiKey, newApiKey } from "../services/shared/keys";
-import { ddb } from "../services/shared/tenants";
+import { createOrg } from "../services/console/store";
+import { legacyLimits } from "../services/shared/accounts";
+import { stackOutputs } from "./lib/stack";
 
 const [name, perMinute = "6000"] = process.argv.slice(2);
-if (!name) {
+if (!name || !/^[1-9]\d*$/.test(perMinute)) {
 	console.error('usage: pnpm tenant:create "<tenant name>" [eventsPerMinute]');
 	process.exit(1);
 }
 
-const { Stacks } = await new CloudFormationClient({}).send(new DescribeStacksCommand({ StackName: "Tracewise" }));
-const outputs = Object.fromEntries((Stacks?.[0]?.Outputs ?? []).map((o) => [o.OutputKey, o.OutputValue]));
-if (!outputs.TenantsTable) throw new Error("Tracewise stack not found: deploy it first");
+const outputs = await stackOutputs();
+const { org, key } = await createOrg({ name, plan: "custom", limits: legacyLimits(Number(perMinute)) });
 
-const apiKey = newApiKey();
-const tenant = { key_hash: hashApiKey(apiKey), tenant_id: randomUUID(), name, status: "active", events_per_minute: Number(perMinute), created_at: new Date().toISOString() };
-await ddb.send(new PutCommand({ TableName: outputs.TenantsTable, Item: tenant, ConditionExpression: "attribute_not_exists(key_hash)" }));
-
-console.error(`Created tenant "${name}" (${tenant.tenant_id}), ${perMinute} events/min.`);
+console.error(`Created tenant "${name}" (${org.org_id}), ${perMinute} events/min.`);
 console.error("API key (shown once, store it somewhere safe):");
-console.log(apiKey);
+console.log(key.secret);
 console.error(`Ingest endpoint: ${outputs.ApiUrl}/v1/traces`);
