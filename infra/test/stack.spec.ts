@@ -1,6 +1,7 @@
 import { App } from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { beforeAll, describe, expect, it } from "vitest";
+import { CONSOLE_ROUTES, JWT_DATA_ROUTES } from "../../services/console/route-keys";
 import { TracewiseStack } from "../lib/tracewise-stack";
 
 // Assertions on the synthesized CloudFormation: the guarantees the design doc makes
@@ -11,10 +12,14 @@ beforeAll(() => {
 	template = Template.fromStack(new TracewiseStack(app, "Test", { alarmEmail: "alerts@example.com" }));
 }, 120_000);
 
+// The IAM policies attached to the roles whose logical IDs match.
+const policiesFor = (re: RegExp) =>
+	Object.values(template.findResources("AWS::IAM::Policy")).filter((p) => re.test(JSON.stringify(p.Properties.Roles)));
+
 describe("TracewiseStack", () => {
 	it("encrypts every table and expires hot data with TTL", () => {
 		const tables = template.findResources("AWS::DynamoDB::GlobalTable");
-		expect(Object.keys(tables)).toHaveLength(4);
+		expect(Object.keys(tables)).toHaveLength(5);
 		for (const t of Object.values(tables)) {
 			expect(t.Properties.SSESpecification).toMatchObject({ SSEEnabled: true });
 			expect(t.Properties.BillingMode).toBe("PAY_PER_REQUEST");
@@ -47,7 +52,7 @@ describe("TracewiseStack", () => {
 		const fns = Object.entries(template.findResources("AWS::Lambda::Function"))
 			.filter(([id]) => !id.startsWith("Custom"))
 			.map(([, f]) => f);
-		expect(fns).toHaveLength(9);
+		expect(fns).toHaveLength(11);
 		for (const f of fns) {
 			expect(f.Properties.Architectures).toEqual(["arm64"]);
 			expect(f.Properties.TracingConfig).toEqual({ Mode: "Active" });
@@ -55,13 +60,24 @@ describe("TracewiseStack", () => {
 	});
 
 	it("does not let the ingest function touch the traces table", () => {
-		const policies = Object.values(template.findResources("AWS::IAM::Policy")).filter((p) => /Ingest/.test(JSON.stringify(p.Properties.Roles)));
+		const policies = policiesFor(/Ingest/);
 		expect(policies).toHaveLength(1);
 		expect(JSON.stringify(policies[0])).not.toMatch(/Traces/);
 	});
 
-	it("alarms on dead letters, backlog and ingest errors, and emails them", () => {
-		template.resourceCountIs("AWS::CloudWatch::Alarm", 3);
+	it("alarms on dead letters, backlog, ingest errors, failed deletions and global caps, and emails them", () => {
+		template.resourceCountIs("AWS::CloudWatch::Alarm", 6);
+		for (const cap of ["orgs", "judge"])
+			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+				Namespace: "Tracewise/Limits",
+				MetricName: "GlobalCapHit",
+				Dimensions: [{ Name: "Cap", Value: cap }],
+				Statistic: "Sum",
+				Period: 300,
+				Threshold: 1,
+				ComparisonOperator: "GreaterThanOrEqualToThreshold",
+				AlarmActions: [Match.anyValue()],
+			});
 		template.hasResourceProperties("AWS::SNS::Subscription", { Protocol: "email", Endpoint: "alerts@example.com" });
 	});
 
@@ -109,10 +125,15 @@ describe("TracewiseStack", () => {
 		});
 	});
 
-	it("gives the analytics function read-only access to data", () => {
-		const policies = Object.values(template.findResources("AWS::IAM::Policy")).filter((p) => /SummaryServiceRole/.test(JSON.stringify(p.Properties.Roles)));
-		const doc = JSON.stringify(policies);
-		expect(doc).not.toMatch(/dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/);
+	it("gives the analytics function read-only access to data, writing only its query counter", () => {
+		const statements = policiesFor(/SummaryServiceRole/).flatMap((p) => p.Properties.PolicyDocument.Statement as { Action: unknown; Resource: unknown }[]);
+		const writes = statements.filter((st) => /dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/.test(JSON.stringify(st.Action)));
+		// analytics_queries_per_day is counted in the Quotas table.
+		expect(writes).toHaveLength(1);
+		expect(writes[0]!.Action).toBe("dynamodb:UpdateItem");
+		expect(JSON.stringify(writes[0]!.Resource)).toMatch(/Quotas/);
+		expect(JSON.stringify(writes[0]!.Resource)).not.toMatch(/Traces|Accounts|Tenants/);
+		const doc = JSON.stringify(statements);
 		expect(doc).not.toMatch(/glue:(Create|Update|Delete)/);
 		expect(doc).not.toMatch(/firehose:/);
 	});
@@ -124,6 +145,20 @@ describe("TracewiseStack", () => {
 		expect(definition).toContain("ThrottlingException");
 		expect(definition).toContain("GradeFailed");
 		expect(definition).toMatch(/MaxConcurrency\\?":\s*4/);
+	});
+
+	it("carries each org's judge budget through the workflow to the record step", () => {
+		const [sm] = Object.values(template.findResources("AWS::StepFunctions::StateMachine"));
+		const definition = JSON.stringify(sm!.Properties.DefinitionString);
+		// Step Functions drops any field an itemSelector or payload doesn't name.
+		for (const field of ["sample_budget", "sample_limit"]) {
+			expect(definition).toContain(`${field}.$\\":\\"$$.Map.Item.Value.${field}`); // EachTenant itemSelector
+			expect(definition).toContain(`${field}.$\\":\\"$.${field}`); // Record payload
+		}
+		// The per-org results are dropped, so the execution's output stays small however many orgs ran.
+		const parts = (sm!.Properties.DefinitionString["Fn::Join"]?.[1] ?? [sm!.Properties.DefinitionString]) as unknown[];
+		const states = JSON.parse(parts.map((p) => (typeof p === "string" ? p : "TOKEN")).join("")).States;
+		expect(states.EachTenant.ResultPath).toBeNull();
 	});
 
 	it("scopes the judge to one Bedrock model and metrics to one namespace", () => {
@@ -167,5 +202,57 @@ describe("TracewiseStack", () => {
 				CacheBehaviors: [Match.objectLike({ PathPattern: "/v1/*", ViewerProtocolPolicy: "https-only" })],
 			}),
 		});
+	});
+
+	it("protects every console and session route with the Cognito JWT authorizer, and no key route", () => {
+		const routes = Object.values(template.findResources("AWS::ApiGatewayV2::Route")).map((r) => r.Properties);
+		const jwt = [...CONSOLE_ROUTES, ...Object.values(JWT_DATA_ROUTES)];
+		for (const key of jwt) expect(routes.find((r) => r.RouteKey === key)).toMatchObject({ AuthorizationType: "JWT" });
+		for (const key of ["POST /v1/traces", "GET /v1/traces", "GET /v1/analytics/summary", "GET /v1/evals", "GET /v1/me"])
+			expect(routes.find((r) => r.RouteKey === key)?.AuthorizationType ?? "NONE").toBe("NONE");
+		template.hasResourceProperties("AWS::ApiGatewayV2::Authorizer", { AuthorizerType: "JWT", IdentitySource: ["$request.header.Authorization"] });
+	});
+
+	it("signs users in with verified email, optional TOTP and no SMS", () => {
+		template.hasResourceProperties("AWS::Cognito::UserPool", {
+			AutoVerifiedAttributes: ["email"],
+			UsernameAttributes: ["email"],
+			MfaConfiguration: "OPTIONAL",
+			EnabledMfas: ["SOFTWARE_TOKEN_MFA"],
+		});
+		template.hasResourceProperties("AWS::Cognito::UserPoolClient", { GenerateSecret: false, AllowedOAuthFlows: ["code"], RefreshTokenRotation: { Feature: "ENABLED" } });
+	});
+
+	it("only creates the password-auth smoke client when asked", () => {
+		const smokeClients = (t: Template) =>
+			Object.values(t.findResources("AWS::Cognito::UserPoolClient")).filter((c) =>
+				(c.Properties.ExplicitAuthFlows ?? []).includes("ALLOW_ADMIN_USER_PASSWORD_AUTH"),
+			);
+		expect(smokeClients(template)).toHaveLength(0);
+		const withSmoke = Template.fromStack(new TracewiseStack(new App(), "Smoke", { smokeClient: true }));
+		expect(smokeClients(withSmoke)).toHaveLength(1);
+	}, 120_000);
+
+	it("keeps the console function away from traces, the lake and eval runs", () => {
+		const doc = JSON.stringify(policiesFor(/ConsoleFnServiceRole/));
+		expect(doc).not.toMatch(/Traces|Lake|EvalsRuns/);
+	});
+
+	it("gives the deleter delete rights on the lake's traces prefix, listing only tenant prefixes", () => {
+		const doc = JSON.stringify(policiesFor(/DeleterFnServiceRole/));
+		expect(doc).toMatch(/s3:DeleteObject/);
+		expect(doc).toContain("traces/tenant_id=*");
+		for (const re of [/ConsoleFnServiceRole/, /QueryServiceRole/, /IngestServiceRole/]) expect(JSON.stringify(policiesFor(re))).not.toMatch(/s3:DeleteObject/);
+	});
+
+	it("deletes orgs from an encrypted queue that dead-letters and alarms after 5 attempts", () => {
+		// 6x the deleter's 60 s timeout.
+		template.hasResourceProperties("AWS::SQS::Queue", {
+			VisibilityTimeout: 360,
+			SqsManagedSseEnabled: true,
+			RedrivePolicy: { maxReceiveCount: 5, deadLetterTargetArn: Match.anyValue() },
+		});
+		template.hasResourceProperties("AWS::Lambda::EventSourceMapping", { BatchSize: 1, FunctionResponseTypes: ["ReportBatchItemFailures"] });
+		template.hasResourceProperties("AWS::Lambda::Function", { Timeout: 60, Environment: { Variables: Match.objectLike({ LAKE_BUCKET: Match.anyValue(), DELETION_QUEUE_URL: Match.anyValue() }) } });
 	});
 });

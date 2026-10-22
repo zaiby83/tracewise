@@ -17,6 +17,9 @@ const stack = new TracewiseStack(app, "Tracewise", {
 	judgeModel: app.node.tryGetContext("judgeModel"),
 	// Read-only key for the public demo dashboard; from the environment, never the repo.
 	dashboardKey: process.env.TRACEWISE_DASHBOARD_KEY,
+	authDomainPrefix: app.node.tryGetContext("authDomainPrefix"),
+	// `-c smokeClient=true` adds the password-auth client the self-serve smoke test uses.
+	smokeClient: app.node.tryGetContext("smokeClient") === "true",
 });
 // Tags make the project's spend visible in Cost Explorer.
 Tags.of(stack).add("project", "tracewise");

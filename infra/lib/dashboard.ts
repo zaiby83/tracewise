@@ -25,9 +25,17 @@ const site = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../dash
 
 export interface DashboardProps {
 	api: HttpApi;
+	// Cognito's managed login domain, which the console signs in through.
+	authDomainUrl: string;
+}
+
+// What the pages read from /config.json at runtime.
+export interface DashboardConfig {
 	// A read-only API key the public page uses to show the demo tenant. Read-only keys
 	// can't ingest, so publishing one exposes only the demo data it's meant to show.
-	demoReadKey?: string;
+	demoKey: string;
+	// The console's sign-in: the managed login domain and the public app client.
+	auth: { domain: string; clientId: string };
 }
 
 // The dashboard: static files in a private bucket, served through CloudFront, which
@@ -35,9 +43,12 @@ export interface DashboardProps {
 // CloudFront caches API reads briefly, shielding Athena and Lambda from a busy page.
 export class Dashboard extends Construct {
 	readonly distribution: Distribution;
+	readonly authDomainUrl: string;
+	private readonly bucket: Bucket;
 
 	constructor(scope: Construct, id: string, props: DashboardProps) {
 		super(scope, id);
+		this.authDomainUrl = props.authDomainUrl;
 
 		const bucket = new Bucket(this, "Site", {
 			encryption: BucketEncryption.S3_MANAGED,
@@ -79,6 +90,7 @@ export class Dashboard extends Construct {
 
 		const apiDomain = `${props.api.apiId}.execute-api.${Stack.of(this).region}.${Stack.of(this).urlSuffix}`;
 
+		this.bucket = bucket;
 		this.distribution = new Distribution(this, "Cdn", {
 			comment: "Tracewise dashboard and API",
 			defaultRootObject: "index.html",
@@ -99,10 +111,15 @@ export class Dashboard extends Construct {
 				},
 			},
 		});
+	}
 
+	// Uploads the site with its config. Separate from the constructor because the config
+	// names the console's app client, which can only exist once the distribution's domain
+	// (its callback URL) is known.
+	deploy(config: DashboardConfig) {
 		new BucketDeployment(this, "Deploy", {
-			destinationBucket: bucket,
-			sources: [Source.asset(site), Source.jsonData("config.json", { demoKey: props.demoReadKey ?? "" })],
+			destinationBucket: this.bucket,
+			sources: [Source.asset(site), Source.jsonData("config.json", { demoKey: config.demoKey, auth: { domain: config.auth.domain, clientId: config.auth.clientId } })],
 			distribution: this.distribution,
 			distributionPaths: ["/*"],
 			memoryLimit: 256,
