@@ -4,6 +4,7 @@ LLM observability and evaluation on serverless AWS. Apps send every model call t
 
 - **[PR/FAQ](docs/PRFAQ.md):** the product, written working backwards.
 - **[Design document](docs/design.md):** requirements, architecture, service trade-offs, failure modes, cost model, validation plan.
+- **[Experiments](docs/experiments.md):** measurements from the deployed stack. The first one cut ingest-to-queryable latency from 6.3 s to 63 ms (p50).
 
 > **Status:** Milestone 1 of 6 (the ingest pipeline, API keys and SDK) is built and tested. Analytics, evaluations, the dashboard and the load test are next. See [milestones](docs/design.md#9-milestones).
 
@@ -62,8 +63,10 @@ pnpm synth                # build the CloudFormation template locally, no AWS ne
 
 aws sso login             # with a profile from `aws configure sso`
 cdk bootstrap             # once per account and region
-pnpm run deploy -- -c alarmEmail=you@example.com
-pnpm tenant:create "Demo tenant"   # prints an API key once
+pnpm run deploy -c alarmEmail=you@example.com
+pnpm tenant:create "Demo tenant"   # prints an API key once; save it with the URL in .env.local
+node --env-file=.env.local --import tsx scripts/smoke.ts     # end-to-end checks
+node --env-file=.env.local --import tsx scripts/latency.ts   # pipeline latency percentiles
 ```
 
 ```sh

@@ -42,6 +42,8 @@ export function toItem(record: SQSRecord): Record<string, unknown> | null {
 			sk: sortKey(e.ts, e.event_id),
 			expires_at: expiresAt(e.ts),
 			...e,
+			// With received_at, this gives the pipeline's own latency (queue + processing).
+			processed_at: new Date().toISOString(),
 		};
 	} catch (err) {
 		log("error", "unparseable message", { messageId: record.messageId, error: String(err) });

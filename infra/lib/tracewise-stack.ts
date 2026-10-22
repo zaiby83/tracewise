@@ -20,6 +20,11 @@ const services = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../
 export interface TracewiseStackProps extends StackProps {
 	// Where alarms are emailed. Omit to create the topic without a subscription.
 	alarmEmail?: string;
+	// How long the SQS trigger waits to fill a batch, and the batch size. Together they
+	// trade freshness for fewer, larger invocations; see docs/experiments.md. AWS
+	// requires a window above 0 for batches larger than 10.
+	batchingWindowSeconds?: number;
+	batchSize?: number;
 }
 
 export class TracewiseStack extends Stack {
@@ -101,8 +106,8 @@ export class TracewiseStack extends Stack {
 		traces.grantWriteData(processor);
 		processor.addEventSource(
 			new SqsEventSource(queue, {
-				batchSize: 100,
-				maxBatchingWindow: Duration.seconds(2),
+				batchSize: props.batchSize ?? 10,
+				maxBatchingWindow: Duration.seconds(props.batchingWindowSeconds ?? 0),
 				reportBatchItemFailures: true,
 				// Caps how hard the consumer pushes on DynamoDB; the queue absorbs the rest.
 				maxConcurrency: 10,

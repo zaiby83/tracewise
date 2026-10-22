@@ -23,6 +23,7 @@
 | Ingest API latency | p99 < 150 ms (the API only validates and enqueues) |
 | Event size | ≤ 32 KB after SDK truncation; typical 2–4 KB |
 | Durability | No acknowledged event lost |
+| Freshness | Ingest to queryable: p50 < 5 s, p99 < 30 s ([measured: p50 63 ms](experiments.md)) |
 | Recent-trace lookup | < 200 ms for a tenant's last 24 h |
 | Analytics | Minutes-old data is fine; cost matters more than speed |
 | Retention | Hot: 30 days. Cold: 1 year, configurable per tenant |
@@ -38,7 +39,7 @@ flowchart LR
     SDK -->|HTTPS, API key| APIGW[API Gateway<br/>HTTP API]
     APIGW --> ING[Lambda: ingest<br/>auth, validate, quota]
     ING --> SQS[(SQS queue)]
-    SQS --> PROC[Lambda: processor<br/>batch of up to 100]
+    SQS --> PROC[Lambda: processor<br/>batches of 10]
     SQS -.after 5 failures.-> DLQ[(Dead-letter queue)]
     PROC --> DDB[(DynamoDB<br/>hot traces, 30-day TTL)]
     PROC --> FH[Data Firehose]
@@ -59,7 +60,7 @@ flowchart LR
 1. The SDK batches events in memory (up to 50 events or 2 s) and POSTs them to `/v1/traces` with the tenant's API key. On failure it retries with exponential backoff and jitter, then drops the oldest events once a bounded buffer fills. Customer requests are never blocked.
 2. **API Gateway (HTTP API)** terminates TLS and applies a coarse per-key throttle.
 3. **The ingest Lambda** hashes the API key and looks up the tenant (cached in memory for 60 s). It validates the schema, checks the tenant's quota, stamps `tenant_id`, `received_at` and an idempotency key, and calls `SendMessageBatch`. It returns `202` once SQS has accepted the batch, so the event is durable.
-4. **SQS** absorbs bursts. **The processor Lambda** reads batches of up to 100 and writes to DynamoDB with `BatchWriteItem` and to Firehose with `PutRecordBatch`. It reports partial batch failures so only failed messages are retried. Five failures move a message to the **dead-letter queue**, and a CloudWatch alarm fires.
+4. **SQS** absorbs bursts. **The processor Lambda** reads batches of up to 10 with no batching window, a setting chosen by measurement (see [experiments](experiments.md)), and writes to DynamoDB with `BatchWriteItem` and to Firehose with `PutRecordBatch`. It reports partial batch failures so only failed messages are retried. Five failures move a message to the **dead-letter queue**, and a CloudWatch alarm fires.
 
 ### Storage
 - **DynamoDB (hot path):** table `traces`. Partition key is `tenant_id#yyyy-mm-dd#shard` and sort key is `ts#event_id`, so recent traces are a single `Query`. A TTL attribute expires items after 30 days. Using `shard` (0–9) as a suffix keeps a busy tenant from overloading one partition; reads fan out across the shards in parallel.
@@ -89,6 +90,7 @@ flowchart LR
 | API front door | **API Gateway HTTP API** | REST API, ALB | Cheaper and lower latency than the REST API. Usage plans (a REST API feature) are replaced by our own quota check, which is tenant-aware. |
 | Hot store | **DynamoDB on-demand** | Aurora Serverless, OpenSearch | The access pattern is key-value by tenant and time, with predictable single-digit-ms reads and TTL built in. OpenSearch would add full-text search but runs always-on. |
 | Analytics | **S3 Parquet + Athena** | Redshift Serverless, OpenSearch | Cheapest at rest, and pay-per-query suits nightly batch. Columnar Parquet and partition projection keep scans small. |
+| Trigger batching | **Batch 10, no window** | Batch 100 with a 2 s window | Measured p50 63 ms vs. 6.3 s ([experiments](experiments.md)). Costs more Lambda requests at high volume (~$52 vs. ~$5/month at 1,000 events/s), which is configurable per deployment. |
 | Orchestration | **Step Functions** | A long-running Lambda, AWS Batch | Retries, timeouts, parallel Map and visual run history without custom code. |
 | Judge model | **Bedrock** | Calling a provider API directly | IAM-authenticated with no external keys, data stays in the account, and models are swappable. |
 | IaC | **AWS CDK (TypeScript)** | Terraform, SAM | Typed, composable constructs, and same-language tests for the infrastructure. |

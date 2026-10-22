@@ -33,8 +33,9 @@ describe("TracewiseStack", () => {
 	});
 
 	it("consumes in batches with partial-failure reporting and bounded concurrency", () => {
+		// Small batches, no window: measured ~100x fresher than 100 / 2 s (docs/experiments.md).
 		template.hasResourceProperties("AWS::Lambda::EventSourceMapping", {
-			BatchSize: 100,
+			BatchSize: 10,
 			FunctionResponseTypes: ["ReportBatchItemFailures"],
 			ScalingConfig: { MaximumConcurrency: 10 },
 		});
