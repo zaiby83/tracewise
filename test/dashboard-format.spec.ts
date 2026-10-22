@@ -1,6 +1,4 @@
 import { describe, expect, it } from "vitest";
-// The dashboard modules are plain JavaScript with no declarations, so tsc sees them as untyped.
-// @ts-expect-error TS7016
 import { fmtCost, fmtMs, fmtPct, niceMax } from "../dashboard/shared/format.js";
 
 describe("dashboard formatting", () => {
