@@ -196,6 +196,27 @@ export async function startDeletion(orgId: string): Promise<boolean> {
 	}
 }
 
+// Undoes startDeletion when the deleter couldn't be queued, so the owner can try again.
+// False when the org wasn't deleting any more.
+export async function cancelDeletion(orgId: string): Promise<boolean> {
+	try {
+		await ddb.send(
+			new UpdateCommand({
+				TableName: accounts(),
+				Key: profileKey(orgId),
+				UpdateExpression: "SET #s = :active",
+				ConditionExpression: "#s = :deleting",
+				ExpressionAttributeNames: { "#s": "status" },
+				ExpressionAttributeValues: { ":active": "active", ":deleting": "deleting" },
+			}),
+		);
+		return true;
+	} catch (e) {
+		if (isConditionFailure(e)) return false;
+		throw e;
+	}
+}
+
 // Scripts only. Names aren't unique, so this returns the first live match.
 export async function findOrgByName(name: string): Promise<OrgProfile | null> {
 	let startKey: Row | undefined;

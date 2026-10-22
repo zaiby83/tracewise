@@ -11,7 +11,7 @@ process.env.CONSOLE_ORIGIN = "https://d1.cloudfront.net";
 const { FREE_LIMITS } = await import("../services/shared/accounts");
 const { hashApiKey } = await import("../services/shared/keys");
 const store = await import("../services/console/store");
-const { acceptInvite, countOwnedOrgs, createInvite, createKey, createOrg, findOrgByName, listInvites, listKeys, listMembers, removeMember, revokeInvite, revokeKey, setRole, startDeletion, updateProfile } = store;
+const { acceptInvite, cancelDeletion, countOwnedOrgs, createInvite, createKey, createOrg, findOrgByName, listInvites, listKeys, listMembers, removeMember, revokeInvite, revokeKey, setRole, startDeletion, updateProfile } = store;
 
 // Mocks are set per test (not in a hook), as in accounts.spec.ts. Every test starts from "send resolves {}".
 const fresh = () => ddb.send.mockReset().mockResolvedValue({});
@@ -106,6 +106,26 @@ describe("startDeletion", () => {
 	it("rethrows other failures", async () => {
 		fresh().mockRejectedValueOnce(new Error("throttled"));
 		await expect(startDeletion("o1")).rejects.toThrow("throttled");
+	});
+});
+
+describe("cancelDeletion", () => {
+	it("only moves a deleting org back to active", async () => {
+		fresh();
+		expect(await cancelDeletion("o1")).toBe(true);
+		const input = sent(UpdateCommand)[0]!.input;
+		expect(input.Key).toEqual({ pk: "ORG#o1", sk: "PROFILE" });
+		expect(input.UpdateExpression).toBe("SET #s = :active");
+		expect(input.ConditionExpression).toBe("#s = :deleting");
+		expect(input.ExpressionAttributeValues).toMatchObject({ ":active": "active", ":deleting": "deleting" });
+	});
+	it("returns false when the org isn't deleting", async () => {
+		fresh().mockRejectedValueOnce(new ConditionalCheckFailedException({ message: "x", $metadata: {} }));
+		expect(await cancelDeletion("o1")).toBe(false);
+	});
+	it("rethrows other failures", async () => {
+		fresh().mockRejectedValueOnce(new Error("throttled"));
+		await expect(cancelDeletion("o1")).rejects.toThrow("throttled");
 	});
 });
 

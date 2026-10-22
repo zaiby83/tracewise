@@ -5,7 +5,7 @@ import { GLOBAL_ORGS_PER_DAY, MAX_OWNED_ORGS, listUserOrgs } from "../../shared/
 import { json, log } from "../../shared/http";
 import { consumeCounter, counterIds } from "../../shared/tenants";
 import type { Ctx, RouteTable } from "../handler";
-import { countOwnedOrgs, createOrg, startDeletion, updateProfile } from "../store";
+import { cancelDeletion, countOwnedOrgs, createOrg, startDeletion, updateProfile } from "../store";
 import { bodyOf, keyView, notFound, orgView } from "./common";
 
 const sqs = new SQSClient({});
@@ -73,7 +73,19 @@ export const orgRoutes: RouteTable = {
 			const orgId = ctx.profile!.org_id;
 			// False means another request already moved the org out of active.
 			if (!(await startDeletion(orgId))) return notFound();
-			await sqs.send(new SendMessageCommand({ QueueUrl: process.env.DELETION_QUEUE_URL, MessageBody: JSON.stringify({ org_id: orgId, phase: "dynamo" }) }));
+			try {
+				await sqs.send(new SendMessageCommand({ QueueUrl: process.env.DELETION_QUEUE_URL, MessageBody: JSON.stringify({ org_id: orgId, phase: "dynamo" }) }));
+			} catch {
+				// Without a queued deleter the org would sit hidden in `deleting` and the owner couldn't
+				// retry, so put it back. The order stays: queueing first could delete an active org's data.
+				log("error", "deletion enqueue failed", { org_id: orgId });
+				try {
+					await cancelDeletion(orgId);
+				} catch {
+					log("error", "deletion rollback failed", { org_id: orgId });
+				}
+				return json(503, { error: "couldn't start deletion, try again" });
+			}
 			return json(202, { status: "deleting" });
 		},
 	},

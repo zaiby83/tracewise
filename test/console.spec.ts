@@ -16,6 +16,7 @@ const store = vi.hoisted(() => ({
 	revokeKey: vi.fn(),
 	setRole: vi.fn(),
 	startDeletion: vi.fn(),
+	cancelDeletion: vi.fn(),
 	updateProfile: vi.fn(),
 	findOrgByName: vi.fn(),
 }));
@@ -212,6 +213,35 @@ describe("orgs", () => {
 		const cmd = sqsSend.mock.calls[0]![0] as { input: { QueueUrl: string; MessageBody: string } };
 		expect(cmd.input.QueueUrl).toBe("https://sqs.test/deletion");
 		expect(JSON.parse(cmd.input.MessageBody)).toEqual({ org_id: "o1", phase: "dynamo" });
+	});
+	it("doesn't roll back a deletion that was queued", async () => {
+		store.startDeletion.mockResolvedValue(true);
+		expect((await call("DELETE /v1/orgs/{orgId}", { params: { orgId: "o1" }, body: { confirm_name: "Acme" } })).statusCode).toBe(202);
+		expect(store.cancelDeletion).not.toHaveBeenCalled();
+	});
+	it("rolls the org back to active and answers 503 when the deleter can't be queued", async () => {
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+		store.startDeletion.mockResolvedValue(true);
+		sqsSend.mockRejectedValue(new Error("queue down"));
+		const res = await call("DELETE /v1/orgs/{orgId}", { params: { orgId: "o1" }, body: { confirm_name: "Acme" } });
+		expect(res.statusCode).toBe(503);
+		expect(parse(res)).toEqual({ error: "couldn't start deletion, try again" });
+		expect(store.cancelDeletion).toHaveBeenCalledWith("o1");
+		expect(JSON.parse(String(err.mock.calls[0]![0]))).toEqual({ level: "error", msg: "deletion enqueue failed", org_id: "o1" });
+		err.mockRestore();
+	});
+	it("still answers 503 when the rollback fails too", async () => {
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+		store.startDeletion.mockResolvedValue(true);
+		sqsSend.mockRejectedValue(new Error("queue down"));
+		store.cancelDeletion.mockRejectedValue(new Error("throttled"));
+		const res = await call("DELETE /v1/orgs/{orgId}", { params: { orgId: "o1" }, body: { confirm_name: "Acme" } });
+		expect(res.statusCode).toBe(503);
+		expect(err.mock.calls.map((c) => JSON.parse(String(c[0])))).toEqual([
+			{ level: "error", msg: "deletion enqueue failed", org_id: "o1" },
+			{ level: "error", msg: "deletion rollback failed", org_id: "o1" },
+		]);
+		err.mockRestore();
 	});
 	it("doesn't queue a second deletion when the org already left active", async () => {
 		store.startDeletion.mockResolvedValue(false);
