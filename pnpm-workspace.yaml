@@ -1,0 +1,6 @@
+packages:
+  - sdk
+# esbuild's postinstall swaps its JS launcher for the native binary, which pnpm's bin
+# shim then runs with node. Skipping it keeps the launcher, which finds the binary.
+allowBuilds:
+  esbuild: false

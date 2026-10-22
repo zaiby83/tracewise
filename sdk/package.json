@@ -1,0 +1,9 @@
+{
+	"name": "@tracewise/sdk",
+	"version": "0.1.0",
+	"description": "Send LLM traces to Tracewise without slowing your app down",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": { ".": "./src/index.ts" },
+	"license": "MIT"
+}

@@ -1,0 +1,8 @@
+{
+	"app": "npx tsx infra/bin/tracewise.ts",
+	"watch": { "include": ["infra/**", "services/**"] },
+	"context": {
+		"@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+		"@aws-cdk/core:target-partitions": ["aws"]
+	}
+}
