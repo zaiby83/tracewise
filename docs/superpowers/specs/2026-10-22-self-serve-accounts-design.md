@@ -115,7 +115,7 @@ The query code after that, including Athena's tenant-filter enforcement, doesn't
 | `max_keys` / `max_members` / `max_pending_invites` | 10 / 5 / 10 | console Lambda |
 
 - The ingest check runs the per-minute update first and then the daily update. If the daily update fails, the minute window has slightly over-counted, which is acceptable.
-- When the daily cap is reached, ingest returns `429 { error: "daily event cap reached" }` with `retry-after` set to the seconds until UTC midnight and `x-tracewise-limit: daily`. The per-minute 429 gains `x-tracewise-limit: minute`.
+- When the daily cap is reached, ingest returns `429 { error: "daily event cap reached" }` with `retry-after` set to the seconds until UTC midnight and `x-tracewise-limit: day`. The per-minute 429 gains `x-tracewise-limit: minute`.
 - Operators raise limits by editing `PROFILE.limits`, through `scripts/set-limits.ts "<org name or id>" key=value…`, which also sets `plan: custom`.
 
 ### 5.2 Global caps
@@ -223,7 +223,7 @@ CDK assertion tests enforce the console and deleter rows and the existing rule t
 
 ## 11. Open items for later specs
 
-- **SDK spec:** build and publish `@tracewise/sdk`, write a Python SDK, and make the SDK stop retrying on `x-tracewise-limit: daily`.
+- **SDK spec:** build and publish `@tracewise/sdk`, write a Python SDK, and make the SDK stop retrying on `x-tracewise-limit: day`.
 - **Invite emails:** send through SES once a domain is verified and SES production access is granted. The `INVITE` items already hold everything needed.
 - **Billing and plans:** `plan` and `limits` already sit on `PROFILE`, ready for them.
 - **SSO:** Cognito SAML/OIDC identity providers, mapped to orgs by email domain.
@@ -257,3 +257,8 @@ These refine the sections above, and where they differ, they win.
 - `GET /v1/orgs` lists only orgs whose profile is active.
 - Unmigrated (old-shape) keys are refused at ingest when their org has a non-active profile. The migration rewrites keys of non-active orgs as revoked, a re-run with `--owner` can attach an owner to an existing owner-less org, and key-index rewrites are conditioned on the scanned status so a key revoked mid-migration isn't revived.
 - The console client uses refresh-token rotation with only the SRP explicit auth flow (no `ALLOW_REFRESH_TOKEN_AUTH`), and the console refreshes through `/oauth2/token`.
+- The daily-cap header value is `x-tracewise-limit: day` (not `daily`), pairing with `minute`; sections 5.1 and 11 use it.
+- The processor writes the hot table only for events whose `ts` is within [now − (`HOT_RETENTION_DAYS` + 1) days, now + 1 day] and whose partition date is no later than tomorrow (UTC). Others go to Firehose only, with one aggregated warning per batch, because the deleter never visits far-off partitions and TTL ignores expiries more than five years past.
+- The eval `sample` and `record` steps re-read the org's profile and skip an org that isn't active (sample returns no keys, so the run ends at `NothingToGrade`; record writes no run, metric or alert). `listTenants` reads every profile, whatever its status, so an old-shape key row of a suspended, deleting or deleted org isn't evaluated. The deleter's delayed sweep also re-deletes the org's eval runs, bounded and with its own cursor.
+- An `EvalWorkflowFailed` alarm on the eval state machine's `ExecutionsFailed` (sum ≥ 1 in an hour) goes to the alarms topic, and `listTenants` treats its `GlobalCapHit` metric as best effort.
+- Sign-out revokes the refresh token at `/oauth2/revoke` (best effort, bounded) before clearing storage and redirecting to the Cognito logout.

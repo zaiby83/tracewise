@@ -1,9 +1,11 @@
 // End-to-end check of self-serve accounts against a deployed stack: two Cognito test users, an
-// org, ingest, the trace query, an invite, a permission check, key revocation and org deletion
-// down to the last object in the lake. The stack must be deployed with the smoke client:
+// org, ingest (and the key's last_used_at stamp), the trace query, an invite, a permission check,
+// key revocation and org deletion down to the tombstone, the last hot-table item and the last
+// object in the lake. The stack must be deployed with the smoke client:
 //   TRACEWISE_ALARM_EMAIL=you@example.com TRACEWISE_DASHBOARD_KEY=<read-only key> pnpm run deploy --context smokeClient=true
 // Keep both variables set on every redeploy: without them the demo gets an empty key and the alarm email is dropped.
-// Needs the operator's AWS credentials (Cognito admin, and s3:ListBucket on the lake).
+// Needs the operator's AWS credentials (Cognito admin, s3:ListBucket on the lake, and DynamoDB
+// reads on the Accounts and Traces tables).
 // Usage: pnpm exec tsx scripts/smoke-selfserve.ts
 import {
 	AdminCreateUserCommand,
@@ -13,14 +15,18 @@ import {
 	CognitoIdentityProviderClient,
 } from "@aws-sdk/client-cognito-identity-provider";
 import { ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
+import { QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { Tracewise } from "../sdk/src/index";
+import { getProfile } from "../services/shared/accounts";
+import { ddb } from "../services/shared/ddb";
+import { partitionsForDay } from "../services/shared/keys";
 import { stackOutputs } from "./lib/stack";
 
 if (process.argv.length > 2) {
 	console.error("usage: pnpm exec tsx scripts/smoke-selfserve.ts");
 	console.error("Deploy first with: TRACEWISE_ALARM_EMAIL=... TRACEWISE_DASHBOARD_KEY=... pnpm run deploy --context smokeClient=true");
 	console.error("Set both variables on every redeploy, or the demo loses its key and the alarm email subscription is dropped.");
-	console.error("Reads the stack outputs UserPoolId, SmokeClientId, DashboardUrl and LakeBucket; takes no arguments.");
+	console.error("Reads the stack outputs UserPoolId, SmokeClientId, DashboardUrl, LakeBucket, AccountsTable and TracesTable; takes no arguments.");
 	process.exit(process.argv.some((a) => a === "-h" || a === "--help") ? 0 : 1);
 }
 
@@ -29,7 +35,7 @@ const outputs = await stackOutputs().catch((e: unknown) => {
 	console.error(`could not read the Tracewise stack: ${e instanceof Error ? e.message : String(e)}`);
 	process.exit(1);
 });
-const missing = ["UserPoolId", "SmokeClientId", "DashboardUrl", "LakeBucket"].filter((k) => !outputs[k]);
+const missing = ["UserPoolId", "SmokeClientId", "DashboardUrl", "LakeBucket", "TracesTable"].filter((k) => !outputs[k]);
 if (missing.length > 0) {
 	console.error(`stack outputs missing: ${missing.join(", ")}`);
 	if (missing.includes("SmokeClientId")) {
@@ -38,7 +44,14 @@ if (missing.length > 0) {
 	}
 	process.exit(1);
 }
-const { UserPoolId, SmokeClientId, DashboardUrl: url, LakeBucket } = outputs as { UserPoolId: string; SmokeClientId: string; DashboardUrl: string; LakeBucket: string };
+// stackOutputs also pointed getProfile at the Accounts table.
+const { UserPoolId, SmokeClientId, DashboardUrl: url, LakeBucket, TracesTable } = outputs as {
+	UserPoolId: string;
+	SmokeClientId: string;
+	DashboardUrl: string;
+	LakeBucket: string;
+	TracesTable: string;
+};
 
 const runId = crypto.randomUUID().slice(0, 8);
 const emails = { a: `smoke-${runId}-a@example.com`, b: `smoke-${runId}-b@example.com` };
@@ -107,6 +120,19 @@ async function lakeObjects(orgId: string): Promise<number> {
 	return KeyCount;
 }
 
+// Items left in the org's hot-table partitions for the given days, read directly with the
+// operator's credentials (the API can't see a deleted org's data at all).
+async function hotItems(orgId: string, days: string[]): Promise<number> {
+	let count = 0;
+	for (const pk of days.flatMap((d) => partitionsForDay(orgId, d))) {
+		const { Count = 0 } = await ddb.send(
+			new QueryCommand({ TableName: TracesTable, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": pk }, Select: "COUNT", ConsistentRead: true }),
+		);
+		count += Count;
+	}
+	return count;
+}
+
 let tokenA = "";
 let tokenB = "";
 let orgId = "";
@@ -142,6 +168,17 @@ try {
 	}
 	check("events queryable by the owner's session", seen === 5, `${seen} of 5 visible`);
 
+	// 4b. Ingest stamped the key's last_used_at. The write is fire-and-forget and limited by an
+	// IAM condition to pk, sk and last_used_at, so this is the live check of that condition.
+	const stampDeadline = Date.now() + 20_000;
+	let lastUsed: string | null = null;
+	while (Date.now() < stampDeadline && !lastUsed) {
+		const res = await api("GET", `/v1/orgs/${orgId}/keys`, tokenA);
+		lastUsed = (res.body?.keys ?? [])[0]?.last_used_at ?? null;
+		if (!lastUsed) await sleep(2000);
+	}
+	check("ingest stamped the key's last_used_at", Boolean(lastUsed), lastUsed ?? "still null");
+
 	// 5. Invite B, accept as B. The link's last segment is the token.
 	const invite = await api("POST", `/v1/orgs/${orgId}/invites`, tokenA, { email: emails.b, role: "member" });
 	const inviteToken = String(invite.body?.link ?? "").split("/invite/")[1] ?? "";
@@ -164,21 +201,28 @@ try {
 	const after = await ingest(secret);
 	check("revoked key rejected at ingest", after.status === 401, `status ${after.status}`);
 
-	// 8. Delete the org, then wait for the deleter and its delayed sweep to empty the lake.
+	// 8. Delete the org, then wait for the deleter to finish: the tombstone is written by its
+	// last phase, after the delayed sweep (15 minutes) has re-deleted late writes.
 	const deleted = await api("DELETE", `/v1/orgs/${orgId}`, tokenA, { confirm_name: orgName });
 	deleteRequested = deleted.status === 202;
 	check("org deletion accepted", deleteRequested, `status ${deleted.status}`);
-	const gone = Date.now() + 20 * 60_000;
-	let objects = -1;
-	let status = 0;
+	const gone = Date.now() + 25 * 60_000;
+	let profileStatus: string | undefined;
 	const waitStart = Date.now();
 	while (Date.now() < gone) {
-		objects = await lakeObjects(orgId);
-		status = (await api("GET", `/v1/orgs/${orgId}/traces?day=${day}`, tokenA)).status;
-		if (objects === 0 && status === 404) break;
-		await sleep(15_000);
+		profileStatus = (await getProfile(orgId))?.status;
+		if (profileStatus === "deleted") break;
+		await sleep(30_000);
 	}
-	check("lake prefix empty and org gone", objects === 0 && status === 404, `${objects} objects, status ${status}, after ${Math.round((Date.now() - waitStart) / 1000)} s`);
+	const waited = `after ${Math.round((Date.now() - waitStart) / 1000)} s`;
+	check("deleter finished (profile tombstoned)", profileStatus === "deleted", `status ${profileStatus ?? "missing"}, ${waited}`);
+	const status = (await api("GET", `/v1/orgs/${orgId}/traces?day=${day}`, tokenA)).status;
+	check("org gone from the API", status === 404, `status ${status}`);
+	const objects = await lakeObjects(orgId);
+	check("lake prefix empty", objects === 0, `${objects} objects`);
+	// The ingest day, and today too if the run crossed midnight UTC.
+	const items = await hotItems(orgId, [...new Set([day, new Date().toISOString().slice(0, 10)])]);
+	check("trace partitions empty", items === 0, `${items} items`);
 } catch (e) {
 	check("script ran to completion", false, e instanceof Error ? e.message : String(e));
 } finally {

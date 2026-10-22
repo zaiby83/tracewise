@@ -81,11 +81,23 @@ Each organisation gets free limits, which the console's Usage page shows:
 
 Ingest answers `429` at a cap, with `x-tracewise-limit: minute` or `day`. The daily one sets `retry-after` to the seconds until UTC midnight. Hitting the key, member or invite cap returns `409` with the limit's name.
 
+An event's `ts` is set by the client. Events stamped more than 31 days ago or more than a day ahead go to the analytics lake only, not the 30-day hot store, so the Traces view and evaluations don't see them.
+
 Three global caps protect the whole service: one person can own at most **3 organisations**, at most **100 organisations** can be created per UTC day, and the nightly evaluation makes at most **2,000 judge calls** in total. A `GlobalCapHit` alarm tells the operator when the sign-up cap is reached. An operator can raise one org's limits with `set-limits` (see [Run it](#run-it)).
 
-**Email limit.** Cognito's built-in email sender allows **50 emails a day**, and verification and password-reset emails count against it. That's fine for launch. The follow-up is to send through Amazon SES once a domain is verified and SES production access is granted. Invites aren't emailed: the owner copies a link.
+**Email limit.** Cognito's built-in email sender allows **50 emails a day** for the whole user pool, and verification and password-reset emails count against it. The console's app client is public, so anyone can call `SignUp` about 50 times in a day and use up the quota, and real users then get no verification or reset codes until it resets. So this is an abuse risk, not only a capacity limit. Before a public launch, send through Amazon SES (a verified domain and SES production access), or put a WAF rate limit on the user pool, or both. Invites aren't emailed: the owner copies a link.
 
-**Deleting an organisation** removes its keys, members, invites, eval runs, DynamoDB traces and the `traces/` partitions in the lake, then leaves a tombstone profile. A final sweep 15 minutes later catches writes that were still in flight. It deliberately leaves `errors/` (malformed records, 14-day lifecycle) and `athena-results/` (query output, 7-day lifecycle) to expire on their own.
+**Deleting an organisation** removes its keys, members, invites, eval runs, DynamoDB traces and the `traces/` partitions in the lake, then leaves a tombstone profile. A final sweep 15 minutes later catches writes that were still in flight, including an eval run recorded while the deletion started. It deliberately leaves `errors/` (malformed records, 14-day lifecycle) and `athena-results/` (query output, 7-day lifecycle) to expire on their own.
+
+**If a deletion gets stuck.** A step that fails 5 times goes to the deletion dead-letter queue and fires the `DeletionDeadLetters` alarm. The org stays `deleting`: it's hidden from the console and its keys no longer work, but some of its data is still there. Read the message on the dead-letter queue (it names the org and the phase), and the deleter's logs for the error, then fix the cause. Then move the message back to the deletion queue:
+
+```sh
+aws sqs list-queues --queue-name-prefix Tracewise-SelfServeDeletionDLQ             # the DLQ's URL (the queue's is the DeletionQueue output)
+aws sqs get-queue-attributes --queue-url <url> --attribute-names QueueArn          # for each of the two
+aws sqs start-message-move-task --source-arn <deletion DLQ ARN> --destination-arn <deletion queue ARN>
+```
+
+The deleter is idempotent and re-checks that the org is still `deleting` before every step, so a redriven message carries on where it stopped, and one for an org that is no longer deleting does nothing.
 
 ## The SDK
 
@@ -114,7 +126,7 @@ Requirements: Node 22+, pnpm, AWS CLI v2, and AWS CDK.
 
 ```sh
 pnpm install
-pnpm test                 # 314 tests: logic, SDK, console API, and CDK assertions on the synthesized stack
+pnpm test                 # 333 tests: logic, SDK, console API, and CDK assertions on the synthesized stack
 pnpm synth                # build the CloudFormation template locally, no AWS needed
 
 aws sso login             # with a profile from `aws configure sso`
@@ -136,12 +148,12 @@ pnpm exec tsx scripts/run-evals.ts [YYYY-MM-DD]                  # run the evalu
 ```sh
 TRACEWISE_ALARM_EMAIL=you@example.com TRACEWISE_DASHBOARD_KEY=<read-only key> pnpm run deploy --context smokeClient=true   # also adds the password-auth app client the smoke test needs
 pnpm exec tsx scripts/migrate-accounts.ts [--owner you@example.com]   # turn existing tenants into orgs
-pnpm exec tsx scripts/smoke-selfserve.ts                  # sign-up to deletion, end to end (about 25 minutes, mostly waiting for the delayed sweep)
+pnpm exec tsx scripts/smoke-selfserve.ts                  # sign-up to deletion, end to end (about 20 minutes, up to 30, mostly waiting for the delayed sweep)
 pnpm exec tsx scripts/set-limits.ts "<org name or id>" events_per_day=200000 max_members=10   # custom limits for one org
 ```
 
 - **`migrate-accounts`** creates an org for each existing tenant, with its current rate as the per-minute limit and a daily cap of that rate sustained all day, so the public demo and load tests keep working. Running it again changes nothing already migrated. With `--owner`, the Cognito user with that email (they must have signed up first) becomes owner of every active org that has no owner yet, not only the ones this run creates. Keys of orgs that are deleting, deleted or suspended are retired as revoked, so unsuspending an org later doesn't restore them. Create new keys instead.
-- **`smoke-selfserve`** creates two throwaway Cognito users and an org, ingests, queries, invites, checks permissions, revokes the key, then deletes the org and waits (up to 20 minutes) for its lake partitions to disappear. It deletes the users afterwards, even on failure. It needs your operator credentials, including `s3:ListBucket` on the lake. It creates one real org, so it counts toward the daily sign-up cap.
+- **`smoke-selfserve`** creates two throwaway Cognito users and an org, ingests, checks that the key's `last_used_at` was stamped, queries, invites, checks permissions, revokes the key, then deletes the org. It waits (up to 25 minutes) for the deleter to tombstone the org's profile, then checks that the org's lake prefix and today's trace partitions are empty. It deletes the users afterwards, even on failure. It needs your operator credentials, including `s3:ListBucket` on the lake and read access to the Accounts and Traces tables. It creates one real org, so it counts toward the daily sign-up cap.
 - **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`. Unnamed limits keep their value.
 
 ```sh
