@@ -73,13 +73,13 @@ describe("listTenants", () => {
 		const tenants = await import("../services/shared/tenants");
 		vi.spyOn(tenants.ddb, "send").mockResolvedValue({
 			Items: [
-				{ tenant_id: "t1", name: "Acme", status: "active", scope: "write" },
-				{ tenant_id: "t1", name: "Acme", status: "active", scope: "read" },
+				{ tenant_id: "t1", name: "Acme", status: "active", scope: "write", events_per_minute: 600 },
+				{ tenant_id: "t1", name: "Acme", status: "active", scope: "read", events_per_minute: 600 },
 				{ tenant_id: "t2", name: "Off", status: "disabled" },
 			],
 		} as never);
 		const { listTenants } = await import("../services/evals/handlers");
 		const { tenants: list } = await listTenants({ day: "2026-10-21" });
-		expect(list).toEqual([{ tenant_id: "t1", name: "Acme", rubric: null, day: "2026-10-21" }]);
+		expect(list).toEqual([{ tenant_id: "t1", name: "Acme", rubric: null, day: "2026-10-21", sample_budget: 20, sample_limit: 20 }]);
 	});
 });

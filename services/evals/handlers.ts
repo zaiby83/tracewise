@@ -4,7 +4,9 @@ import { PublishCommand, SNSClient } from "@aws-sdk/client-sns";
 import { GetCommand, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { log } from "../shared/http";
 import { partitionsForDay } from "../shared/keys";
-import { ddb } from "../shared/tenants";
+import { GLOBAL_JUDGE_CALLS_PER_NIGHT, legacyLimits, listActiveProfiles } from "../shared/accounts";
+import { ddb } from "../shared/ddb";
+import { counterIds } from "../shared/tenants";
 import { DEFAULT_RUBRIC, isRegression, judgeMessages, parseScores, summarize, type Graded } from "./judge-prompt";
 
 // The four steps of the nightly evaluation workflow. Step Functions passes only small
@@ -22,30 +24,61 @@ interface TenantRef {
 	// Always present (null for the default) because Step Functions fails on a missing path.
 	rubric: string | null;
 	day: string;
+	// Judge calls this org may use tonight: its own limit, or its share of the global cap
+	// when that is smaller. Both travel with the run so the shortfall can be recorded.
+	sample_budget: number;
+	sample_limit: number;
 }
 
-// Step 1: every active tenant, with the day to evaluate (yesterday by default). The
-// table holds one item per API key, and a tenant can have several (e.g. a read-only
-// dashboard key), so tenants are de-duplicated by id.
+// Step 1: every active org with evals on, with the day to evaluate (yesterday by default)
+// and its share of tonight's judge budget. Tenants that predate self-serve have no profile
+// yet, only key rows, so those are read too until the migration has rewritten them. The
+// table holds one item per API key and a tenant can have several (e.g. a read-only
+// dashboard key), so they are de-duplicated by id.
 export async function listTenants(input: { day?: string }): Promise<{ tenants: TenantRef[] }> {
 	const day = input.day ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-	const tenants: TenantRef[] = [];
+	const candidates: { tenant_id: string; name: string; rubric: string | null; limit: number }[] = [];
 	const seen = new Set<string>();
+
+	for (const p of await listActiveProfiles()) {
+		// Profiles are covered even with evals off, so an old key row can't re-enable them.
+		seen.add(p.org_id);
+		if (p.evals_enabled) candidates.push({ tenant_id: p.org_id, name: p.name, rubric: p.rubric, limit: p.limits.eval_samples_per_night });
+	}
+
 	let start: Record<string, unknown> | undefined;
 	do {
 		const page = await ddb.send(new ScanCommand({ TableName: process.env.TENANTS_TABLE, ExclusiveStartKey: start }));
 		for (const t of page.Items ?? []) {
-			if (t.status !== "active" || seen.has(t.tenant_id)) continue;
+			if (t.org_id || t.status !== "active" || seen.has(t.tenant_id)) continue;
 			seen.add(t.tenant_id);
-			tenants.push({ tenant_id: t.tenant_id, name: t.name, rubric: t.rubric ?? null, day });
+			candidates.push({
+				tenant_id: t.tenant_id,
+				name: t.name,
+				rubric: t.rubric ?? null,
+				limit: legacyLimits(t.events_per_minute).eval_samples_per_night,
+			});
 		}
 		start = page.LastEvaluatedKey;
 	} while (start);
+
+	// An equal split is simple and predictable; budget an org doesn't use isn't redistributed.
+	const share = Math.floor(GLOBAL_JUDGE_CALLS_PER_NIGHT / Math.max(candidates.length, 1));
+	const tenants = candidates.map(({ limit, ...c }) => ({ ...c, day, sample_budget: Math.min(limit, share), sample_limit: limit }));
+
+	if (tenants.some((t) => t.sample_budget < t.sample_limit)) {
+		await cloudwatch.send(
+			new PutMetricDataCommand({
+				Namespace: "Tracewise/Limits",
+				MetricData: [{ MetricName: "GlobalCapHit", Dimensions: [{ Name: "Cap", Value: "judge" }], Value: 1, Unit: "Count" }],
+			}),
+		);
+	}
 	return { tenants };
 }
 
-// Step 2: a random sample of the tenant's successful, unblocked calls for the day,
-// returned as keys only.
+// Step 2: a random sample of the tenant's successful, unblocked calls for the day (at most
+// its judge budget), returned as keys only.
 export async function sample(tenant: TenantRef): Promise<TenantRef & { keys: { pk: string; sk: string }[] }> {
 	const pages = await Promise.all(
 		partitionsForDay(tenant.tenant_id, tenant.day).map((pk) =>
@@ -67,7 +100,16 @@ export async function sample(tenant: TenantRef): Promise<TenantRef & { keys: { p
 		const j = Math.floor(Math.random() * (i + 1));
 		[all[i], all[j]] = [all[j]!, all[i]!];
 	}
-	return { ...tenant, keys: all.slice(0, SAMPLE_SIZE) };
+	const keys = all.slice(0, Math.min(tenant.sample_budget, SAMPLE_SIZE));
+
+	// The usage route reads the night's count from here, so it needs no access to eval runs.
+	await ddb.send(
+		new PutCommand({
+			TableName: process.env.QUOTAS_TABLE,
+			Item: { window: counterIds.evals(tenant.tenant_id, tenant.day), used: keys.length, expires_at: Math.floor(Date.now() / 1000) + 3 * 86_400 },
+		}),
+	);
+	return { ...tenant, keys };
 }
 
 // Step 3 (run in parallel by a Map state): grade one trace. Throttling errors are
@@ -118,6 +160,8 @@ export async function record(input: TenantRef & { results: Graded[] }) {
 				day: input.day,
 				judge_model: process.env.JUDGE_MODEL,
 				regressed,
+				sample_budget: input.sample_budget,
+				sample_shortfall: input.sample_limit - input.sample_budget,
 				...summary,
 				expires_at: Math.floor(Date.now() / 1000) + 400 * 86_400,
 			},
