@@ -43,8 +43,10 @@ export interface Scan {
 // always plans the same items; rows already rewritten (they have an org_id) plan nothing.
 //
 // Existing profiles come as a Set of ids, or a Map with what the scan saw. With the Map:
-// - a row whose org isn't active (deleting, deleted, suspended) plans nothing, so no KEY item
-//   or lean row appears for an org on its way out;
+// - a row whose org isn't active (deleting, deleted, suspended) is retired: its index row is
+//   rewritten as revoked, with no KEY item. Leaving it in the old shape would leave the key
+//   working at ingest, which accepts any old-shape row, and the deleter only reaches index
+//   rows through KEY items;
 // - with an owner, an active profile with no owners gets a membership, which is how a later
 //   run claims orgs migrated before the operator had an account.
 // A bare Set carries no status or owner count, so it plans neither.
@@ -63,7 +65,13 @@ export function planMigration(
 		if (row.org_id) continue;
 		const orgId = row.tenant_id;
 		const found = existing(orgId);
-		if (found && found !== "unknown" && found.status !== "active") continue;
+		const retired = !!found && found !== "unknown" && found.status !== "active";
+		const scope = row.scope ?? "write";
+		const keyId = row.key_hash.slice(0, 16);
+		if (retired) {
+			plan.index.push({ key_hash: row.key_hash, org_id: orgId, key_id: keyId, scope, status: "revoked" });
+			continue;
+		}
 
 		if (!found) {
 			const profile = planned.get(orgId);
@@ -91,8 +99,6 @@ export function planMigration(
 		// Every row gets a KEY item, even when its profile exists: the deleter finds an org's
 		// key-index rows through its KEY items, so a rewritten row without one would outlive
 		// the org.
-		const scope = row.scope ?? "write";
-		const keyId = row.key_hash.slice(0, 16);
 		const active = row.status === "active";
 		plan.keys.push({
 			org_id: orgId,
@@ -155,6 +161,8 @@ export interface MigrationCounts {
 	members: number;
 	keys: number;
 	index: number;
+	// Index rows of inactive orgs, rewritten as revoked (they get no KEY item).
+	retired: number;
 	// Rows whose status changed between the scan and the rewrite: left alone, picked up by a re-run.
 	stale: number;
 }
@@ -181,7 +189,7 @@ async function putOnce(params: ConstructorParameters<typeof PutCommand>[0]): Pro
 // re-run finishes whatever was left: every write is conditional and skips what is done.
 export async function applyPlan(plan: MigrationPlan, scan: Scan): Promise<MigrationCounts> {
 	const accounts = process.env.ACCOUNTS_TABLE;
-	const counts: MigrationCounts = { profiles: 0, members: 0, keys: 0, index: 0, stale: 0 };
+	const counts: MigrationCounts = { profiles: 0, members: 0, keys: 0, index: 0, retired: 0, stale: 0 };
 	const memberOf = (orgId: string) => plan.members.find((m) => m.org_id === orgId);
 	const memberItems = (m: Member, orgName: string) => [
 		{ Put: { TableName: accounts, Item: { pk: k.org(m.org_id), sk: k.member(m.sub), ...m }, ConditionExpression: "attribute_not_exists(pk)" } },
@@ -236,12 +244,16 @@ export async function applyPlan(plan: MigrationPlan, scan: Scan): Promise<Migrat
 	}
 
 	const scanned = new Map(scan.rows.map((r) => [r.key_hash, r.status]));
-	for (const record of plan.keys) {
-		const row = plan.index.find((i) => i.key_hash === record.key_hash);
-		const scannedStatus = scanned.get(record.key_hash);
-		if (!row || scannedStatus === undefined) throw new Error(`plan has no scanned index row for key ${record.key_id}`);
-		const item = { pk: k.org(record.org_id), sk: k.key(record.key_id), ...record };
-		if (await putOnce({ TableName: accounts, Item: item, ConditionExpression: "attribute_not_exists(pk)" })) counts.keys++;
+	const records = new Map(plan.keys.map((r) => [r.key_hash, r]));
+	for (const row of plan.index) {
+		const scannedStatus = scanned.get(row.key_hash);
+		if (scannedStatus === undefined) throw new Error(`plan has no scanned index row for key ${row.key_id}`);
+		// A row without a KEY record belongs to an inactive org and is only being retired.
+		const record = records.get(row.key_hash);
+		if (record) {
+			const item = { pk: k.org(record.org_id), sk: k.key(record.key_id), ...record };
+			if (await putOnce({ TableName: accounts, Item: item, ConditionExpression: "attribute_not_exists(pk)" })) counts.keys++;
+		}
 		// Only an old-shape row (no org_id) is replaced, and only while its status is still what
 		// the plan was made from: a key revoked since the scan must not come back to life. The
 		// lean row has no other fields to lose.
@@ -252,8 +264,9 @@ export async function applyPlan(plan: MigrationPlan, scan: Scan): Promise<Migrat
 			ExpressionAttributeNames: { "#s": "status" },
 			ExpressionAttributeValues: { ":scanned": scannedStatus },
 		});
-		if (written) counts.index++;
-		else counts.stale++;
+		if (!written) counts.stale++;
+		else if (record) counts.index++;
+		else counts.retired++;
 	}
 	return counts;
 }

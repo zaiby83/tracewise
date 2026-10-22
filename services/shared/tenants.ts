@@ -44,12 +44,16 @@ export async function tenantForKey(apiKey: string): Promise<Tenant | null> {
 
 // The Tenants table is the key index: one get by key hash. New rows point at an org, whose
 // profile carries the name and limits. Rows from before self-serve have no org_id and carry
-// their own fields, so they keep working until the migration rewrites them.
+// their own fields, so they keep working until the migration rewrites them, unless their org
+// has a profile that isn't active: a deleted or suspended org must not keep ingesting through
+// a key the migration hasn't reached.
 async function resolve(keyHash: string): Promise<Tenant | null> {
 	const { Item } = await ddb.send(new GetCommand({ TableName: process.env.TENANTS_TABLE, Key: { key_hash: keyHash } }));
 	if (!Item || Item.status !== "active") return null;
 
 	if (!Item.org_id) {
+		const legacy = await getProfile(Item.tenant_id);
+		if (legacy && legacy.status !== "active") return null;
 		return {
 			tenant_id: Item.tenant_id,
 			org_id: Item.tenant_id,

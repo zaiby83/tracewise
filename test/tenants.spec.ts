@@ -44,11 +44,22 @@ describe("tenantForKey", () => {
 		accounts.getProfile.mockResolvedValueOnce(null);
 		expect(await tenantForKey(newApiKey())).toBeNull();
 	});
-	it("falls back to an old-shape row that has no org_id yet", async () => {
-		accounts.getProfile.mockClear();
-		ddb.send.mockResolvedValueOnce({ Item: { key_hash: "h", tenant_id: "t1", name: "Demo", status: "active", events_per_minute: 6000, scope: "read" } });
-		expect(await tenantForKey(newApiKey())).toMatchObject({ tenant_id: "t1", org_id: "t1", scope: "read", limits: legacyLimits(6000) });
-		expect(accounts.getProfile).not.toHaveBeenCalled();
+	const legacyRow = { key_hash: "h", tenant_id: "t1", name: "Demo", status: "active", events_per_minute: 6000, scope: "read" };
+	it("falls back to an old-shape row that has no org_id and no profile yet", async () => {
+		accounts.getProfile.mockReset().mockResolvedValue(null);
+		ddb.send.mockResolvedValueOnce({ Item: legacyRow });
+		expect(await tenantForKey(newApiKey())).toMatchObject({ tenant_id: "t1", org_id: "t1", scope: "read", name: "Demo", limits: legacyLimits(6000) });
+		expect(accounts.getProfile).toHaveBeenCalledWith("t1");
+	});
+	it("serves an old-shape row whose org has an active profile, built from the row", async () => {
+		accounts.getProfile.mockReset().mockResolvedValue({ ...profile, org_id: "t1" });
+		ddb.send.mockResolvedValueOnce({ Item: legacyRow });
+		expect(await tenantForKey(newApiKey())).toMatchObject({ tenant_id: "t1", name: "Demo", limits: legacyLimits(6000) });
+	});
+	it.each(["deleted", "deleting", "suspended"])("refuses an old-shape row whose org is %s", async (status) => {
+		accounts.getProfile.mockReset().mockResolvedValue({ ...profile, org_id: "t1", status });
+		ddb.send.mockResolvedValueOnce({ Item: legacyRow });
+		expect(await tenantForKey(newApiKey())).toBeNull();
 	});
 	it("caches the result per key for a minute", async () => {
 		const key = newApiKey();

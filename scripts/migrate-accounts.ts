@@ -41,10 +41,8 @@ const plan = planMigration(rows, profiles, owner);
 const counts = await applyPlan(plan, { rows, profiles });
 
 const pending = rows.filter((r) => !r.org_id).length;
-// Old-shape rows that planned nothing belong to orgs that are not active; they stay as they are.
-const inactive = pending - plan.index.length;
 console.error(`Key index: ${rows.length} rows, ${pending} in the old shape.`);
 console.error(`Wrote ${counts.profiles} profiles, ${counts.members} owner memberships, ${counts.keys} key records, ${counts.index} index rows.`);
-if (inactive > 0) console.error(`Skipped ${inactive} rows of orgs that are deleting, deleted or suspended.`);
+if (counts.retired > 0) console.error(`Retired ${counts.retired} keys of orgs that are deleting, deleted or suspended (rewritten as revoked).`);
 if (counts.stale > 0) console.error(`Skipped ${counts.stale} rows that changed during the run: run it again to pick them up.`);
 if (pending === 0 && counts.members === 0) console.error("Nothing to migrate.");

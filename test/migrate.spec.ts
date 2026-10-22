@@ -113,7 +113,7 @@ describe("applyPlan", () => {
 		expect(puts[0]).toMatchObject({ ConditionExpression: "attribute_not_exists(pk)" });
 		expect(puts[0]!.Item).toMatchObject({ pk: "ORG#t1", org_id: "t1", key_id: "aaaaaaaaaaaaaaaa" });
 		expect(puts[1]).toMatchObject({ ConditionExpression: "attribute_not_exists(org_id) AND #s = :scanned", ExpressionAttributeValues: { ":scanned": "active" }, Item: { key_hash: demo.key_hash, org_id: "t1", key_id: "aaaaaaaaaaaaaaaa", scope: "read", status: "active" } });
-		expect(counts).toEqual({ profiles: 1, members: 1, keys: 2, index: 2, stale: 0 });
+		expect(counts).toEqual({ profiles: 1, members: 1, keys: 2, index: 2, retired: 0, stale: 0 });
 	});
 
 	it("writes no member or USER item without an owner", async () => {
@@ -129,7 +129,7 @@ describe("applyPlan", () => {
 		});
 		const counts = await applyPlan(plan(), scan);
 		// Nothing written; the index rows count as stale because every condition failed here.
-		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 2 });
+		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, retired: 0, stale: 2 });
 		// The keys are still attempted after a profile that already exists.
 		expect(calls(PutCommand)).toHaveLength(4);
 	});
@@ -140,7 +140,7 @@ describe("applyPlan", () => {
 			return {};
 		});
 		const counts = await applyPlan(planMigration([demo], new Set(["t1"])), { rows: [demo], profiles: new Map() });
-		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 1, stale: 0 });
+		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 1, retired: 0, stale: 0 });
 	});
 
 	it("does not swallow real errors", async () => {
@@ -152,7 +152,7 @@ describe("applyPlan", () => {
 
 	it("writes nothing for an empty plan", async () => {
 		ddb.send.mockReset().mockResolvedValue({});
-		expect(await applyPlan(planMigration([], new Set()), { rows: [], profiles: new Map() })).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 0 });
+		expect(await applyPlan(planMigration([], new Set()), { rows: [], profiles: new Map() })).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, retired: 0, stale: 0 });
 		expect(ddb.send).not.toHaveBeenCalled();
 	});
 });
@@ -173,15 +173,18 @@ describe("planMigration with scanned profiles", () => {
 		expect(planMigration([], new Map([["t1", info("active", 0)]])).members).toEqual([]);
 	});
 
-	it("skips rows of orgs that are not active: no KEY item, no index rewrite", () => {
-		const rows = [demo, { ...demo, key_hash: "f".repeat(64), tenant_id: "t9" }];
+	it("retires rows of orgs that are not active: a revoked lean row, no KEY item", () => {
+		const rows = [demo, { ...demo, key_hash: "f".repeat(64), tenant_id: "t9", scope: undefined }];
 		const profiles = new Map([["t1", info("deleted", 0)], ["t9", info("active", 1)]]);
 		const p = planMigration(rows, profiles, owner);
 		expect(p.keys.map((x) => x.org_id)).toEqual(["t9"]);
-		expect(p.index.map((x) => x.org_id)).toEqual(["t9"]);
+		expect(p.index).toEqual([
+			{ key_hash: demo.key_hash, org_id: "t1", key_id: "aaaaaaaaaaaaaaaa", scope: "read", status: "revoked" },
+			{ key_hash: "f".repeat(64), org_id: "t9", key_id: "ffffffffffffffff", scope: "write", status: "active" },
+		]);
 		for (const status of ["deleting", "deleted", "suspended"] as const) {
 			const q = planMigration([demo], new Map([["t1", info(status, 0)]]));
-			expect(q).toEqual({ profiles: [], members: [], keys: [], index: [] });
+			expect(q).toEqual({ profiles: [], members: [], keys: [], index: [expect.objectContaining({ org_id: "t1", status: "revoked" })] });
 		}
 	});
 });
@@ -216,7 +219,7 @@ describe("applyPlan, owner attach and stale rows", () => {
 			return {};
 		});
 		const counts = await applyPlan(planMigration([demo], new Set(["t1"])), { rows: [demo], profiles: new Map() });
-		expect(counts).toEqual({ profiles: 0, members: 0, keys: 1, index: 0, stale: 1 });
+		expect(counts).toEqual({ profiles: 0, members: 0, keys: 1, index: 0, retired: 0, stale: 1 });
 	});
 
 	it("guards the rewrite with the raw scanned status, not the mapped one", async () => {
@@ -281,27 +284,29 @@ describe("a full migration, run three times", () => {
 
 	it("migrates without an owner, attaches one on the second run, and the third changes nothing", async () => {
 		const db = fakeAws();
-		expect(await run()).toEqual({ profiles: 1, members: 0, keys: 2, index: 2, stale: 0 });
+		expect(await run()).toEqual({ profiles: 1, members: 0, keys: 2, index: 2, retired: 0, stale: 0 });
 		expect(db.get("accounts|ORG#t1|PROFILE")!.owner_count).toBe(0);
 		expect([...db.keys()].filter((key) => key.startsWith("accounts|ORG#t1|KEY#"))).toHaveLength(2);
 		for (const row of [demo, write]) expect(db.get(`tenants|${row.key_hash}|`)).toMatchObject({ org_id: "t1" });
 
-		expect(await run(owner)).toEqual({ profiles: 0, members: 1, keys: 0, index: 0, stale: 0 });
+		expect(await run(owner)).toEqual({ profiles: 0, members: 1, keys: 0, index: 0, retired: 0, stale: 0 });
 		expect(db.get("accounts|ORG#t1|PROFILE")!.owner_count).toBe(1);
 		expect(db.get("accounts|ORG#t1|MEMBER#u1")).toMatchObject({ role: "owner" });
 		expect(db.get("accounts|USER#u1|ORG#t1")).toMatchObject({ role: "owner", org_name: "Acme Support" });
 
 		const before = structuredClone([...db]);
-		expect(await run(owner)).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 0 });
+		expect(await run(owner)).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, retired: 0, stale: 0 });
 		expect([...db]).toEqual(before);
 	});
 
-	it("does not touch the keys of an org that is deleting", async () => {
+	it("retires the keys of an org that is deleting: revoked lean rows, no KEY item", async () => {
 		const db = fakeAws();
 		db.set("accounts|ORG#t1|PROFILE", { pk: "ORG#t1", sk: "PROFILE", org_id: "t1", name: "Acme Support", status: "deleting", owner_count: 0 });
-		expect(await run(owner)).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 0 });
-		expect(db.get(`tenants|${demo.key_hash}|`)).not.toHaveProperty("org_id");
+		expect(await run(owner)).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, retired: 2, stale: 0 });
+		for (const row of [demo, write]) expect(db.get(`tenants|${row.key_hash}|`)).toMatchObject({ org_id: "t1", status: "revoked" });
 		expect([...db.keys()].some((key) => key.includes("KEY#"))).toBe(false);
+		// Nothing is left in the old shape, so a re-run has nothing to do.
+		expect(await run(owner)).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, retired: 0, stale: 0 });
 	});
 });
 
