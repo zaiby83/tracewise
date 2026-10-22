@@ -14,6 +14,7 @@ import { Topic } from "aws-cdk-lib/aws-sns";
 import { EmailSubscription } from "aws-cdk-lib/aws-sns-subscriptions";
 import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
+import { Analytics } from "./analytics";
 
 const services = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../services");
 
@@ -101,9 +102,13 @@ export class TracewiseStack extends Stack {
 		tenants.grantReadData(ingest);
 		quotas.grantReadWriteData(ingest);
 
+		const analytics = new Analytics(this, "Analytics");
+
 		const processor = fn("Processor", "processor/handler.ts", { timeout: processorTimeout });
 		processor.addEnvironment("TRACES_TABLE", traces.tableName);
+		processor.addEnvironment("DELIVERY_STREAM", analytics.deliveryStream.ref);
 		traces.grantWriteData(processor);
+		analytics.grantPut(processor);
 		processor.addEventSource(
 			new SqsEventSource(queue, {
 				batchSize: props.batchSize ?? 10,
@@ -120,10 +125,22 @@ export class TracewiseStack extends Stack {
 		traces.grantReadData(query);
 		tenants.grantReadData(query);
 
+		const summary = fn("Summary", "analytics/handler.ts", { timeout: Duration.seconds(29) });
+		summary.addEnvironment("TENANTS_TABLE", tenants.tableName);
+		summary.addEnvironment("WORKGROUP", analytics.workGroup.name);
+		summary.addEnvironment("GLUE_DATABASE", analytics.database);
+		tenants.grantReadData(summary);
+		analytics.grantQuery(summary);
+
 		// ---- API --------------------------------------------------------------------
 		const api = new HttpApi(this, "Api", { description: "Tracewise ingest and query API" });
 		api.addRoutes({ path: "/v1/traces", methods: [HttpMethod.POST], integration: new HttpLambdaIntegration("IngestRoute", ingest) });
 		api.addRoutes({ path: "/v1/traces", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("QueryRoute", query) });
+		api.addRoutes({
+			path: "/v1/analytics/summary",
+			methods: [HttpMethod.GET],
+			integration: new HttpLambdaIntegration("AnalyticsRoute", summary),
+		});
 		// Account-wide backstop throttle; per-tenant quotas are enforced in the ingest function.
 		const stage = api.defaultStage!.node.defaultChild as import("aws-cdk-lib/aws-apigatewayv2").CfnStage;
 		stage.defaultRouteSettings = { throttlingRateLimit: 200, throttlingBurstLimit: 400 };
@@ -161,5 +178,6 @@ export class TracewiseStack extends Stack {
 		new CfnOutput(this, "ApiUrl", { value: api.apiEndpoint });
 		new CfnOutput(this, "TenantsTable", { value: tenants.tableName });
 		new CfnOutput(this, "TracesTable", { value: traces.tableName });
+		new CfnOutput(this, "LakeBucket", { value: analytics.bucket.bucketName });
 	}
 }

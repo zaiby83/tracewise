@@ -1,3 +1,4 @@
+import { FirehoseClient, PutRecordBatchCommand } from "@aws-sdk/client-firehose";
 import { BatchWriteCommand } from "@aws-sdk/lib-dynamodb";
 import type { SQSBatchResponse, SQSEvent, SQSRecord } from "aws-lambda";
 import { log } from "../shared/http";
@@ -6,12 +7,15 @@ import type { QueuedEvent } from "../shared/schema";
 import { ddb } from "../shared/tenants";
 
 const DDB_BATCH = 25; // BatchWriteItem's maximum
+const FIREHOSE_BATCH = 500; // PutRecordBatch's maximum
 const MAX_ATTEMPTS = 4;
+const firehose = new FirehoseClient({});
 
-// Consumes queued events in batches and writes them to the hot store. Failures are
-// reported per message (ReportBatchItemFailures), so a single bad write retries only
-// that message rather than the whole batch. Writes are idempotent: the same event
-// always maps to the same key.
+// Consumes queued events in batches and writes each one twice: to the hot store
+// (DynamoDB) and to the analytics stream (Firehose → S3 Parquet). Failures are reported
+// per message (ReportBatchItemFailures), so a failed write retries only that message.
+// DynamoDB writes are idempotent; a retried message may reach Firehose twice, which
+// analytics tolerates by counting distinct event ids.
 export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 	const failures = new Set<string>();
 	const items: { messageId: string; item: Record<string, unknown> }[] = [];
@@ -22,13 +26,11 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 		else failures.add(record.messageId);
 	}
 
-	const chunks: (typeof items)[] = [];
-	for (let i = 0; i < items.length; i += DDB_BATCH) chunks.push(items.slice(i, i + DDB_BATCH));
-	await Promise.all(
-		chunks.map(async (chunk) => {
-			for (const id of await writeChunk(chunk)) failures.add(id);
-		}),
-	);
+	const failed = await Promise.all([
+		...chunk(items, DDB_BATCH).map(writeChunk),
+		...(process.env.DELIVERY_STREAM ? chunk(items, FIREHOSE_BATCH).map(streamChunk) : []),
+	]);
+	for (const id of failed.flat()) failures.add(id);
 
 	if (failures.size) log("warn", "batch had failures", { failed: failures.size, total: event.Records.length });
 	return { batchItemFailures: [...failures].map((itemIdentifier) => ({ itemIdentifier })) };
@@ -51,11 +53,44 @@ export function toItem(record: SQSRecord): Record<string, unknown> | null {
 	}
 }
 
+function chunk<T>(list: T[], size: number): T[][] {
+	const out: T[][] = [];
+	for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+	return out;
+}
+
+// The analytics record: the event without the hot store's key and TTL attributes.
+function analyticsRecord(item: Record<string, unknown>): Uint8Array {
+	const { pk, sk, expires_at, ...record } = item;
+	return new TextEncoder().encode(`${JSON.stringify(record)}\n`);
+}
+
+// PutRecordBatch also succeeds partially (FailedPutCount); retry just the failed records.
+async function streamChunk(batch: { messageId: string; item: Record<string, unknown> }[]): Promise<string[]> {
+	let pending = batch;
+	for (let attempt = 0; attempt < MAX_ATTEMPTS && pending.length; attempt++) {
+		if (attempt > 0) await new Promise((r) => setTimeout(r, 50 * 2 ** attempt + Math.random() * 50));
+		try {
+			const res = await firehose.send(
+				new PutRecordBatchCommand({
+					DeliveryStreamName: process.env.DELIVERY_STREAM,
+					Records: pending.map(({ item }) => ({ Data: analyticsRecord(item) })),
+				}),
+			);
+			if (!res.FailedPutCount) return [];
+			pending = pending.filter((_, i) => res.RequestResponses?.[i]?.ErrorCode);
+		} catch (err) {
+			log("warn", "firehose put failed", { attempt, error: String(err) });
+		}
+	}
+	return pending.map((p) => p.messageId);
+}
+
 // BatchWriteItem can succeed partially, returning UnprocessedItems under throttling.
 // Those are retried with exponential backoff; whatever still fails goes back to SQS.
-async function writeChunk(chunk: { messageId: string; item: Record<string, unknown> }[]): Promise<string[]> {
+async function writeChunk(batch: { messageId: string; item: Record<string, unknown> }[]): Promise<string[]> {
 	const table = process.env.TRACES_TABLE!;
-	let pending = chunk;
+	let pending = batch;
 	for (let attempt = 0; attempt < MAX_ATTEMPTS && pending.length; attempt++) {
 		if (attempt > 0) await new Promise((r) => setTimeout(r, 50 * 2 ** attempt + Math.random() * 50));
 		try {

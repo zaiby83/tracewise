@@ -4,3 +4,26 @@ packages:
 # shim then runs with node. Skipping it keeps the launcher, which finds the binary.
 allowBuilds:
   esbuild: false
+minimumReleaseAgeExclude:
+  - '@aws-sdk/client-athena@3.1155.0'
+  - '@aws-sdk/client-cloudformation@3.1155.0'
+  - '@aws-sdk/client-dynamodb@3.1155.0'
+  - '@aws-sdk/client-firehose@3.1155.0'
+  - '@aws-sdk/client-sqs@3.1155.0'
+  - '@aws-sdk/core@3.978.5'
+  - '@aws-sdk/credential-provider-env@3.972.76'
+  - '@aws-sdk/credential-provider-http@3.972.78'
+  - '@aws-sdk/credential-provider-ini@3.973.21'
+  - '@aws-sdk/credential-provider-login@3.972.83'
+  - '@aws-sdk/credential-provider-node@3.972.88'
+  - '@aws-sdk/credential-provider-process@3.972.76'
+  - '@aws-sdk/credential-provider-sso@3.973.20'
+  - '@aws-sdk/credential-provider-web-identity@3.972.82'
+  - '@aws-sdk/dynamodb-codec@3.973.50'
+  - '@aws-sdk/lib-dynamodb@3.1155.0'
+  - '@aws-sdk/middleware-endpoint-discovery@3.972.34'
+  - '@aws-sdk/middleware-sdk-sqs@3.972.46'
+  - '@aws-sdk/nested-clients@3.997.50'
+  - '@aws-sdk/signature-v4-multi-region@3.996.49'
+  - '@aws-sdk/token-providers@3.1155.0'
+  - '@aws-sdk/types@3.975.0'

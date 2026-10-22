@@ -42,8 +42,11 @@ describe("TracewiseStack", () => {
 	});
 
 	it("runs every function on Graviton with X-Ray tracing", () => {
-		const fns = Object.values(template.findResources("AWS::Lambda::Function")).filter((f) => f.Properties.Runtime?.startsWith("nodejs"));
-		expect(fns.length).toBeGreaterThanOrEqual(3);
+		// Our functions only: CDK's own custom-resource provider functions are excluded.
+		const fns = Object.entries(template.findResources("AWS::Lambda::Function"))
+			.filter(([id]) => !id.startsWith("Custom"))
+			.map(([, f]) => f);
+		expect(fns).toHaveLength(4);
 		for (const f of fns) {
 			expect(f.Properties.Architectures).toEqual(["arm64"]);
 			expect(f.Properties.TracingConfig).toEqual({ Mode: "Active" });
@@ -65,5 +68,51 @@ describe("TracewiseStack", () => {
 		template.hasResourceProperties("AWS::ApiGatewayV2::Stage", {
 			DefaultRouteSettings: { ThrottlingRateLimit: 200, ThrottlingBurstLimit: 400 },
 		});
+	});
+
+	it("keeps the data lake private, encrypted and TLS-only, with retention", () => {
+		template.hasResourceProperties("AWS::S3::Bucket", {
+			BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: "AES256" } }] },
+			PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true },
+			LifecycleConfiguration: { Rules: Match.arrayWith([Match.objectLike({ Prefix: "traces/", ExpirationInDays: 365 })]) },
+		});
+		template.hasResourceProperties("AWS::S3::BucketPolicy", {
+			PolicyDocument: { Statement: Match.arrayWith([Match.objectLike({ Effect: "Deny", Condition: { Bool: { "aws:SecureTransport": "false" } } })]) },
+		});
+	});
+
+	it("delivers Parquet, partitioned by tenant and day", () => {
+		template.hasResourceProperties("AWS::KinesisFirehose::DeliveryStream", {
+			ExtendedS3DestinationConfiguration: Match.objectLike({
+				Prefix: "traces/tenant_id=!{partitionKeyFromQuery:tenant_id}/dt=!{partitionKeyFromQuery:dt}/",
+				DynamicPartitioningConfiguration: Match.objectLike({ Enabled: true }),
+				DataFormatConversionConfiguration: Match.objectLike({
+					Enabled: true,
+					OutputFormatConfiguration: { Serializer: { ParquetSerDe: { Compression: "SNAPPY" } } },
+				}),
+			}),
+		});
+	});
+
+	it("forces every Athena query to name a tenant (injected partition projection)", () => {
+		template.hasResourceProperties("AWS::Glue::Table", {
+			TableInput: Match.objectLike({
+				Parameters: Match.objectLike({ "projection.enabled": "true", "projection.tenant_id.type": "injected" }),
+			}),
+		});
+	});
+
+	it("caps how much any Athena query can scan, and callers can't override it", () => {
+		template.hasResourceProperties("AWS::Athena::WorkGroup", {
+			WorkGroupConfiguration: Match.objectLike({ EnforceWorkGroupConfiguration: true, BytesScannedCutoffPerQuery: 1024 ** 3 }),
+		});
+	});
+
+	it("gives the analytics function read-only access to data", () => {
+		const policies = Object.values(template.findResources("AWS::IAM::Policy")).filter((p) => /SummaryServiceRole/.test(JSON.stringify(p.Properties.Roles)));
+		const doc = JSON.stringify(policies);
+		expect(doc).not.toMatch(/dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/);
+		expect(doc).not.toMatch(/glue:(Create|Update|Delete)/);
+		expect(doc).not.toMatch(/firehose:/);
 	});
 });

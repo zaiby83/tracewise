@@ -11,7 +11,9 @@
 		"tenant:create": "tsx scripts/create-tenant.ts"
 	},
 	"dependencies": {
+		"@aws-sdk/client-athena": "3.1155.0",
 		"@aws-sdk/client-dynamodb": "3.1155.0",
+		"@aws-sdk/client-firehose": "3.1155.0",
 		"@aws-sdk/client-sqs": "3.1155.0",
 		"@aws-sdk/lib-dynamodb": "3.1155.0",
 		"zod": "4.6.7"

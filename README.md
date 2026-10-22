@@ -4,11 +4,11 @@ LLM observability and evaluation on serverless AWS. Apps send every model call t
 
 - **[PR/FAQ](docs/PRFAQ.md):** the product, written working backwards.
 - **[Design document](docs/design.md):** requirements, architecture, service trade-offs, failure modes, cost model, validation plan.
-- **[Experiments](docs/experiments.md):** measurements from the deployed stack. The first one cut ingest-to-queryable latency from 6.3 s to 63 ms (p50).
+- **[Experiments](docs/experiments.md):** measurements from the deployed stack. They cover cutting ingest-to-queryable latency from 6.3 s to 63 ms (p50), and proving that Athena itself refuses queries that skip the tenant filter.
 
-> **Status:** Milestone 1 of 6 (the ingest pipeline, API keys and SDK) is built and tested. Analytics, evaluations, the dashboard and the load test are next. See [milestones](docs/design.md#9-milestones).
+> **Status:** Milestones 1 and 2 of 6 are live: the ingest pipeline, API keys and SDK, and the S3/Athena data lake with an analytics API. Evaluations, the dashboard and the load test are next. See [milestones](docs/design.md#9-milestones).
 
-## Architecture (Milestone 1)
+## Architecture (Milestones 1–2)
 
 ```mermaid
 flowchart LR
@@ -18,7 +18,11 @@ flowchart LR
     SQS --> PROC[Lambda: processor]
     SQS -.5 failures.-> DLQ[(DLQ)]
     PROC --> DDB[(DynamoDB<br/>sharded, TTL)]
+    PROC --> FH[Data Firehose<br/>JSON → Parquet]
+    FH --> S3[(S3 data lake<br/>tenant_id/dt partitions)]
+    S3 --- GLUE[Glue table<br/>partition projection]
     APIGW --> Q[Lambda: query] --> DDB
+    APIGW --> AN[Lambda: analytics] --> ATH[Athena workgroup<br/>1 GB scan cap] --> GLUE
     DLQ & SQS & ING -.-> CW[CloudWatch alarms → SNS]
 ```
 
@@ -29,6 +33,8 @@ flowchart LR
 - **Partial-batch failure handling.** The processor reports failures per message, retries DynamoDB's unprocessed items with backoff, and dead-letters after five attempts. An alarm fires on the first dead letter.
 - **Tenant isolation.** The tenant comes from the hashed API key, never from the request. API keys are stored only as SHA-256 hashes.
 - **Per-tenant quotas** are counted atomically in DynamoDB, so they hold across every concurrent Lambda.
+- **A data lake that enforces isolation.** Firehose converts events to Parquet and partitions them by tenant and day. The Glue table uses *injected* partition projection, so Athena rejects any query that doesn't name a tenant, and a tenant's query reads only that tenant's prefix. Proven in [experiment 2](docs/experiments.md#2-the-data-lake-tenant-isolation-and-what-a-query-actually-reads).
+- **Cost guardrails on analytics.** The Athena workgroup enforces a 1 GB per-query scan cap that callers can't override. Repeated questions reuse cached results, and S3 lifecycle rules tier and expire data.
 - **Least-privilege IAM.** For example, the ingest function can't read or write traces at all, and a test enforces that.
 
 ## The SDK
@@ -58,7 +64,7 @@ Requirements: Node 22+, pnpm, AWS CLI v2, and AWS CDK.
 
 ```sh
 pnpm install
-pnpm test                 # 37 tests: logic, SDK, and CDK assertions on the synthesized stack
+pnpm test                 # 48 tests: logic, SDK, and CDK assertions on the synthesized stack
 pnpm synth                # build the CloudFormation template locally, no AWS needed
 
 aws sso login             # with a profile from `aws configure sso`
@@ -67,12 +73,14 @@ TRACEWISE_ALARM_EMAIL=you@example.com pnpm run deploy
 pnpm tenant:create "Demo tenant"   # prints an API key once; save it with the URL in .env.local
 node --env-file=.env.local --import tsx scripts/smoke.ts     # end-to-end checks
 node --env-file=.env.local --import tsx scripts/latency.ts   # pipeline latency percentiles
+node --env-file=.env.local --import tsx scripts/seed.ts      # a week of demo traffic for analytics
 ```
 
 ```sh
 curl -X POST "$API_URL/v1/traces" -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"events":[{"event_id":"'$(uuidgen | tr A-Z a-z)'","ts":"'$(date -u +%FT%TZ)'","model":"demo","input":"hi","output":"hello","latency_ms":120}]}'
 curl "$API_URL/v1/traces" -H "authorization: Bearer $KEY"
+curl "$API_URL/v1/analytics/summary?days=7" -H "authorization: Bearer $KEY"   # cost, p50/p95, errors, blocks by route
 ```
 
 `cdk destroy` removes everything, including all data.
@@ -81,7 +89,7 @@ curl "$API_URL/v1/traces" -H "authorization: Bearer $KEY"
 
 ```
 infra/          CDK app and stack, plus assertion tests on the template
-services/       Lambda handlers: ingest, processor, query, plus shared schema/keys/tenants
+services/       Lambda handlers: ingest, processor, query, analytics, plus shared schema/keys/tenants
 sdk/            @tracewise/sdk: batching, retrying, redacting client
 scripts/        create-tenant
 docs/           PR/FAQ and design document
