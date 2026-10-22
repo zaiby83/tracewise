@@ -1,7 +1,8 @@
 // End-to-end check of self-serve accounts against a deployed stack: two Cognito test users, an
 // org, ingest, the trace query, an invite, a permission check, key revocation and org deletion
 // down to the last object in the lake. The stack must be deployed with the smoke client:
-//   pnpm run deploy --context smokeClient=true
+//   TRACEWISE_ALARM_EMAIL=you@example.com TRACEWISE_DASHBOARD_KEY=<read-only key> pnpm run deploy --context smokeClient=true
+// Keep both variables set on every redeploy: without them the demo gets an empty key and the alarm email is dropped.
 // Needs the operator's AWS credentials (Cognito admin, and s3:ListBucket on the lake).
 // Usage: pnpm exec tsx scripts/smoke-selfserve.ts
 import {
@@ -17,17 +18,24 @@ import { stackOutputs } from "./lib/stack";
 
 if (process.argv.length > 2) {
 	console.error("usage: pnpm exec tsx scripts/smoke-selfserve.ts");
-	console.error("Deploy first with: pnpm run deploy --context smokeClient=true");
+	console.error("Deploy first with: TRACEWISE_ALARM_EMAIL=... TRACEWISE_DASHBOARD_KEY=... pnpm run deploy --context smokeClient=true");
+	console.error("Set both variables on every redeploy, or the demo loses its key and the alarm email subscription is dropped.");
 	console.error("Reads the stack outputs UserPoolId, SmokeClientId, DashboardUrl and LakeBucket; takes no arguments.");
 	process.exit(process.argv.some((a) => a === "-h" || a === "--help") ? 0 : 1);
 }
 
 // Everything is checked before the first write, so a stack without the smoke client fails here.
-const outputs = await stackOutputs();
+const outputs = await stackOutputs().catch((e: unknown) => {
+	console.error(`could not read the Tracewise stack: ${e instanceof Error ? e.message : String(e)}`);
+	process.exit(1);
+});
 const missing = ["UserPoolId", "SmokeClientId", "DashboardUrl", "LakeBucket"].filter((k) => !outputs[k]);
 if (missing.length > 0) {
 	console.error(`stack outputs missing: ${missing.join(", ")}`);
-	if (missing.includes("SmokeClientId")) console.error("deploy with: pnpm run deploy --context smokeClient=true");
+	if (missing.includes("SmokeClientId")) {
+		console.error("deploy with: TRACEWISE_ALARM_EMAIL=... TRACEWISE_DASHBOARD_KEY=... pnpm run deploy --context smokeClient=true");
+		console.error("(set both on every redeploy, or the demo loses its key and the alarm email is dropped)");
+	}
 	process.exit(1);
 }
 const { UserPoolId, SmokeClientId, DashboardUrl: url, LakeBucket } = outputs as { UserPoolId: string; SmokeClientId: string; DashboardUrl: string; LakeBucket: string };

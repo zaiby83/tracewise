@@ -1200,7 +1200,7 @@ The script needs `s3:ListBucket` through the operator's credentials, as the othe
 - [ ] **Step 1: Write the script and run it against a deployed stack.** Follow the README order: deploy with `--context smokeClient=true`, then migrate, then run the smoke test.
 
 ```bash
-pnpm run deploy -- --context smokeClient=true
+TRACEWISE_ALARM_EMAIL=you@example.com TRACEWISE_DASHBOARD_KEY=<read-only key> pnpm run deploy --context smokeClient=true
 ```
 ```bash
 pnpm exec tsx scripts/migrate-accounts.ts

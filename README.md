@@ -131,16 +131,16 @@ pnpm exec tsx scripts/calibrate-judge.ts <bedrock-model-id>...   # compare judge
 pnpm exec tsx scripts/run-evals.ts [YYYY-MM-DD]                  # run the evaluation workflow now
 ```
 
-**Self-serve operator commands.** Run them in this order on an existing deployment:
+**Self-serve operator commands.** Run them in this order on an existing deployment. Set `TRACEWISE_ALARM_EMAIL` and `TRACEWISE_DASHBOARD_KEY` on every redeploy, this one included: a deploy without them publishes the demo with an empty key and drops the alarm email subscription.
 
 ```sh
-pnpm run deploy --context smokeClient=true                # also adds the password-auth app client the smoke test needs; omit it for normal deploys
+TRACEWISE_ALARM_EMAIL=you@example.com TRACEWISE_DASHBOARD_KEY=<read-only key> pnpm run deploy --context smokeClient=true   # also adds the password-auth app client the smoke test needs
 pnpm exec tsx scripts/migrate-accounts.ts [--owner you@example.com]   # turn existing tenants into orgs
 pnpm exec tsx scripts/smoke-selfserve.ts                  # sign-up to deletion, end to end (about 25 minutes, mostly waiting for the delayed sweep)
 pnpm exec tsx scripts/set-limits.ts "<org name or id>" events_per_day=200000 max_members=10   # custom limits for one org
 ```
 
-- **`migrate-accounts`** creates an org for each existing tenant, with its current rate as the per-minute limit and a daily cap of that rate sustained all day, so the public demo and load tests keep working. Running it again changes nothing already migrated. With `--owner`, the Cognito user with that email (they must have signed up first) becomes owner of every org that has no owner yet, not only the ones this run creates. Keys of orgs that are deleting, deleted or suspended are retired as revoked, so unsuspending an org later doesn't restore them. Create new keys instead.
+- **`migrate-accounts`** creates an org for each existing tenant, with its current rate as the per-minute limit and a daily cap of that rate sustained all day, so the public demo and load tests keep working. Running it again changes nothing already migrated. With `--owner`, the Cognito user with that email (they must have signed up first) becomes owner of every active org that has no owner yet, not only the ones this run creates. Keys of orgs that are deleting, deleted or suspended are retired as revoked, so unsuspending an org later doesn't restore them. Create new keys instead.
 - **`smoke-selfserve`** creates two throwaway Cognito users and an org, ingests, queries, invites, checks permissions, revokes the key, then deletes the org and waits (up to 20 minutes) for its lake partitions to disappear. It deletes the users afterwards, even on failure. It needs your operator credentials, including `s3:ListBucket` on the lake. It creates one real org, so it counts toward the daily sign-up cap.
 - **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`. Unnamed limits keep their value.
 
