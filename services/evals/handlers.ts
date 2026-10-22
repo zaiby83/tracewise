@@ -4,7 +4,7 @@ import { PublishCommand, SNSClient } from "@aws-sdk/client-sns";
 import { GetCommand, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { log } from "../shared/http";
 import { partitionsForDay } from "../shared/keys";
-import { GLOBAL_JUDGE_CALLS_PER_NIGHT, legacyLimits, listActiveProfiles } from "../shared/accounts";
+import { GLOBAL_JUDGE_CALLS_PER_NIGHT, getProfile, legacyLimits, listActiveProfiles } from "../shared/accounts";
 import { ddb } from "../shared/ddb";
 import { counterIds } from "../shared/tenants";
 import { DEFAULT_RUBRIC, isRegression, judgeMessages, parseScores, summarize, type Graded } from "./judge-prompt";
@@ -43,7 +43,9 @@ export async function listTenants(input: { day?: string }): Promise<{ tenants: T
 	for (const p of await listActiveProfiles()) {
 		// Profiles are covered even with evals off, so an old key row can't re-enable them.
 		seen.add(p.org_id);
-		if (p.evals_enabled) candidates.push({ tenant_id: p.org_id, name: p.name, rubric: p.rubric, limit: p.limits.eval_samples_per_night });
+		// Rubrics (up to 4,000 characters each) stay out of this state, which Step Functions
+		// caps at 256 KB across every org; the sample step loads them.
+		if (p.evals_enabled) candidates.push({ tenant_id: p.org_id, name: p.name, rubric: null, limit: p.limits.eval_samples_per_night });
 	}
 
 	let start: Record<string, unknown> | undefined;
@@ -109,7 +111,12 @@ export async function sample(tenant: TenantRef): Promise<TenantRef & { keys: { p
 			Item: { window: counterIds.evals(tenant.tenant_id, tenant.day), used: keys.length, expires_at: Math.floor(Date.now() / 1000) + 3 * 86_400 },
 		}),
 	);
-	return { ...tenant, keys };
+
+	// The judge step reads the rubric from this output. A profile's rubric wins (it may be
+	// null for the default); a tenant with no profile yet carries its own on the ref.
+	const profile = keys.length ? await getProfile(tenant.tenant_id) : null;
+	const rubric = profile ? profile.rubric : tenant.rubric ?? null;
+	return { ...tenant, rubric, keys };
 }
 
 // Step 3 (run in parallel by a Map state): grade one trace. Throttling errors are

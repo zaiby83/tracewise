@@ -1,5 +1,5 @@
 import { CloudWatchClient, PutMetricDataCommand } from "@aws-sdk/client-cloudwatch";
-import { PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FREE_LIMITS } from "../services/shared/accounts";
 
@@ -46,11 +46,17 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("listTenants", () => {
-	it("evaluates active orgs with evals on, with their rubric", async () => {
+	it("evaluates active orgs with evals on, leaving rubrics out of the state", async () => {
 		scans([profile("a", { rubric: "r" }), profile("b", { evals_enabled: false })]);
 		const { tenants } = await listTenants({ day: "2026-10-21" });
-		expect(tenants).toEqual([{ tenant_id: "a", name: "A", rubric: "r", day: "2026-10-21", sample_budget: 20, sample_limit: 20 }]);
+		expect(tenants).toEqual([{ tenant_id: "a", name: "A", rubric: null, day: "2026-10-21", sample_budget: 20, sample_limit: 20 }]);
 		expect(metric()).toBeUndefined();
+	});
+
+	it("keeps a legacy row's own rubric on its ref", async () => {
+		scans([], [{ tenant_id: "t", name: "Old", status: "active", events_per_minute: 600, rubric: "legacy" }]);
+		const { tenants } = await listTenants({ day: "2026-10-21" });
+		expect(tenants[0]).toMatchObject({ tenant_id: "t", rubric: "legacy" });
 	});
 
 	it("still evaluates tenants that haven't been migrated", async () => {
@@ -113,6 +119,29 @@ describe("sample", () => {
 			TableName: "quotas",
 			Item: { window: "a#evals#2026-10-21", used: 5, expires_at: Math.floor(Date.now() / 1000) + 3 * 86_400 },
 		});
+	});
+
+	it("loads the org's rubric from its profile for the judge step", async () => {
+		ddb.send.mockImplementation(async (c) =>
+			c instanceof QueryCommand ? { Items: [{ pk: "p", sk: "1" }] } : c instanceof GetCommand ? { Item: profile("a", { rubric: "r" }) } : {},
+		);
+		const out = await sample({ tenant_id: "a", name: "A", rubric: null, day: "2026-10-21", sample_budget: 5, sample_limit: 20 });
+		expect(out.rubric).toBe("r");
+		expect(sent(GetCommand)[0]!.input).toMatchObject({ TableName: "accounts", Key: { pk: "ORG#a", sk: "PROFILE" } });
+	});
+
+	it("returns a null rubric for a profile that uses the default", async () => {
+		ddb.send.mockImplementation(async (c) =>
+			c instanceof QueryCommand ? { Items: [{ pk: "p", sk: "1" }] } : c instanceof GetCommand ? { Item: profile("a", { rubric: null }) } : {},
+		);
+		const out = await sample({ tenant_id: "a", name: "A", rubric: "stale", day: "2026-10-21", sample_budget: 5, sample_limit: 20 });
+		expect(out.rubric).toBeNull();
+	});
+
+	it("falls back to the ref's rubric for a legacy tenant with no profile", async () => {
+		ddb.send.mockImplementation(async (c) => (c instanceof QueryCommand ? { Items: [{ pk: "p", sk: "1" }] } : {}));
+		const out = await sample({ tenant_id: "t", name: "Old", rubric: "legacy", day: "2026-10-21", sample_budget: 5, sample_limit: 20 });
+		expect(out.rubric).toBe("legacy");
 	});
 
 	it("records how many it actually took when fewer traces exist", async () => {
