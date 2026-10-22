@@ -68,8 +68,8 @@ describe("TracewiseStack", () => {
 		expect(JSON.stringify(policies[0])).not.toMatch(/Traces/);
 	});
 
-	it("alarms on dead letters, backlog, ingest errors, failed deletions and global caps, and emails them", () => {
-		template.resourceCountIs("AWS::CloudWatch::Alarm", 6);
+	it("alarms on dead letters, backlog, ingest errors, failed deletions, global caps and failed eval runs, and emails them", () => {
+		template.resourceCountIs("AWS::CloudWatch::Alarm", 7);
 		for (const cap of ["orgs", "judge"])
 			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
 				Namespace: "Tracewise/Limits",
@@ -82,6 +82,22 @@ describe("TracewiseStack", () => {
 				AlarmActions: [Match.anyValue()],
 			});
 		template.hasResourceProperties("AWS::SNS::Subscription", { Protocol: "email", Endpoint: "alerts@example.com" });
+	});
+
+	it("alarms when a nightly eval execution fails", () => {
+		const [smId] = Object.keys(template.findResources("AWS::StepFunctions::StateMachine"));
+		template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+			Namespace: "AWS/States",
+			MetricName: "ExecutionsFailed",
+			Dimensions: [{ Name: "StateMachineArn", Value: { Ref: smId } }],
+			Statistic: "Sum",
+			Period: 3600,
+			Threshold: 1,
+			ComparisonOperator: "GreaterThanOrEqualToThreshold",
+			EvaluationPeriods: 1,
+			TreatMissingData: "notBreaching",
+			AlarmActions: [Match.anyValue()],
+		});
 	});
 
 	it("throttles the API as a backstop", () => {

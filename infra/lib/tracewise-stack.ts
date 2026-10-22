@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { Aws, CfnOutput, Duration, RemovalPolicy, Stack, type StackProps } from "aws-cdk-lib";
 import { HttpApi, HttpMethod } from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
-import { Alarm, ComparisonOperator, TreatMissingData } from "aws-cdk-lib/aws-cloudwatch";
+import { Alarm, ComparisonOperator, Stats, TreatMissingData } from "aws-cdk-lib/aws-cloudwatch";
 import { SnsAction } from "aws-cdk-lib/aws-cloudwatch-actions";
 import { AttributeType, Billing, TableEncryptionV2, TableV2 } from "aws-cdk-lib/aws-dynamodb";
 import { PolicyStatement } from "aws-cdk-lib/aws-iam";
@@ -273,6 +273,17 @@ export class TracewiseStack extends Stack {
 			metric: ingest.metricErrors({ period: Duration.minutes(1) }),
 			threshold: 5,
 			evaluationPeriods: 2,
+			treatMissingData: TreatMissingData.NOT_BREACHING,
+		}).addAlarmAction(notify);
+
+		// The nightly run is otherwise silent: a failed execution means no org was evaluated.
+		// An hourly period alerts within the hour of the 06:00 UTC run.
+		new Alarm(this, "EvalWorkflowFailed", {
+			alarmDescription: "The nightly evaluation workflow failed: orgs weren't evaluated",
+			metric: evals.stateMachine.metricFailed({ period: Duration.hours(1), statistic: Stats.SUM }),
+			threshold: 1,
+			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+			evaluationPeriods: 1,
 			treatMissingData: TreatMissingData.NOT_BREACHING,
 		}).addAlarmAction(notify);
 

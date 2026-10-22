@@ -100,6 +100,16 @@ describe("listTenants", () => {
 		expect(JSON.stringify(accountsScan.input)).not.toContain("active");
 	});
 
+	it("still returns the night's tenants when the cap metric can't be published", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		scans(Array.from({ length: 150 }, (_, i) => profile(`o${i}`)));
+		cwSend.mockRejectedValue(new Error("throttled"));
+		const { tenants } = await listTenants({ day: "2026-10-21" });
+		expect(tenants).toHaveLength(150);
+		expect(warn.mock.calls.map((c) => String(c[0])).some((l) => l.includes("GlobalCapHit") && l.includes("throttled"))).toBe(true);
+		warn.mockRestore();
+	});
+
 	it("splits 2,000 judge calls across orgs and reports the cap", async () => {
 		scans(Array.from({ length: 150 }, (_, i) => profile(`o${i}`)));
 		const { tenants } = await listTenants({ day: "2026-10-21" });

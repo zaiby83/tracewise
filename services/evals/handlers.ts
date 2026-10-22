@@ -70,12 +70,17 @@ export async function listTenants(input: { day?: string }): Promise<{ tenants: T
 	const tenants = candidates.map(({ limit, ...c }) => ({ ...c, day, sample_budget: Math.min(limit, share), sample_limit: limit }));
 
 	if (tenants.some((t) => t.sample_budget < t.sample_limit)) {
-		await cloudwatch.send(
-			new PutMetricDataCommand({
-				Namespace: "Tracewise/Limits",
-				MetricData: [{ MetricName: "GlobalCapHit", Dimensions: [{ Name: "Cap", Value: "judge" }], Value: 1, Unit: "Count" }],
-			}),
-		);
+		try {
+			await cloudwatch.send(
+				new PutMetricDataCommand({
+					Namespace: "Tracewise/Limits",
+					MetricData: [{ MetricName: "GlobalCapHit", Dimensions: [{ Name: "Cap", Value: "judge" }], Value: 1, Unit: "Count" }],
+				}),
+			);
+		} catch (e) {
+			// Reporting is best effort: a CloudWatch blip mustn't cost the night's evaluation.
+			log("warn", "could not publish GlobalCapHit", { error: e instanceof Error ? e.message : String(e) });
+		}
 	}
 	return { tenants };
 }
