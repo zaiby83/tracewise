@@ -6,9 +6,9 @@ LLM observability and evaluation on serverless AWS. Apps send every model call t
 
 - **[PR/FAQ](docs/PRFAQ.md):** the product, written working backwards.
 - **[Design document](docs/design.md):** requirements, architecture, service trade-offs, failure modes, cost model, validation plan.
-- **[Experiments](docs/experiments.md):** measurements from the deployed stack. They cover cutting ingest-to-queryable latency from 6.3 s to 63 ms (p50), proving that Athena itself refuses queries that skip the tenant filter, and choosing an evaluation judge by calibrating four models against labelled answers. The chosen judge caught a simulated bad deploy (score 4.5 → 2.45).
+- **[Experiments](docs/experiments.md):** measurements from the deployed stack. They cover a load test that found two hidden account limits and still lost nothing, cutting ingest-to-queryable latency from 6.3 s to 63 ms (p50), proving that Athena itself refuses queries that skip the tenant filter, and choosing an evaluation judge by calibrating four models against labelled answers. The chosen judge caught a simulated bad deploy (score 4.5 → 2.45).
 
-> **Status:** Milestones 1–4 of 6 are live: the ingest pipeline and SDK, the S3/Athena data lake with an analytics API, nightly AI evaluations with regression alerts, and a public dashboard. The load test and write-up are next. See [milestones](docs/design.md#9-milestones).
+> **Status:** Milestones 1–5 of 6 are done: the ingest pipeline and SDK, the S3/Athena data lake with an analytics API, nightly AI evaluations with regression alerts, a public dashboard, and a load test. **Load-tested at 1,000 events/s sustained and a 5,000 events/s burst: 751,200 events accepted, 751,200 stored, zero lost.** See [milestones](docs/design.md#9-milestones).
 
 ## Architecture (Milestones 1–4)
 
@@ -88,6 +88,8 @@ pnpm exec tsx scripts/create-key.ts "Demo tenant" read   # a read-only key, e.g.
 node --env-file=.env.local --import tsx scripts/smoke.ts     # end-to-end checks
 node --env-file=.env.local --import tsx scripts/latency.ts   # pipeline latency percentiles
 node --env-file=.env.local --import tsx scripts/seed.ts      # a week of demo traffic for analytics
+node --env-file=.env.local --import tsx scripts/loadtest.ts "1000x300,5000x60"   # open-loop load test
+pnpm exec tsx scripts/loadtest-metrics.ts <startISO> <endISO>                  # server-side view from CloudWatch
 pnpm exec tsx scripts/calibrate-judge.ts <bedrock-model-id>...   # compare judges against labels
 pnpm exec tsx scripts/run-evals.ts [YYYY-MM-DD]                  # run the evaluation workflow now
 ```

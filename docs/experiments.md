@@ -102,3 +102,64 @@ I created a separate demo tenant and seeded four days of realistic traffic: thre
 The run's "worst traces" named the planted failures in the judge's own words: *"Invented feature, unrealistic claims"*, *"Incorrect information about plan change timing"*, *"Harmful misinformation given"*. Each workflow run took about 9 seconds.
 
 **The first run was a useful failure too.** The original demo tenant's traffic was synthetic filler ("question 12" → "answer 12"), and the judge correctly scored all of it 1/5 ("Generic, non-informative response"). Garbage in, an honest grade out, and the reason a separate tenant holds the realistic demo data.
+
+## 4. Load test: 1,000 events/s sustained, 5× burst, zero loss
+
+**Question.** The design targets 1,000 events/s sustained and a 5× burst for 60 s, with no acknowledged event lost. Does the deployed system meet that, and where does it break?
+
+**Method.** `scripts/loadtest.ts` is an **open-loop** generator. It sends 50-event batches on a fixed schedule whether or not earlier requests have finished, so a slowing server can't throttle the test and hide its own latency (coordinated omission). It reports any request it couldn't issue instead of dropping it silently. It ran from a laptop against the live API, with a dedicated tenant. `scripts/loadtest-metrics.ts` pulled the server side per minute from CloudWatch. Afterwards, every accepted event was reconciled against both stores.
+
+### Run 1: 1,000 events/s for 3 min, batch 10 with no window (the latency-optimized config)
+
+| Minute | Into SQS | Processed | Backlog | Oldest message |
+|---|---|---|---|---|
+| 1 | 53,100 | 33,535 | 0 | 0 s |
+| 2 | 59,500 | 37,180 | 23,106 | 24 s |
+| 3 | 59,500 | 36,770 | 45,355 | 48 s |
+| after | 7,000 | 44,990 | 51,485 | 54 s |
+
+- **The processor fell behind at ~615 events/s**, close to the ~500/s predicted beforehand. Each invocation took only **16 ms (p50)**, so the limit wasn't compute. It was the fixed per-batch cost of the SQS poll → invoke → delete cycle, at 10 messages per batch and a concurrency of 7.
+- **26 requests (1,300 events) got 503s, all from Lambda throttling, not from Tracewise code.** The account's concurrent-execution limit was **10**. AWS's default is 1,000, but **new accounts start at 10**, and every function shares it. CloudWatch showed exactly 26 ingest throttles.
+
+### Run 2: same load, batch 100 with a 1 s window
+
+| | Run 1 (batch 10, 0 s) | **Run 2 (batch 100, 1 s)** |
+|---|---|---|
+| Accepted | 992/s, 26 throttled requests | **999/s, 0 throttled** |
+| Backlog | grew to 51,485 | **0 every minute** |
+| Processor concurrency | 7 | **4–5** |
+| Freshness at low traffic (p50 / p90) | **63 ms / 99 ms** | 4.7 s / 12.9 s |
+
+Bigger batches cut the per-event overhead roughly tenfold, so the processor kept up with **fewer** concurrent executions. That also left more of the 10-slot limit for ingest. The cost is freshness at low traffic: with little traffic, the batching window and SQS polling dominate.
+
+### Run 3: burst, 1,000 → 5,000 → 1,000 events/s (60 s each), batch 100
+
+| Minute | API 5xx | Ingest concurrency | Backlog | Oldest | DynamoDB write throttles |
+|---|---|---|---|---|---|
+| 1,000/s | 0 | 5 | 0 | 0 s | 0 |
+| **5,000/s** | 428 | **10 (limit)** | 0 | 0 s | 0 |
+| after burst | 172 | 10 | **185,662** | 46 s | **8,180** |
+| 1,000/s | 2 | 4 | 139,975 | 91 s | 19,877 |
+| drain | – | – | 13,985 | 87 s | 3,772 |
+
+- **4,477 events/s accepted during the burst (90%).** The rest were clean 503s from Lambda throttling, which the SDK retries with backoff and jitter.
+- **A second hidden limit: DynamoDB on-demand throttled writes.** A new on-demand table starts with limited throughput and scales up as traffic grows. The processor's backoff retries plus SQS redelivery absorbed it, with **0 dead letters and 0 processor errors**.
+- The queue did what it's there for: it soaked up a 185k-message backlog and drained it within about 3 minutes.
+
+### Reconciliation: did anything get lost?
+
+| | Events |
+|---|---|
+| Accepted (HTTP 202) across all runs | **751,200** |
+| In DynamoDB | **751,200** |
+| In the S3 data lake, distinct | **751,200** (751,203 rows: 3 Firehose retry duplicates, handled by counting distinct `event_id`) |
+
+The first DynamoDB count came up 3 short. Those were messages still in their throttle-retry cycle, and a recount minutes later matched exactly. **No acknowledged event was lost, through Lambda throttling, DynamoDB throttling and a 185k-message backlog.**
+
+### Decisions
+
+1. **Default trigger config is now batch 100 with a 1 s window.** At the account's current limit, it's the only config that meets the 1,000/s target, and it still meets the freshness target (p50 < 5 s, p99 < 30 s). This reverses experiment 1's choice, which optimized freshness without measuring throughput. Both are kept in this document because the reversal is the point.
+2. **A Lambda concurrency increase to 1,000 has been requested** (AWS support case). With headroom, two follow-ups become worth measuring: (a) batch 10 with no window plus higher `processorConcurrency`, which may recover 63 ms freshness *and* the throughput; (b) the 5,000/s burst with no ingest throttling.
+3. **For production, also:** reserve concurrency for the ingest function so the processor can never starve it, and pre-warm the traces table's on-demand throughput (or set a warm throughput) before an expected traffic jump.
+
+*Approximate cost of all runs: ~750k events, about $2–3, mostly DynamoDB writes.*

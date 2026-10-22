@@ -18,8 +18,8 @@
 
 | | Target for v1 |
 |---|---|
-| Sustained ingest | 1,000 events/s; the design scales to 10k+ by raising limits, without re-architecture |
-| Burst | 5× sustained for 60 s without dropping events |
+| Sustained ingest | 1,000 events/s; the design scales to 10k+ by raising limits, without re-architecture (**measured: 999/s, zero backlog**) |
+| Burst | 5× sustained for 60 s without dropping events (**measured: 0 lost; 90% accepted first time at a 10-execution Lambda limit, rest retried by the SDK**; see [experiment 4](experiments.md#4-load-test-1000-events-s-sustained-5-burst-zero-loss)) |
 | Ingest API latency | p99 < 150 ms (the API only validates and enqueues) |
 | Event size | ≤ 32 KB after SDK truncation; typical 2–4 KB |
 | Durability | No acknowledged event lost |

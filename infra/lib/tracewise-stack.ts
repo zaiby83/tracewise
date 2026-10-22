@@ -28,6 +28,8 @@ export interface TracewiseStackProps extends StackProps {
 	// requires a window above 0 for batches larger than 10.
 	batchingWindowSeconds?: number;
 	batchSize?: number;
+	// Maximum concurrent processor invocations. Bounded by the account's Lambda limit.
+	processorConcurrency?: number;
 	// Bedrock model (or cross-region inference profile) that grades sampled traces.
 	judgeModel?: string;
 	// Read-only key the public dashboard uses to show the demo tenant.
@@ -117,11 +119,13 @@ export class TracewiseStack extends Stack {
 		analytics.grantPut(processor);
 		processor.addEventSource(
 			new SqsEventSource(queue, {
-				batchSize: props.batchSize ?? 10,
-				maxBatchingWindow: Duration.seconds(props.batchingWindowSeconds ?? 0),
+				batchSize: props.batchSize ?? 100,
+				maxBatchingWindow: Duration.seconds(props.batchingWindowSeconds ?? 1),
 				reportBatchItemFailures: true,
 				// Caps how hard the consumer pushes on DynamoDB; the queue absorbs the rest.
-				maxConcurrency: 10,
+				// Defaults (batch 100, 1 s window, 10 concurrent) come from load testing at a
+				// 10-execution account limit: see docs/experiments.md, experiment 4.
+				maxConcurrency: props.processorConcurrency ?? 10,
 			}),
 		);
 

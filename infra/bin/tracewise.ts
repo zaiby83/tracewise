@@ -13,6 +13,7 @@ const stack = new TracewiseStack(app, "Tracewise", {
 	alarmEmail: app.node.tryGetContext("alarmEmail") ?? process.env.TRACEWISE_ALARM_EMAIL,
 	batchingWindowSeconds: numberContext(app, "batchingWindow"),
 	batchSize: numberContext(app, "batchSize"),
+	processorConcurrency: numberContext(app, "processorConcurrency"),
 	judgeModel: app.node.tryGetContext("judgeModel"),
 	// Read-only key for the public demo dashboard; from the environment, never the repo.
 	dashboardKey: process.env.TRACEWISE_DASHBOARD_KEY,
