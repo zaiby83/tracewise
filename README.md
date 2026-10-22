@@ -4,11 +4,13 @@ LLM observability and evaluation on serverless AWS. Apps send every model call t
 
 **Live dashboard:** https://d67mankz12h3n.cloudfront.net (public demo data, read-only)
 
+**Write-up:** [My load test proved my best optimization wrong, and that was the most useful thing it did](docs/blog-post.md)
+
 - **[PR/FAQ](docs/PRFAQ.md):** the product, written working backwards.
 - **[Design document](docs/design.md):** requirements, architecture, service trade-offs, failure modes, cost model, validation plan.
 - **[Experiments](docs/experiments.md):** measurements from the deployed stack. They cover a load test that found two hidden account limits and still lost nothing, cutting ingest-to-queryable latency from 6.3 s to 63 ms (p50), proving that Athena itself refuses queries that skip the tenant filter, and choosing an evaluation judge by calibrating four models against labelled answers. The chosen judge caught a simulated bad deploy (score 4.5 → 2.45).
 
-> **Status:** Milestones 1–5 of 6 are done: the ingest pipeline and SDK, the S3/Athena data lake with an analytics API, nightly AI evaluations with regression alerts, a public dashboard, and a load test. **Load-tested at 1,000 events/s sustained and a 5,000 events/s burst: 751,200 events accepted, 751,200 stored, zero lost.** See [milestones](docs/design.md#9-milestones).
+> **Status:** All 6 milestones are done: the ingest pipeline and SDK, the S3/Athena data lake with an analytics API, nightly AI evaluations with regression alerts, a public dashboard, a load test, and a [write-up](docs/blog-post.md). **Load-tested at 1,000 events/s sustained and a 5,000 events/s burst: 751,200 events accepted, 751,200 stored, zero lost.** See [milestones](docs/design.md#9-milestones).
 
 ## Architecture (Milestones 1–4)
 
