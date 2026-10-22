@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tracewise</title>
+<meta name="description" content="LLM observability and evaluation on serverless AWS: cost, latency, quality scores and security for every AI call.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232a78d6'/%3E%3Cpath d='M7 20l5-6 4 4 6-8 3 3' stroke='%23fff' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="top">
+	<div class="brand">
+		<span class="logo" aria-hidden="true"></span>
+		<span class="name">Tracewise</span>
+	</div>
+	<div class="who">
+		<span id="tenant-name" class="tenant">Loading…</span>
+		<span id="mode-badge" class="badge" hidden></span>
+		<button id="key-button" class="ghost" type="button">Use your own key</button>
+	</div>
+</header>
+
+<main>
+	<section class="intro" id="intro">
+		<p><strong>Tracewise</strong> records every call an app makes to an AI model, then shows what it costs, how fast it is, how often it's attacked, and whether answer quality is slipping. Graded nightly by an AI judge. You're looking at live demo data for a fictional company, <em>Acme Support</em>.</p>
+		<p class="links"><a href="https://github.com/zaiby83/tracewise">Code</a> · <a href="https://github.com/zaiby83/tracewise/blob/main/docs/design.md">Design doc</a> · <a href="https://github.com/zaiby83/tracewise/blob/main/docs/experiments.md">Experiments</a></p>
+	</section>
+
+	<div class="filters" role="group" aria-label="Date range">
+		<button type="button" class="range" data-days="7" aria-pressed="true">Last 7 days</button>
+		<button type="button" class="range" data-days="30" aria-pressed="false">Last 30 days</button>
+		<span id="status" class="status" role="status"></span>
+	</div>
+
+	<section class="tiles" id="tiles" aria-label="Summary"></section>
+
+	<section class="grid">
+		<article class="card">
+			<h2>Calls per day</h2>
+			<div class="chart" id="chart-calls"></div>
+			<details><summary>View as table</summary><div id="table-calls"></div></details>
+		</article>
+		<article class="card">
+			<h2>Model spend per day</h2>
+			<div class="chart" id="chart-cost"></div>
+			<details><summary>View as table</summary><div id="table-cost"></div></details>
+		</article>
+	</section>
+
+	<article class="card">
+		<h2>Answer quality <span class="sub">mean judge score, 1–5, per evaluated day</span></h2>
+		<div class="chart" id="chart-quality"></div>
+		<details><summary>View as table</summary><div id="table-quality"></div></details>
+	</article>
+
+	<article class="card">
+		<h2>By route and model</h2>
+		<div class="table-wrap" id="routes"></div>
+	</article>
+
+	<article class="card" id="worst-card">
+		<h2>Lowest-scoring answers <span class="sub" id="worst-day"></span></h2>
+		<ul class="worst" id="worst"></ul>
+	</article>
+
+	<article class="card">
+		<h2>Recent traces <span class="sub" id="traces-day"></span></h2>
+		<div class="table-wrap" id="traces"></div>
+	</article>
+</main>
+
+<footer>
+	Built on API Gateway, Lambda, SQS, DynamoDB, Data Firehose, S3, Athena, Step Functions, Bedrock and CloudFront. Deployed with AWS CDK.
+</footer>
+
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+
+<dialog id="key-dialog">
+	<form method="dialog" id="key-form">
+		<h2>View your own data</h2>
+		<p>Paste a Tracewise API key. It stays in this browser tab only (session storage) and is sent only to this site's API.</p>
+		<label for="key-input">API key</label>
+		<input id="key-input" name="key" autocomplete="off" spellcheck="false" placeholder="tw_…" pattern="tw_[A-Za-z0-9_\-]{43}" required>
+		<p id="key-error" class="error" hidden></p>
+		<div class="actions">
+			<button type="button" class="ghost" id="key-demo">Back to demo data</button>
+			<button type="button" class="ghost" id="key-cancel">Cancel</button>
+			<button type="submit" class="primary">View</button>
+		</div>
+	</form>
+</dialog>
+</body>
+</html>

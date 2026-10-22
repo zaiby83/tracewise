@@ -7,7 +7,12 @@ export interface Tenant {
 	name: string;
 	status: "active" | "disabled";
 	events_per_minute: number;
+	// "read" keys can query but not ingest, so one can be embedded in a public dashboard.
+	// Keys created before scopes existed have none and are treated as "write".
+	scope?: "read" | "write";
 }
+
+export const canWrite = (t: Tenant) => (t.scope ?? "write") === "write";
 
 export const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 	marshallOptions: { removeUndefinedValues: true },

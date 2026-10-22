@@ -24,15 +24,20 @@ interface TenantRef {
 	day: string;
 }
 
-// Step 1: every active tenant, with the day to evaluate (yesterday by default).
+// Step 1: every active tenant, with the day to evaluate (yesterday by default). The
+// table holds one item per API key, and a tenant can have several (e.g. a read-only
+// dashboard key), so tenants are de-duplicated by id.
 export async function listTenants(input: { day?: string }): Promise<{ tenants: TenantRef[] }> {
 	const day = input.day ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 	const tenants: TenantRef[] = [];
+	const seen = new Set<string>();
 	let start: Record<string, unknown> | undefined;
 	do {
 		const page = await ddb.send(new ScanCommand({ TableName: process.env.TENANTS_TABLE, ExclusiveStartKey: start }));
 		for (const t of page.Items ?? []) {
-			if (t.status === "active") tenants.push({ tenant_id: t.tenant_id, name: t.name, rubric: t.rubric ?? null, day });
+			if (t.status !== "active" || seen.has(t.tenant_id)) continue;
+			seen.add(t.tenant_id);
+			tenants.push({ tenant_id: t.tenant_id, name: t.name, rubric: t.rubric ?? null, day });
 		}
 		start = page.LastEvaluatedKey;
 	} while (start);

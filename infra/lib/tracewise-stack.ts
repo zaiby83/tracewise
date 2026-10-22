@@ -15,6 +15,7 @@ import { EmailSubscription } from "aws-cdk-lib/aws-sns-subscriptions";
 import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
 import { Analytics } from "./analytics";
+import { Dashboard } from "./dashboard";
 import { Evals } from "./evals";
 
 const services = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../services");
@@ -29,6 +30,8 @@ export interface TracewiseStackProps extends StackProps {
 	batchSize?: number;
 	// Bedrock model (or cross-region inference profile) that grades sampled traces.
 	judgeModel?: string;
+	// Read-only key the public dashboard uses to show the demo tenant.
+	dashboardKey?: string;
 }
 
 export class TracewiseStack extends Stack {
@@ -162,6 +165,9 @@ export class TracewiseStack extends Stack {
 			integration: new HttpLambdaIntegration("AnalyticsRoute", summary),
 		});
 		api.addRoutes({ path: "/v1/evals", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("EvalsRoute", evalsApi) });
+		api.addRoutes({ path: "/v1/me", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("MeRoute", query) });
+
+		const dashboard = new Dashboard(this, "Dashboard", { api, demoReadKey: props.dashboardKey });
 		// Account-wide backstop throttle; per-tenant quotas are enforced in the ingest function.
 		const stage = api.defaultStage!.node.defaultChild as import("aws-cdk-lib/aws-apigatewayv2").CfnStage;
 		stage.defaultRouteSettings = { throttlingRateLimit: 200, throttlingBurstLimit: 400 };
@@ -199,5 +205,6 @@ export class TracewiseStack extends Stack {
 		new CfnOutput(this, "TracesTable", { value: traces.tableName });
 		new CfnOutput(this, "LakeBucket", { value: analytics.bucket.bucketName });
 		new CfnOutput(this, "EvalWorkflow", { value: evals.stateMachine.stateMachineArn });
+		new CfnOutput(this, "DashboardUrl", { value: `https://${dashboard.distribution.distributionDomainName}` });
 	}
 }

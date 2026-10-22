@@ -14,6 +14,8 @@ const stack = new TracewiseStack(app, "Tracewise", {
 	batchingWindowSeconds: numberContext(app, "batchingWindow"),
 	batchSize: numberContext(app, "batchSize"),
 	judgeModel: app.node.tryGetContext("judgeModel"),
+	// Read-only key for the public demo dashboard; from the environment, never the repo.
+	dashboardKey: process.env.TRACEWISE_DASHBOARD_KEY,
 });
 // Tags make the project's spend visible in Cost Explorer.
 Tags.of(stack).add("project", "tracewise");

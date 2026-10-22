@@ -139,4 +139,32 @@ describe("TracewiseStack", () => {
 			},
 		});
 	});
+
+	it("serves the dashboard privately through CloudFront with strict security headers", () => {
+		template.hasResourceProperties("AWS::CloudFront::OriginAccessControl", Match.anyValue());
+		template.hasResourceProperties("AWS::CloudFront::ResponseHeadersPolicy", {
+			ResponseHeadersPolicyConfig: Match.objectLike({
+				SecurityHeadersConfig: Match.objectLike({
+					ContentSecurityPolicy: Match.objectLike({ ContentSecurityPolicy: Match.stringLikeRegexp("script-src 'self';") }),
+					FrameOptions: Match.objectLike({ FrameOption: "DENY" }),
+				}),
+			}),
+		});
+	});
+
+	it("routes /v1/* through CloudFront with a short, per-key cache", () => {
+		template.hasResourceProperties("AWS::CloudFront::CachePolicy", {
+			CachePolicyConfig: Match.objectLike({
+				DefaultTTL: 60,
+				ParametersInCacheKeyAndForwardedToOrigin: Match.objectLike({
+					HeadersConfig: { HeaderBehavior: "whitelist", Headers: ["authorization"] },
+				}),
+			}),
+		});
+		template.hasResourceProperties("AWS::CloudFront::Distribution", {
+			DistributionConfig: Match.objectLike({
+				CacheBehaviors: [Match.objectLike({ PathPattern: "/v1/*", ViewerProtocolPolicy: "https-only" })],
+			}),
+		});
+	});
 });

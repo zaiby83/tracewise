@@ -3,7 +3,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "
 import { json, log } from "../shared/http";
 import { bearerToken } from "../shared/keys";
 import { IngestRequest, validateEvents, type QueuedEvent } from "../shared/schema";
-import { consumeQuota, tenantForKey } from "../shared/tenants";
+import { canWrite, consumeQuota, tenantForKey } from "../shared/tenants";
 
 const sqs = new SQSClient({});
 const SQS_BATCH = 10; // SendMessageBatch's maximum
@@ -17,6 +17,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	if (!key) return json(401, { error: "missing or malformed API key" });
 	const tenant = await tenantForKey(key);
 	if (!tenant) return json(401, { error: "invalid API key" });
+	if (!canWrite(tenant)) return json(403, { error: "this key is read-only" });
 
 	let body: unknown;
 	try {

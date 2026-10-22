@@ -15,6 +15,9 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const tenant = key ? await tenantForKey(key) : null;
 	if (!tenant) return json(401, { error: "invalid API key" });
 
+	// GET /v1/me: who this key belongs to, for the dashboard header.
+	if (event.rawPath === "/v1/me") return json(200, { name: tenant.name, scope: tenant.scope ?? "write" });
+
 	const day = event.queryStringParameters?.day ?? new Date().toISOString().slice(0, 10);
 	if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return json(400, { error: "day must be YYYY-MM-DD" });
 	const limit = Math.min(Math.max(Number(event.queryStringParameters?.limit ?? 50) || 50, 1), MAX_LIMIT);

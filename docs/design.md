@@ -142,6 +142,11 @@ A **budget alarm** at a fixed monthly amount protects the demo account.
 5. **Proof:** load test, cost report, and Prompt Shield integration.
 6. **Write-up:** the blog post and an architecture diagram for the README.
 
+## 9a. Changes from the original plan
+
+- **Dashboard sign-in: read-only API keys instead of Cognito (for now).** The goal for v1 was a dashboard anyone can open from a portfolio link, which a sign-in wall would defeat. So the public page uses a read-only key scope: it can query the demo tenant and nothing else. Customers can paste their own key, which is held in session storage only. Cognito with a JWT authorizer mapping users to tenants remains the right design for real customers, with SSO for enterprise tenants.
+- **Evaluation workflow: the judge model was chosen by calibration** (Nova Pro) rather than fixed in advance. See [experiments](experiments.md).
+
 ## 10. Open questions
 
 - Should cold analytics be per-tenant buckets (stronger isolation, more resources) or a shared bucket with partitions (simpler)? *Leaning shared, with IAM conditions and Lake Formation as the upgrade path.*

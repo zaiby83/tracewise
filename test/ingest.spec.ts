@@ -3,7 +3,7 @@ import type { APIGatewayProxyEventV2 } from "aws-lambda";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tenant = { tenant_id: "tenant-1", name: "Acme", status: "active", events_per_minute: 1000 };
-const tenants = vi.hoisted(() => ({ tenantForKey: vi.fn(), consumeQuota: vi.fn() }));
+const tenants = vi.hoisted(() => ({ tenantForKey: vi.fn(), consumeQuota: vi.fn(), canWrite: (t: { scope?: string }) => (t.scope ?? "write") === "write" }));
 vi.mock("../services/shared/tenants", () => tenants);
 
 const { handler } = await import("../services/ingest/handler");
@@ -62,5 +62,12 @@ describe("ingest handler", () => {
 		expect((await handler({ ...request({}), body: "not json" } as APIGatewayProxyEventV2)).statusCode).toBe(400);
 		expect((await handler(request({ events: Array.from({ length: 101 }, event) }))).statusCode).toBe(400);
 		expect((await handler(request({ events: [{ junk: true }] }))).statusCode).toBe(400);
+	});
+
+	it("refuses to ingest with a read-only key", async () => {
+		tenants.tenantForKey.mockResolvedValue({ ...tenant, scope: "read" });
+		const res = await handler(request({ events: [event()] }));
+		expect(res.statusCode).toBe(403);
+		expect(send).not.toHaveBeenCalled();
 	});
 });
