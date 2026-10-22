@@ -1,0 +1,160 @@
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+import { CloudWatchClient, PutMetricDataCommand } from "@aws-sdk/client-cloudwatch";
+import { PublishCommand, SNSClient } from "@aws-sdk/client-sns";
+import { GetCommand, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { log } from "../shared/http";
+import { partitionsForDay } from "../shared/keys";
+import { ddb } from "../shared/tenants";
+import { DEFAULT_RUBRIC, isRegression, judgeMessages, parseScores, summarize, type Graded } from "./judge-prompt";
+
+// The four steps of the nightly evaluation workflow. Step Functions passes only small
+// payloads between them (keys, not transcripts): its state limit is 256 KB, and a
+// sample of full conversations could exceed it. Each judge call fetches its own trace.
+
+const bedrock = new BedrockRuntimeClient({});
+const cloudwatch = new CloudWatchClient({});
+const sns = new SNSClient({});
+const SAMPLE_SIZE = Number(process.env.SAMPLE_SIZE ?? 20);
+
+interface TenantRef {
+	tenant_id: string;
+	name: string;
+	// Always present (null for the default) because Step Functions fails on a missing path.
+	rubric: string | null;
+	day: string;
+}
+
+// Step 1: every active tenant, with the day to evaluate (yesterday by default).
+export async function listTenants(input: { day?: string }): Promise<{ tenants: TenantRef[] }> {
+	const day = input.day ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+	const tenants: TenantRef[] = [];
+	let start: Record<string, unknown> | undefined;
+	do {
+		const page = await ddb.send(new ScanCommand({ TableName: process.env.TENANTS_TABLE, ExclusiveStartKey: start }));
+		for (const t of page.Items ?? []) {
+			if (t.status === "active") tenants.push({ tenant_id: t.tenant_id, name: t.name, rubric: t.rubric ?? null, day });
+		}
+		start = page.LastEvaluatedKey;
+	} while (start);
+	return { tenants };
+}
+
+// Step 2: a random sample of the tenant's successful, unblocked calls for the day,
+// returned as keys only.
+export async function sample(tenant: TenantRef): Promise<TenantRef & { keys: { pk: string; sk: string }[] }> {
+	const pages = await Promise.all(
+		partitionsForDay(tenant.tenant_id, tenant.day).map((pk) =>
+			ddb.send(
+				new QueryCommand({
+					TableName: process.env.TRACES_TABLE,
+					KeyConditionExpression: "pk = :pk",
+					FilterExpression: "#s = :ok AND (attribute_not_exists(security) OR security.verdict <> :blocked)",
+					ExpressionAttributeNames: { "#s": "status" },
+					ExpressionAttributeValues: { ":pk": pk, ":ok": "ok", ":blocked": "blocked" },
+					ProjectionExpression: "pk, sk",
+				}),
+			),
+		),
+	);
+	const all = pages.flatMap((p) => (p.Items ?? []) as { pk: string; sk: string }[]);
+	// Fisher-Yates shuffle, then take the sample.
+	for (let i = all.length - 1; i > 0; i--) {
+		const j = Math.floor(Math.random() * (i + 1));
+		[all[i], all[j]] = [all[j]!, all[i]!];
+	}
+	return { ...tenant, keys: all.slice(0, SAMPLE_SIZE) };
+}
+
+// Step 3 (run in parallel by a Map state): grade one trace. Throttling errors are
+// rethrown so Step Functions retries them with backoff; anything else is recorded as
+// a failed grade rather than failing the whole run.
+export async function judge(input: { key: { pk: string; sk: string }; rubric: string | null }): Promise<Graded> {
+	const { Item } = await ddb.send(new GetCommand({ TableName: process.env.TRACES_TABLE, Key: input.key }));
+	if (!Item) return { key: input.key, event_id: "", route: "", scores: null, error: "trace expired or missing" };
+
+	const { system, user } = judgeMessages(String(Item.input), String(Item.output), input.rubric ?? DEFAULT_RUBRIC);
+	const res = await bedrock.send(
+		new ConverseCommand({
+			modelId: process.env.JUDGE_MODEL,
+			system: [{ text: system }],
+			messages: [{ role: "user", content: [{ text: user }] }],
+			inferenceConfig: { maxTokens: 200, temperature: 0 },
+		}),
+	);
+	const text = res.output?.message?.content?.map((c) => c.text ?? "").join("") ?? "";
+	const scores = parseScores(text);
+	if (!scores) log("warn", "judge reply unparseable", { event_id: Item.event_id });
+	return { key: input.key, event_id: Item.event_id, route: Item.route ?? "(none)", scores, ...(scores ? {} : { error: "unparseable judge reply" }) };
+}
+
+// Step 4: store the run, publish metrics, and alert on a regression.
+export async function record(input: TenantRef & { results: Graded[] }) {
+	const summary = summarize(input.results);
+	const runAt = new Date().toISOString();
+
+	const previous = await ddb.send(
+		new QueryCommand({
+			TableName: process.env.EVALS_TABLE,
+			KeyConditionExpression: "tenant_id = :t",
+			ExpressionAttributeValues: { ":t": input.tenant_id },
+			ScanIndexForward: false,
+			Limit: 7,
+		}),
+	);
+	const baseline = (previous.Items ?? []).map((r) => r.meanOverall).filter((m): m is number => typeof m === "number");
+	const regressed = isRegression(summary.meanOverall, baseline);
+
+	await ddb.send(
+		new PutCommand({
+			TableName: process.env.EVALS_TABLE,
+			Item: {
+				tenant_id: input.tenant_id,
+				run_at: runAt,
+				day: input.day,
+				judge_model: process.env.JUDGE_MODEL,
+				regressed,
+				...summary,
+				expires_at: Math.floor(Date.now() / 1000) + 400 * 86_400,
+			},
+		}),
+	);
+
+	if (summary.meanOverall !== null) {
+		const dims = (route?: string) => [
+			{ Name: "Tenant", Value: input.tenant_id },
+			...(route ? [{ Name: "Route", Value: route }] : []),
+		];
+		await cloudwatch.send(
+			new PutMetricDataCommand({
+				Namespace: "Tracewise/Evals",
+				MetricData: [
+					{ MetricName: "MeanScore", Dimensions: dims(), Value: summary.meanOverall },
+					{ MetricName: "SafetyFailures", Dimensions: dims(), Value: summary.safetyFailures, Unit: "Count" },
+					...Object.entries(summary.byRoute).map(([route, r]) => ({ MetricName: "MeanScore", Dimensions: dims(route), Value: r.meanOverall })),
+				],
+			}),
+		);
+	}
+
+	if (regressed || summary.safetyFailures > 0) {
+		const base = baseline.length ? (baseline.reduce((a, b) => a + b, 0) / baseline.length).toFixed(2) : "n/a";
+		await sns.send(
+			new PublishCommand({
+				TopicArn: process.env.ALERT_TOPIC,
+				Subject: `Tracewise: ${regressed ? "quality regression" : "safety failures"} for ${input.name}`.slice(0, 100),
+				Message: [
+					`Tenant: ${input.name} (${input.tenant_id})`,
+					`Day evaluated: ${input.day}`,
+					`Mean score: ${summary.meanOverall} (7-run baseline: ${base})`,
+					`Safety failures: ${summary.safetyFailures} of ${summary.scored}`,
+					"",
+					"Lowest-scoring traces:",
+					...summary.worst.map((w) => `- ${w.overall.toFixed(1)}  ${w.route}  ${w.event_id}  ${w.reason}`),
+				].join("\n"),
+			}),
+		);
+	}
+
+	log("info", "eval run recorded", { tenant_id: input.tenant_id, day: input.day, ...summary, regressed, worst: undefined });
+	return { tenant_id: input.tenant_id, meanOverall: summary.meanOverall, scored: summary.scored, regressed };
+}

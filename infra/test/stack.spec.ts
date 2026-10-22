@@ -14,7 +14,7 @@ beforeAll(() => {
 describe("TracewiseStack", () => {
 	it("encrypts every table and expires hot data with TTL", () => {
 		const tables = template.findResources("AWS::DynamoDB::GlobalTable");
-		expect(Object.keys(tables)).toHaveLength(3);
+		expect(Object.keys(tables)).toHaveLength(4);
 		for (const t of Object.values(tables)) {
 			expect(t.Properties.SSESpecification).toMatchObject({ SSEEnabled: true });
 			expect(t.Properties.BillingMode).toBe("PAY_PER_REQUEST");
@@ -46,7 +46,7 @@ describe("TracewiseStack", () => {
 		const fns = Object.entries(template.findResources("AWS::Lambda::Function"))
 			.filter(([id]) => !id.startsWith("Custom"))
 			.map(([, f]) => f);
-		expect(fns).toHaveLength(4);
+		expect(fns).toHaveLength(9);
 		for (const f of fns) {
 			expect(f.Properties.Architectures).toEqual(["arm64"]);
 			expect(f.Properties.TracingConfig).toEqual({ Mode: "Active" });
@@ -114,5 +114,29 @@ describe("TracewiseStack", () => {
 		expect(doc).not.toMatch(/dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/);
 		expect(doc).not.toMatch(/glue:(Create|Update|Delete)/);
 		expect(doc).not.toMatch(/firehose:/);
+	});
+
+	it("runs evaluations nightly as a workflow with throttling retries and per-trace failure handling", () => {
+		template.hasResourceProperties("AWS::Scheduler::Schedule", { ScheduleExpression: "cron(0 6 * * ? *)" });
+		const [sm] = Object.values(template.findResources("AWS::StepFunctions::StateMachine"));
+		const definition = JSON.stringify(sm!.Properties.DefinitionString);
+		expect(definition).toContain("ThrottlingException");
+		expect(definition).toContain("GradeFailed");
+		expect(definition).toMatch(/MaxConcurrency\\?":\s*4/);
+	});
+
+	it("scopes the judge to one Bedrock model and metrics to one namespace", () => {
+		const policies = JSON.stringify(template.findResources("AWS::IAM::Policy"));
+		expect(policies).toContain("inference-profile/us.amazon.nova-pro-v1:0");
+		expect(policies).toContain("foundation-model/amazon.nova-pro-v1:0");
+		// No wildcard *action* (the region wildcard inside the foundation-model ARN is expected).
+		expect(policies).not.toContain('"bedrock:*"');
+		template.hasResourceProperties("AWS::IAM::Policy", {
+			PolicyDocument: {
+				Statement: Match.arrayWith([
+					Match.objectLike({ Action: "cloudwatch:PutMetricData", Condition: { StringEquals: { "cloudwatch:namespace": "Tracewise/Evals" } } }),
+				]),
+			},
+		});
 	});
 });

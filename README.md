@@ -4,11 +4,11 @@ LLM observability and evaluation on serverless AWS. Apps send every model call t
 
 - **[PR/FAQ](docs/PRFAQ.md):** the product, written working backwards.
 - **[Design document](docs/design.md):** requirements, architecture, service trade-offs, failure modes, cost model, validation plan.
-- **[Experiments](docs/experiments.md):** measurements from the deployed stack. They cover cutting ingest-to-queryable latency from 6.3 s to 63 ms (p50), and proving that Athena itself refuses queries that skip the tenant filter.
+- **[Experiments](docs/experiments.md):** measurements from the deployed stack. They cover cutting ingest-to-queryable latency from 6.3 s to 63 ms (p50), proving that Athena itself refuses queries that skip the tenant filter, and choosing an evaluation judge by calibrating four models against labelled answers. The chosen judge caught a simulated bad deploy (score 4.5 → 2.45).
 
-> **Status:** Milestones 1 and 2 of 6 are live: the ingest pipeline, API keys and SDK, and the S3/Athena data lake with an analytics API. Evaluations, the dashboard and the load test are next. See [milestones](docs/design.md#9-milestones).
+> **Status:** Milestones 1–3 of 6 are live: the ingest pipeline and SDK, the S3/Athena data lake with an analytics API, and nightly AI evaluations with regression alerts. The dashboard and load test are next. See [milestones](docs/design.md#9-milestones).
 
-## Architecture (Milestones 1–2)
+## Architecture (Milestones 1–3)
 
 ```mermaid
 flowchart LR
@@ -23,6 +23,11 @@ flowchart LR
     S3 --- GLUE[Glue table<br/>partition projection]
     APIGW --> Q[Lambda: query] --> DDB
     APIGW --> AN[Lambda: analytics] --> ATH[Athena workgroup<br/>1 GB scan cap] --> GLUE
+    SCHED[EventBridge Scheduler<br/>nightly] --> SFN[Step Functions<br/>sample → grade → record]
+    SFN --> DDB
+    SFN --> BR[Bedrock: Nova Pro judge]
+    SFN --> EV[(DynamoDB: eval runs)]
+    SFN --> CWM[CloudWatch metrics] & SNS[SNS regression alert]
     DLQ & SQS & ING -.-> CW[CloudWatch alarms → SNS]
 ```
 
@@ -35,6 +40,8 @@ flowchart LR
 - **Per-tenant quotas** are counted atomically in DynamoDB, so they hold across every concurrent Lambda.
 - **A data lake that enforces isolation.** Firehose converts events to Parquet and partitions them by tenant and day. The Glue table uses *injected* partition projection, so Athena rejects any query that doesn't name a tenant, and a tenant's query reads only that tenant's prefix. Proven in [experiment 2](docs/experiments.md#2-the-data-lake-tenant-isolation-and-what-a-query-actually-reads).
 - **Cost guardrails on analytics.** The Athena workgroup enforces a 1 GB per-query scan cap that callers can't override. Repeated questions reuse cached results, and S3 lifecycle rules tier and expire data.
+- **Nightly AI evaluations.** A Step Functions workflow samples each tenant's day, grades every sample with a Bedrock judge against the tenant's rubric, stores the run, publishes CloudWatch metrics, and alerts through SNS when quality drops 0.5+ below the 7-run baseline or any safety check fails. Throttled grades retry with backoff in the workflow. Ungradable traces are recorded as failures rather than failing the run. Only DynamoDB keys move between steps (the claim-check pattern), so the 256 KB state limit never matters.
+- **A judge chosen by measurement and hardened against injection.** The judge was picked by calibrating four Bedrock models on 24 labelled answers, and it's prompted with a random boundary fence so a conversation can't instruct it to grade itself 5/5.
 - **Least-privilege IAM.** For example, the ingest function can't read or write traces at all, and a test enforces that.
 
 ## The SDK
@@ -64,7 +71,7 @@ Requirements: Node 22+, pnpm, AWS CLI v2, and AWS CDK.
 
 ```sh
 pnpm install
-pnpm test                 # 48 tests: logic, SDK, and CDK assertions on the synthesized stack
+pnpm test                 # 59 tests: logic, SDK, and CDK assertions on the synthesized stack
 pnpm synth                # build the CloudFormation template locally, no AWS needed
 
 aws sso login             # with a profile from `aws configure sso`
@@ -74,6 +81,8 @@ pnpm tenant:create "Demo tenant"   # prints an API key once; save it with the UR
 node --env-file=.env.local --import tsx scripts/smoke.ts     # end-to-end checks
 node --env-file=.env.local --import tsx scripts/latency.ts   # pipeline latency percentiles
 node --env-file=.env.local --import tsx scripts/seed.ts      # a week of demo traffic for analytics
+pnpm exec tsx scripts/calibrate-judge.ts <bedrock-model-id>...   # compare judges against labels
+pnpm exec tsx scripts/run-evals.ts [YYYY-MM-DD]                  # run the evaluation workflow now
 ```
 
 ```sh
@@ -81,6 +90,7 @@ curl -X POST "$API_URL/v1/traces" -H "authorization: Bearer $KEY" -H 'content-ty
   -d '{"events":[{"event_id":"'$(uuidgen | tr A-Z a-z)'","ts":"'$(date -u +%FT%TZ)'","model":"demo","input":"hi","output":"hello","latency_ms":120}]}'
 curl "$API_URL/v1/traces" -H "authorization: Bearer $KEY"
 curl "$API_URL/v1/analytics/summary?days=7" -H "authorization: Bearer $KEY"   # cost, p50/p95, errors, blocks by route
+curl "$API_URL/v1/evals" -H "authorization: Bearer $KEY"                        # recent evaluation runs
 ```
 
 `cdk destroy` removes everything, including all data.
@@ -89,7 +99,8 @@ curl "$API_URL/v1/analytics/summary?days=7" -H "authorization: Bearer $KEY"   # 
 
 ```
 infra/          CDK app and stack, plus assertion tests on the template
-services/       Lambda handlers: ingest, processor, query, analytics, plus shared schema/keys/tenants
+services/       Lambda handlers: ingest, processor, query, analytics, evals, plus shared schema/keys/tenants
+eval/           labelled conversations for judge calibration
 sdk/            @tracewise/sdk: batching, retrying, redacting client
 scripts/        create-tenant
 docs/           PR/FAQ and design document

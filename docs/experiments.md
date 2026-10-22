@@ -63,3 +63,42 @@ Measurements taken against the deployed stack in `us-east-1`. Each one records t
 **Caveat on cost.** Athena bills $5 per TB scanned with a **10 MB minimum per query**, so at demo volumes every query above costs the same, about $0.00005. The savings from pruning and columns become real at scale: at 1,000 events/s (~86M events/day), a 30-day `SELECT *` would scan hundreds of GB, while a one-column, one-week query reads a small fraction of that. The workgroup's 1 GB per-query scan cap is the backstop against an expensive mistake.
 
 **Decision.** Keep the layout. Next steps would be compaction (Firehose writes many small files per day at low volume, and small files slow Athena down at scale) and, if tenants need SQL access themselves, Lake Formation row-level permissions.
+
+## 3. Choosing and trusting the evaluation judge
+
+**Question.** The nightly evaluation uses an LLM to grade answers. Which Bedrock model should do it, and can its grades be trusted?
+
+**Method.** `eval/conversations.json` holds 24 hand-labelled conversations: 12 good and 12 bad. The bad ones are deliberately varied: wrong facts, a hallucinated feature, off-topic answers, a leaked secret, an obeyed prompt injection, wrong and dangerous SQL, an unhelpful refusal, a wrong summary, a rude email and a made-up policy. `scripts/calibrate-judge.ts` sends every case to each candidate model through the same prompt and parser the workflow uses, and compares "overall < 3" against the labels.
+
+**Results**
+
+| Judge | Agreement | Bad answers caught | Good answers wrongly failed |
+|---|---|---|---|
+| Amazon Nova 2 Lite | 22/24 (twice) | 10/12 | 0/12 |
+| **Amazon Nova Pro** | **23/24, then 24/24** | **11–12/12** | **0/12** |
+| Meta Llama 3.3 70B | 20/24 | 8/12 | 0/12 |
+| Anthropic Claude Haiku 5.5 | not available | – | – |
+
+Claude models on Bedrock require a one-time use-case submission on new accounts, which wasn't needed for this.
+
+**Observations**
+- **No model failed a good answer.** Every miss was a bad answer graded too kindly, and almost all of those scored exactly 3.0, the cut-off. Llama missed "rude", "off-topic" and "unhelpful refusal": it graded factual accuracy well but tone and helpfulness poorly.
+- **The judge isn't perfectly repeatable, even at temperature 0.** Nova Pro graded the borderline "unhelpful refusal" differently on two runs. That's why the workflow averages a sample of 20 per tenant per day and alerts on a drop of 0.5 or more against a 7-run baseline, rather than reacting to any single grade.
+- **A threshold sweep** showed Nova Pro's good answers all scored 4.5–5.0, so any cut-off from 2.5 to 4 gives the same result. Nova 2 Lite needed a looser cut-off (< 3.5) to catch one more bad answer.
+
+**Decision.** Nova Pro is the default judge (`-c judgeModel=…` to change). A nightly run of 20 samples uses about 7k tokens, a fraction of a cent.
+
+### End-to-end: detecting a bad deploy
+
+I created a separate demo tenant and seeded four days of realistic traffic: three normal days (10% bad answers) and a "bad deploy" day (70% bad), then ran the workflow for each day in order.
+
+| Day | Mean score (1–5) | Safety failures | Regression? |
+|---|---|---|---|
+| Oct 18 | 4.53 | 0 | – |
+| Oct 19 | 4.50 | 0 | – |
+| Oct 20 | 4.48 | 0 | – |
+| **Oct 21** | **2.45** | **4** | **yes: alert published to SNS** |
+
+The run's "worst traces" named the planted failures in the judge's own words: *"Invented feature, unrealistic claims"*, *"Incorrect information about plan change timing"*, *"Harmful misinformation given"*. Each workflow run took about 9 seconds.
+
+**The first run was a useful failure too.** The original demo tenant's traffic was synthetic filler ("question 12" → "answer 12"), and the judge correctly scored all of it 1/5 ("Generic, non-informative response"). Garbage in, an honest grade out, and the reason a separate tenant holds the realistic demo data.

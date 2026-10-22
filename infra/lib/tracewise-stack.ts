@@ -15,6 +15,7 @@ import { EmailSubscription } from "aws-cdk-lib/aws-sns-subscriptions";
 import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
 import { Analytics } from "./analytics";
+import { Evals } from "./evals";
 
 const services = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../services");
 
@@ -26,6 +27,8 @@ export interface TracewiseStackProps extends StackProps {
 	// requires a window above 0 for batches larger than 10.
 	batchingWindowSeconds?: number;
 	batchSize?: number;
+	// Bedrock model (or cross-region inference profile) that grades sampled traces.
+	judgeModel?: string;
 }
 
 export class TracewiseStack extends Stack {
@@ -132,6 +135,23 @@ export class TracewiseStack extends Stack {
 		tenants.grantReadData(summary);
 		analytics.grantQuery(summary);
 
+		// ---- Evaluations ------------------------------------------------------------
+		const alarms = new Topic(this, "Alarms");
+		if (props.alarmEmail) alarms.addSubscription(new EmailSubscription(props.alarmEmail));
+
+		const evals = new Evals(this, "Evals", {
+			traces,
+			tenants,
+			alerts: alarms,
+			fn,
+			judgeModel: props.judgeModel ?? "us.amazon.nova-pro-v1:0", // chosen by calibration: docs/experiments.md
+		});
+		const evalsApi = fn("EvalsApi", "evals/api.ts", { timeout: Duration.seconds(10) });
+		evalsApi.addEnvironment("TENANTS_TABLE", tenants.tableName);
+		evalsApi.addEnvironment("EVALS_TABLE", evals.table.tableName);
+		tenants.grantReadData(evalsApi);
+		evals.table.grantReadData(evalsApi);
+
 		// ---- API --------------------------------------------------------------------
 		const api = new HttpApi(this, "Api", { description: "Tracewise ingest and query API" });
 		api.addRoutes({ path: "/v1/traces", methods: [HttpMethod.POST], integration: new HttpLambdaIntegration("IngestRoute", ingest) });
@@ -141,13 +161,12 @@ export class TracewiseStack extends Stack {
 			methods: [HttpMethod.GET],
 			integration: new HttpLambdaIntegration("AnalyticsRoute", summary),
 		});
+		api.addRoutes({ path: "/v1/evals", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("EvalsRoute", evalsApi) });
 		// Account-wide backstop throttle; per-tenant quotas are enforced in the ingest function.
 		const stage = api.defaultStage!.node.defaultChild as import("aws-cdk-lib/aws-apigatewayv2").CfnStage;
 		stage.defaultRouteSettings = { throttlingRateLimit: 200, throttlingBurstLimit: 400 };
 
 		// ---- Alarms -----------------------------------------------------------------
-		const alarms = new Topic(this, "Alarms");
-		if (props.alarmEmail) alarms.addSubscription(new EmailSubscription(props.alarmEmail));
 		const notify = new SnsAction(alarms);
 
 		new Alarm(this, "DeadLetters", {
@@ -179,5 +198,6 @@ export class TracewiseStack extends Stack {
 		new CfnOutput(this, "TenantsTable", { value: tenants.tableName });
 		new CfnOutput(this, "TracesTable", { value: traces.tableName });
 		new CfnOutput(this, "LakeBucket", { value: analytics.bucket.bucketName });
+		new CfnOutput(this, "EvalWorkflow", { value: evals.stateMachine.stateMachineArn });
 	}
 }

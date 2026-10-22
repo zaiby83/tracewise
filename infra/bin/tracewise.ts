@@ -13,6 +13,7 @@ const stack = new TracewiseStack(app, "Tracewise", {
 	alarmEmail: app.node.tryGetContext("alarmEmail") ?? process.env.TRACEWISE_ALARM_EMAIL,
 	batchingWindowSeconds: numberContext(app, "batchingWindow"),
 	batchSize: numberContext(app, "batchSize"),
+	judgeModel: app.node.tryGetContext("judgeModel"),
 });
 // Tags make the project's spend visible in Cost Explorer.
 Tags.of(stack).add("project", "tracewise");
