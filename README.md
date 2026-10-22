@@ -63,7 +63,7 @@ pnpm synth                # build the CloudFormation template locally, no AWS ne
 
 aws sso login             # with a profile from `aws configure sso`
 cdk bootstrap             # once per account and region
-pnpm run deploy -c alarmEmail=you@example.com
+TRACEWISE_ALARM_EMAIL=you@example.com pnpm run deploy
 pnpm tenant:create "Demo tenant"   # prints an API key once; save it with the URL in .env.local
 node --env-file=.env.local --import tsx scripts/smoke.ts     # end-to-end checks
 node --env-file=.env.local --import tsx scripts/latency.ts   # pipeline latency percentiles

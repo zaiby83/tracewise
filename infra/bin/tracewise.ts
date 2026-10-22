@@ -9,7 +9,8 @@ function numberContext(app: App, key: string): number | undefined {
 const app = new App();
 const stack = new TracewiseStack(app, "Tracewise", {
 	env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
-	alarmEmail: app.node.tryGetContext("alarmEmail"),
+	// From context or the environment, so a personal address never lands in the repo.
+	alarmEmail: app.node.tryGetContext("alarmEmail") ?? process.env.TRACEWISE_ALARM_EMAIL,
 	batchingWindowSeconds: numberContext(app, "batchingWindow"),
 	batchSize: numberContext(app, "batchSize"),
 });
