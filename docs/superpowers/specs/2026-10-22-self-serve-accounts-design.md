@@ -228,3 +228,32 @@ CDK assertion tests enforce the console and deleter rows and the existing rule t
 - **Billing and plans:** `plan` and `limits` already sit on `PROFILE`, ready for them.
 - **SSO:** Cognito SAML/OIDC identity providers, mapped to orgs by email domain.
 - **Audit log** for key, member and settings changes.
+
+## 12. Changes during planning
+
+These refine the sections above, and where they differ, they win.
+
+**Decisions made while planning**
+1. The console sends the Cognito ID token, not the access token: access tokens carry no `email` or `email_verified` claims, which invite acceptance needs, and ID tokens have `aud` = client ID for the JWT authorizer.
+2. The callback and sign-out URL is `<origin>/console/index.html`, because S3 behind OAC doesn't serve directory index files and this avoids a CloudFront Function.
+3. Migrated orgs keep today's behaviour: `legacyLimits(epm)` sets `events_per_day = epm × 1440` and `analytics_queries_per_day = 10_000`, so the public demo and the load test aren't capped by free defaults.
+4. `PROFILE.owner_count` is kept atomically, and demoting or removing an owner is conditioned on `owner_count > 1`, so "at least one owner" holds under concurrency.
+5. The `Accounts` table is declared in the stack's Storage section, like the other tables, while `infra/lib/accounts.ts` holds Cognito, the console and deleter functions, routes and alarms.
+6. The eval `sample` step writes the night's sample count to the Quotas table (`<org>#evals#<day>`), so the usage route reads it without eval-runs access. The console Lambda also needs SQS send on the deletion queue and `cloudwatch:PutMetricData` on `Tracewise/Limits`.
+7. Key, member and invite caps return `409 { error, limit }`.
+8. The self-serve smoke test is a separate `scripts/smoke-selfserve.ts`, so `smoke.ts` keeps working with only a key.
+9. The key display prefix is the first 9 characters (`tw_` plus 6), matching the example `tw_ab12cd`.
+10. CloudFront gets uncached behaviours `/v1/orgs*` and `/v1/invites/*` ahead of `/v1/*`, whose cache keys on `authorization` and would serve stale key lists after a create.
+11. The deleter removes DynamoDB trace days 0 to `HOT_RETENTION_DAYS + 2` to cover TTL lag, and leaves `errors/` and `athena-results/` in the lake to their lifecycle rules (14 and 7 days), since they hold malformed records and aggregates, not trace partitions.
+
+**Changes made during implementation**
+- List endpoints return wrapped objects (`{ orgs }`, `{ keys }`, `{ members }`, `{ invites }`) rather than bare arrays, matching the existing API's `{ traces }` and `{ runs }`.
+- Deleting an org: if queueing the deletion fails, the org is rolled back to active and the owner gets a retryable `503`.
+- The deleter re-checks that the org is `deleting` (consistent read) before every step and drops the message otherwise, and the tombstone is conditioned on `deleting`.
+- The deleter covers trace partitions from tomorrow (day −1) back to `HOT_RETENTION_DAYS + 2`, and the delayed sweep also re-deletes trace days −1..1 to catch late processor writes.
+- The nightly eval workflow no longer carries rubrics in its state: the sample step loads each org's rubric, and the `EachTenant` map discards its results.
+- API-key reads (query, analytics, evals) also stamp `last_used_at`, and every `last_used_at` grant is limited by an IAM condition to the `pk`, `sk` and `last_used_at` attributes.
+- The analytics function also writes the Quotas table, for its daily cap counter.
+- `GET /v1/orgs` lists only orgs whose profile is active.
+- Unmigrated (old-shape) keys are refused at ingest when their org has a non-active profile. The migration rewrites keys of non-active orgs as revoked, a re-run with `--owner` can attach an owner to an existing owner-less org, and key-index rewrites are conditioned on the scanned status so a key revoked mid-migration isn't revived.
+- The console client uses refresh-token rotation with only the SRP explicit auth flow (no `ALLOW_REFRESH_TOKEN_AUTH`), and the console refreshes through `/oauth2/token`.

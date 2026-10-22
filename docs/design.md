@@ -11,8 +11,9 @@
 - Run scheduled evaluations (LLM-as-judge and deterministic checks) and alert on regressions.
 - Query recent traces quickly, and run historical analytics cheaply.
 - Deploy everything as code, in one command, at near-zero idle cost.
+- Let a team sign up, create an organisation and manage its keys, members and settings without an operator (self-serve accounts, added after milestone 6).
 
-**Non-goals (v1):** billing, SSO, real-time streaming UI, self-hosting, prompt management.
+**Non-goals (v1):** billing, SSO, emailing invites, real-time streaming UI, self-hosting, prompt management.
 
 ## 2. Requirements and assumptions
 
@@ -78,7 +79,7 @@ flowchart LR
 - **IAM is least-privilege per function.** For example, the ingest function can only `sqs:SendMessage` to one queue.
 - **Data is encrypted at rest** (SSE for DynamoDB, S3 and SQS) and in transit (TLS).
 - **Tenant isolation:** every query path is keyed by the authenticated `tenant_id` and never by a client-supplied one.
-- **Dashboard sign-in** uses Cognito user pools. Query APIs use a JWT authorizer.
+- **Sign-in** uses a Cognito user pool with hosted sign-up. The console sends the ID token, and an API Gateway JWT authorizer verifies it. Handlers read `sub`, `email` and `email_verified` from the claims and look membership up in DynamoDB, so the org always comes from the membership row, never from the request. Data routes accept either a session or an API key.
 - **Redaction** happens in the SDK, so sensitive fields never leave the customer's environment.
 
 ## 4. Key decisions and alternatives
@@ -144,7 +145,7 @@ A **budget alarm** at a fixed monthly amount protects the demo account.
 
 ## 9a. Changes from the original plan
 
-- **Dashboard sign-in: read-only API keys instead of Cognito (for now).** The goal for v1 was a dashboard anyone can open from a portfolio link, which a sign-in wall would defeat. So the public page uses a read-only key scope: it can query the demo tenant and nothing else. Customers can paste their own key, which is held in session storage only. Cognito with a JWT authorizer mapping users to tenants remains the right design for real customers, with SSO for enterprise tenants.
+- **Dashboard sign-in: read-only keys for the public demo, Cognito for customers.** The demo page still uses a read-only key scope, because a sign-in wall would defeat a portfolio link: it can query the demo tenant and nothing else. Real customers now sign up through Cognito and use a separate console (`/console/`). Cognito answers who you are, and nothing more. Organisations, members and roles live in a single-table `Accounts` DynamoDB table, so a user can belong to several orgs with a different role in each, which Cognito groups can't express. API keys belong to an org and are managed in the console. Each org has free-tier limits (`events_per_minute`, `events_per_day`, eval samples, analytics queries, keys, members, invites) and three global caps (3 owned orgs per user, 100 new orgs a day, 2,000 judge calls a night) bound what open sign-up can cost. Deleting an org is an asynchronous, resumable job: an SQS-driven deleter removes its DynamoDB traces, eval runs, lake partitions and account rows, and a delayed sweep catches late writes. SSO, billing and emailing invites (via SES) are still not built. Details: [self-serve accounts spec](superpowers/specs/2026-10-22-self-serve-accounts-design.md).
 - **Evaluation workflow: the judge model was chosen by calibration** (Nova Pro) rather than fixed in advance. See [experiments](experiments.md).
 
 ## 10. Open questions
