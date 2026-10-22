@@ -1,5 +1,6 @@
-import { ConditionalCheckFailedException, DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
+import { GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { ddb } from "./ddb";
 import { hashApiKey } from "./keys";
 
 export interface Tenant {
@@ -14,9 +15,8 @@ export interface Tenant {
 
 export const canWrite = (t: Tenant) => (t.scope ?? "write") === "write";
 
-export const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
-	marshallOptions: { removeUndefinedValues: true },
-});
+// Re-exported so existing imports (and test mocks of this module) keep working.
+export { ddb } from "./ddb";
 
 // Tenant lookups are cached per Lambda instance for a minute: every ingest request
 // authenticates, and the tenant record changes rarely. Disabling a key therefore takes
