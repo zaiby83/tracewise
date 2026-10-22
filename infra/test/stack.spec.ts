@@ -215,11 +215,22 @@ describe("TracewiseStack", () => {
 				}),
 			}),
 		});
-		template.hasResourceProperties("AWS::CloudFront::Distribution", {
-			DistributionConfig: Match.objectLike({
-				CacheBehaviors: [Match.objectLike({ PathPattern: "/v1/*", ViewerProtocolPolicy: "https-only" })],
-			}),
-		});
+	});
+
+	it("never caches console API calls, and checks them before the cached /v1/* behaviour", () => {
+		const [dist] = Object.values(template.findResources("AWS::CloudFront::Distribution"));
+		const behaviors = dist!.Properties.DistributionConfig.CacheBehaviors as { PathPattern: string; CachePolicyId: unknown; ViewerProtocolPolicy: string }[];
+		expect(behaviors.map((b) => b.PathPattern)).toEqual(["/v1/orgs*", "/v1/invites/*", "/v1/*", "/console/*"]);
+		expect(behaviors[0]!.CachePolicyId).toBe("4135ea2d-6df8-44a3-9df3-4b5a84be39ad"); // managed CachingDisabled
+		expect(behaviors[1]!.CachePolicyId).toBe("4135ea2d-6df8-44a3-9df3-4b5a84be39ad");
+		expect(behaviors[2]!.ViewerProtocolPolicy).toBe("https-only");
+	});
+
+	it("lets only the console talk to Cognito, and keeps scripts first-party", () => {
+		const csps = Object.values(template.findResources("AWS::CloudFront::ResponseHeadersPolicy")).map((p) => JSON.stringify(p.Properties));
+		expect(csps).toHaveLength(2);
+		expect(csps.filter((c) => c.includes("amazoncognito.com"))).toHaveLength(1);
+		for (const c of csps) expect(c).toContain("script-src 'self';");
 	});
 
 	it("protects every console and session route with the Cognito JWT authorizer, and no key route", () => {

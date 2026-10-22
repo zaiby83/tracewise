@@ -58,21 +58,23 @@ export class Dashboard extends Construct {
 			autoDeleteObjects: true,
 		});
 
-		const securityHeaders = new ResponseHeadersPolicy(this, "SecurityHeaders", {
-			securityHeadersBehavior: {
-				// No third-party scripts, no inline script, no framing. The page talks only
-				// to its own origin.
-				contentSecurityPolicy: {
-					contentSecurityPolicy:
-						"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-					override: true,
+		// No third-party scripts, no inline script, no framing. The page talks only to its
+		// own origin; the console also reaches Cognito's token endpoint to refresh sessions.
+		const headersPolicy = (id: string, connectSrc: string) =>
+			new ResponseHeadersPolicy(this, id, {
+				securityHeadersBehavior: {
+					contentSecurityPolicy: {
+						contentSecurityPolicy: `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ${connectSrc}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+						override: true,
+					},
+					strictTransportSecurity: { accessControlMaxAge: Duration.days(365), includeSubdomains: true, override: true },
+					contentTypeOptions: { override: true },
+					frameOptions: { frameOption: HeadersFrameOption.DENY, override: true },
+					referrerPolicy: { referrerPolicy: HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN, override: true },
 				},
-				strictTransportSecurity: { accessControlMaxAge: Duration.days(365), includeSubdomains: true, override: true },
-				contentTypeOptions: { override: true },
-				frameOptions: { frameOption: HeadersFrameOption.DENY, override: true },
-				referrerPolicy: { referrerPolicy: HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN, override: true },
-			},
-		});
+			});
+		const securityHeaders = headersPolicy("SecurityHeaders", "'self'");
+		const consoleHeaders = headersPolicy("ConsoleHeaders", `'self' ${props.authDomainUrl}`);
 
 		// API reads are cached for up to a minute per key and query, so a burst of
 		// visitors on the public page costs one Athena query, not hundreds. The key is
@@ -90,24 +92,46 @@ export class Dashboard extends Construct {
 
 		const apiDomain = `${props.api.apiId}.execute-api.${Stack.of(this).region}.${Stack.of(this).urlSuffix}`;
 
+		const siteOrigin = S3BucketOrigin.withOriginAccessControl(bucket);
+		const apiOrigin = new HttpOrigin(apiDomain);
+		// The console's own calls (orgs, keys, members, invites) must never be cached: the
+		// /v1/* cache would serve a stale key list right after one is created.
+		const uncachedApi = {
+			origin: apiOrigin,
+			viewerProtocolPolicy: ViewerProtocolPolicy.HTTPS_ONLY,
+			allowedMethods: AllowedMethods.ALLOW_ALL,
+			cachePolicy: CachePolicy.CACHING_DISABLED,
+			originRequestPolicy: OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+		};
+
 		this.bucket = bucket;
 		this.distribution = new Distribution(this, "Cdn", {
 			comment: "Tracewise dashboard and API",
 			defaultRootObject: "index.html",
 			priceClass: PriceClass.PRICE_CLASS_100, // North America and Europe edges: cheapest
 			defaultBehavior: {
-				origin: S3BucketOrigin.withOriginAccessControl(bucket),
+				origin: siteOrigin,
 				viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
 				cachePolicy: CachePolicy.CACHING_OPTIMIZED,
 				responseHeadersPolicy: securityHeaders,
 			},
+			// Insertion order is CloudFront's precedence, so the uncached routes come before
+			// the cached /v1/*.
 			additionalBehaviors: {
+				"/v1/orgs*": uncachedApi,
+				"/v1/invites/*": uncachedApi,
 				"/v1/*": {
-					origin: new HttpOrigin(apiDomain),
+					origin: apiOrigin,
 					viewerProtocolPolicy: ViewerProtocolPolicy.HTTPS_ONLY,
 					allowedMethods: AllowedMethods.ALLOW_ALL,
 					cachePolicy: apiCache,
 					originRequestPolicy: OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+				},
+				"/console/*": {
+					origin: siteOrigin,
+					viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+					cachePolicy: CachePolicy.CACHING_OPTIMIZED,
+					responseHeadersPolicy: consoleHeaders,
 				},
 			},
 		});
