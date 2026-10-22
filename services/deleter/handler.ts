@@ -1,6 +1,6 @@
 import { DeleteObjectsCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
-import { BatchWriteCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { BatchWriteCommand, GetCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import type { SQSBatchResponse, SQSEvent } from "aws-lambda";
 import { k } from "../shared/accounts";
 import { ddb } from "../shared/ddb";
@@ -12,9 +12,12 @@ export type Phase = "dynamo" | "evals" | "s3" | "sweep" | "accounts";
 export interface DeletionMessage {
 	org_id: string;
 	phase: Phase;
-	// dynamo: day (offset from `token`'s date) and shard to resume at, plus the query's lastKey.
-	// evals: lastKey. s3 and sweep: the ListObjectsV2 continuation token.
-	cursor?: { day?: number; shard?: number; lastKey?: Record<string, unknown>; token?: string };
+	// anchor: the UTC date (YYYY-MM-DD) the first message ran on, carried through every phase
+	// so day offsets mean the same thing however late a message is delivered.
+	// dynamo and sweep: day (an offset back from the anchor, -1 being the day after) and shard
+	// to resume at, plus the query's lastKey. evals: lastKey. s3 and sweep: the ListObjectsV2
+	// continuation token (in sweep, its presence means the trace pass is already done).
+	cursor?: { anchor?: string; day?: number; shard?: number; lastKey?: Record<string, unknown>; token?: string };
 }
 
 const PHASES: readonly string[] = ["dynamo", "evals", "s3", "sweep", "accounts"];
@@ -24,8 +27,12 @@ const S3_BATCH = 1000; // DeleteObjects' maximum
 const S3_CALLS_PER_RUN = 3;
 const MAX_ATTEMPTS = 4;
 const SWEEP_DELAY_SECONDS = 900;
-// Traces expire 30 days after their event; two more days cover TTL lag.
-const LAST_DAY_OFFSET = HOT_RETENTION_DAYS + 2;
+// Day offsets back from the anchor. Traces expire 30 days after their event and two more
+// days cover TTL lag. Partitions use the client's own date (ts.slice(0, 10)), so an event
+// stamped with a +14:00 offset already lands on tomorrow (-1), which is checked last.
+const TRACE_DAYS = [...Array.from({ length: HOT_RETENTION_DAYS + 3 }, (_, i) => i), -1];
+// The sweep re-checks the days around the anchor for writes that landed after the first pass.
+const SWEEP_DAYS = [-1, 0, 1];
 
 const s3 = new S3Client({});
 const sqs = new SQSClient({});
@@ -43,15 +50,29 @@ interface Delete {
 // the accounts phase only touches the ORG#<id> partition and what its items point at.
 export async function runPhase(msg: DeletionMessage, now = Date.now()): Promise<DeletionMessage | null> {
 	assertOrgId(msg.org_id);
+	// The console only queues a deletion after marking the org `deleting`, but it can roll
+	// that back after SQS accepted the message, and dead-letter redrives replay old ones.
+	// Anything other than `deleting` ends the chain without touching data.
+	if (!(await isDeleting(msg.org_id))) {
+		log("warn", "deletion skipped: org not deleting", { org_id: msg.org_id, phase: msg.phase });
+		return null;
+	}
+	const anchor = msg.cursor?.anchor ?? new Date(now).toISOString().slice(0, 10);
 	switch (msg.phase) {
 		case "dynamo":
-			return deleteTraces(msg, now);
+			return deleteTraces(msg, anchor, TRACE_DAYS, { org_id: msg.org_id, phase: "evals", cursor: { anchor } });
 		case "evals":
-			return deleteEvalRuns(msg);
+			return deleteEvalRuns(msg, anchor);
 		case "s3":
-			return deleteLakeObjects(msg, "sweep");
-		case "sweep":
-			return deleteLakeObjects(msg, "accounts");
+			return deleteLakeObjects(msg, { org_id: msg.org_id, phase: "sweep", cursor: { anchor } });
+		case "sweep": {
+			// Records the processor or Firehose was still holding when the earlier passes ran.
+			if (msg.cursor?.token === undefined) {
+				const more = await deleteTraces(msg, anchor, SWEEP_DAYS, null);
+				if (more) return more;
+			}
+			return deleteLakeObjects(msg, { org_id: msg.org_id, phase: "accounts" });
+		}
 		case "accounts":
 			return deleteAccounts(msg.org_id, now);
 		default:
@@ -72,7 +93,7 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 				const msg = parse(record.body);
 				const next = await runPhase(msg);
 				if (!next) {
-					log("info", "org deleted", { org_id: msg.org_id });
+					if (msg.phase === "accounts") log("info", "org deleted", { org_id: msg.org_id });
 					return;
 				}
 				await sqs.send(
@@ -99,21 +120,30 @@ function parse(body: string): DeletionMessage {
 	return msg;
 }
 
-// dynamo phase: days 0..HOT_RETENTION_DAYS + 2, every shard. `token` pins day 0 to the
-// date the first message ran, so a cursor resumed after midnight UTC doesn't shift the window.
-async function deleteTraces(msg: DeletionMessage, now: number): Promise<DeletionMessage> {
+async function isDeleting(orgId: string): Promise<boolean> {
+	const { Item } = await ddb.send(
+		new GetCommand({ TableName: process.env.ACCOUNTS_TABLE, Key: { pk: k.org(orgId), sk: "PROFILE" }, ConsistentRead: true }),
+	);
+	return Item?.status === "deleting";
+}
+
+// Deletes the org's trace partitions for the given day offsets, every shard. `anchor` pins
+// offset 0 to the date the first message ran, so a cursor resumed after midnight UTC doesn't
+// shift the window. Returns the cursor message when the budget runs out, otherwise `done`.
+async function deleteTraces(msg: DeletionMessage, anchor: string, days: number[], done: DeletionMessage | null): Promise<DeletionMessage | null> {
 	const table = process.env.TRACES_TABLE!;
-	const base = msg.cursor?.token ?? new Date(now).toISOString().slice(0, 10);
-	let day = msg.cursor?.day ?? 0;
+	let dayIndex = Math.max(0, days.indexOf(msg.cursor?.day ?? days[0]!));
 	let shard = msg.cursor?.shard ?? 0;
 	let lastKey = msg.cursor?.lastKey;
 	const budget = { batches: BATCHES_PER_RUN };
 
-	while (day <= LAST_DAY_OFFSET) {
-		const date = new Date(Date.parse(base) - day * 86_400_000).toISOString().slice(0, 10);
-		const pk = partitionsForDay(msg.org_id, date)[shard]!;
+	while (dayIndex < days.length) {
+		const day = days[dayIndex]!;
+		const date = new Date(Date.parse(anchor) - day * 86_400_000).toISOString().slice(0, 10);
+		const partitions = partitionsForDay(msg.org_id, date);
 		do {
-			if (budget.batches <= 0) return { org_id: msg.org_id, phase: "dynamo", cursor: { day, shard, lastKey, token: base } };
+			if (budget.batches <= 0) return { org_id: msg.org_id, phase: msg.phase, cursor: { anchor, day, shard, lastKey } };
+			const pk = partitions[shard]!;
 			const page = await ddb.send(
 				new QueryCommand({
 					TableName: table,
@@ -133,21 +163,21 @@ async function deleteTraces(msg: DeletionMessage, now: number): Promise<Deletion
 			);
 			lastKey = page.LastEvaluatedKey;
 		} while (lastKey);
-		if (++shard === partitionsForDay(msg.org_id, date).length) {
+		if (++shard === partitions.length) {
 			shard = 0;
-			day++;
+			dayIndex++;
 		}
 	}
-	return { org_id: msg.org_id, phase: "evals" };
+	return done;
 }
 
 // evals phase: the org's runs share one partition (tenant_id), keyed by run_at.
-async function deleteEvalRuns(msg: DeletionMessage): Promise<DeletionMessage> {
+async function deleteEvalRuns(msg: DeletionMessage, anchor: string): Promise<DeletionMessage> {
 	const table = process.env.EVALS_TABLE!;
 	let lastKey = msg.cursor?.lastKey;
 	const budget = { batches: BATCHES_PER_RUN };
 	do {
-		if (budget.batches <= 0) return { org_id: msg.org_id, phase: "evals", cursor: { lastKey } };
+		if (budget.batches <= 0) return { org_id: msg.org_id, phase: "evals", cursor: { anchor, lastKey } };
 		const page = await ddb.send(
 			new QueryCommand({
 				TableName: table,
@@ -165,12 +195,12 @@ async function deleteEvalRuns(msg: DeletionMessage): Promise<DeletionMessage> {
 		);
 		lastKey = page.LastEvaluatedKey;
 	} while (lastKey);
-	return { org_id: msg.org_id, phase: "s3" };
+	return { org_id: msg.org_id, phase: "s3", cursor: { anchor } };
 }
 
 // s3 and sweep phases: the same pass over traces/tenant_id=<org>/. The trailing slash
 // keeps "o1" from matching "o10". The lake isn't versioned, so DeleteObjects is final.
-async function deleteLakeObjects(msg: DeletionMessage, after: Phase): Promise<DeletionMessage> {
+async function deleteLakeObjects(msg: DeletionMessage, done: DeletionMessage): Promise<DeletionMessage> {
 	const Bucket = process.env.LAKE_BUCKET!;
 	const Prefix = `traces/tenant_id=${msg.org_id}/`;
 	let token = msg.cursor?.token;
@@ -181,11 +211,11 @@ async function deleteLakeObjects(msg: DeletionMessage, after: Phase): Promise<De
 			const res = await s3.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true } }));
 			if (res.Errors?.length) throw new Error(`DeleteObjects failed for ${res.Errors.length} keys, first: ${res.Errors[0]?.Key} ${res.Errors[0]?.Code}`);
 		}
-		if (!page.IsTruncated) return { org_id: msg.org_id, phase: after };
+		if (!page.IsTruncated) return done;
 		if (!page.NextContinuationToken) throw new Error("truncated listing without a continuation token");
 		token = page.NextContinuationToken;
 	}
-	return { org_id: msg.org_id, phase: msg.phase, cursor: { token } };
+	return { org_id: msg.org_id, phase: msg.phase, cursor: { anchor: msg.cursor?.anchor, token } };
 }
 
 // accounts phase: removes everything under ORG#<id> except PROFILE, then the rows that
@@ -230,15 +260,15 @@ async function deleteAccounts(orgId: string, now: number): Promise<null> {
 				TableName: accounts,
 				Key: { pk: k.org(orgId), sk: "PROFILE" },
 				UpdateExpression: "SET #s = :deleted, deleted_at = :now REMOVE rubric",
-				// Without it, updating a missing PROFILE would create a stub item.
-				ConditionExpression: "attribute_exists(pk)",
+				// Only a deleting org is tombstoned, and a missing PROFILE isn't recreated as a stub.
+				ConditionExpression: "attribute_exists(pk) AND #s = :deleting",
 				ExpressionAttributeNames: { "#s": "status" },
-				ExpressionAttributeValues: { ":deleted": "deleted", ":now": new Date(now).toISOString() },
+				ExpressionAttributeValues: { ":deleted": "deleted", ":deleting": "deleting", ":now": new Date(now).toISOString() },
 			}),
 		);
 	} catch (err) {
 		if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
-		log("warn", "no profile to tombstone", { org_id: orgId });
+		log("warn", "profile not deleting, no tombstone written", { org_id: orgId });
 	}
 	return null;
 }
