@@ -1,6 +1,6 @@
 import { ConditionalCheckFailedException, TransactionCanceledException } from "@aws-sdk/client-dynamodb";
 import { PutCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
-import { k, legacyLimits, normalizeEmail, type KeyIndexRow, type KeyRecord, type Member, type OrgProfile } from "../../services/shared/accounts";
+import { k, legacyLimits, normalizeEmail, type KeyIndexRow, type KeyRecord, type Member, type OrgProfile, type OrgStatus } from "../../services/shared/accounts";
 import { ddb } from "../../services/shared/ddb";
 
 // The key index as it was before self-serve: one row per key, carrying the tenant's fields.
@@ -24,23 +24,48 @@ export interface MigrationPlan {
 	index: KeyIndexRow[];
 }
 
+// What the scan found for an org that already has a profile.
+export interface ExistingProfile {
+	name: string;
+	status: OrgStatus;
+	owner_count: number;
+}
+
+// What was read from AWS, which applyPlan needs beside the plan: the raw status of each row
+// (to guard the rewrite) and the profiles (for an org's name).
+export interface Scan {
+	rows: LegacyRow[];
+	profiles: Map<string, ExistingProfile>;
+}
+
 // Pure: decides what to write and touches nothing, so a re-run is easy to reason about.
 // Everything is derived from the rows, and key ids from the key hash, so the same input
 // always plans the same items; rows already rewritten (they have an org_id) plan nothing.
+//
+// Existing profiles come as a Set of ids, or a Map with what the scan saw. With the Map:
+// - a row whose org isn't active (deleting, deleted, suspended) plans nothing, so no KEY item
+//   or lean row appears for an org on its way out;
+// - with an owner, an active profile with no owners gets a membership, which is how a later
+//   run claims orgs migrated before the operator had an account.
+// A bare Set carries no status or owner count, so it plans neither.
 export function planMigration(
 	rows: LegacyRow[],
-	existingProfiles: Set<string>,
+	existingProfiles: Set<string> | Map<string, ExistingProfile>,
 	owner?: { sub: string; email: string },
 	now = new Date().toISOString(),
 ): MigrationPlan {
 	const plan: MigrationPlan = { profiles: [], members: [], keys: [], index: [] };
 	const planned = new Map<string, OrgProfile>();
+	const existing = (id: string): ExistingProfile | "unknown" | undefined =>
+		existingProfiles instanceof Map ? existingProfiles.get(id) : existingProfiles.has(id) ? "unknown" : undefined;
 
 	for (const row of rows) {
 		if (row.org_id) continue;
 		const orgId = row.tenant_id;
+		const found = existing(orgId);
+		if (found && found !== "unknown" && found.status !== "active") continue;
 
-		if (!existingProfiles.has(orgId)) {
+		if (!found) {
 			const profile = planned.get(orgId);
 			if (!profile) {
 				planned.set(orgId, {
@@ -86,7 +111,11 @@ export function planMigration(
 
 	plan.profiles = [...planned.values()];
 	if (owner) {
-		plan.members = plan.profiles.map((p) => ({ org_id: p.org_id, sub: owner.sub, email: normalizeEmail(owner.email), role: "owner", joined_at: now }));
+		const orgIds = plan.profiles.map((p) => p.org_id);
+		if (existingProfiles instanceof Map) {
+			for (const [id, p] of existingProfiles) if (p.status === "active" && p.owner_count === 0) orgIds.push(id);
+		}
+		plan.members = orgIds.map((org_id) => ({ org_id, sub: owner.sub, email: normalizeEmail(owner.email), role: "owner", joined_at: now }));
 	}
 	return plan;
 }
@@ -108,15 +137,17 @@ export async function scanKeyIndex(): Promise<LegacyRow[]> {
 	return (await scanAll({ TableName: process.env.TENANTS_TABLE })) as unknown as LegacyRow[];
 }
 
-// Deleted orgs count too: their id must not be recreated by a stray old row.
-export async function scanProfileIds(): Promise<Set<string>> {
+// Deleted orgs are included: their id must not be recreated by a stray old row, and their
+// status is how the plan knows to leave their keys alone.
+export async function scanProfiles(): Promise<Map<string, ExistingProfile>> {
 	const items = await scanAll({
 		TableName: process.env.ACCOUNTS_TABLE,
 		FilterExpression: "sk = :p",
 		ExpressionAttributeValues: { ":p": "PROFILE" },
-		ProjectionExpression: "org_id",
+		ProjectionExpression: "org_id, #n, #s, owner_count",
+		ExpressionAttributeNames: { "#n": "name", "#s": "status" },
 	});
-	return new Set(items.map((i) => String(i.org_id)));
+	return new Map(items.map((i) => [String(i.org_id), { name: String(i.name), status: i.status as OrgStatus, owner_count: Number(i.owner_count ?? 0) }]));
 }
 
 export interface MigrationCounts {
@@ -124,6 +155,8 @@ export interface MigrationCounts {
 	members: number;
 	keys: number;
 	index: number;
+	// Rows whose status changed between the scan and the rewrite: left alone, picked up by a re-run.
+	stale: number;
 }
 
 // A condition that fails means the item is already there (an earlier run wrote it), which is
@@ -145,21 +178,21 @@ async function putOnce(params: ConstructorParameters<typeof PutCommand>[0]): Pro
 // Order matters for a crash at any point. An org's profile (with its member and reverse USER
 // row, written together as everywhere else) goes first. Then per key: the KEY item, then the
 // index rewrite. So a lean index row never exists without its KEY item and profile, and a
-// re-run finishes whatever was left: both writes are conditional and skip what is done.
-export async function applyPlan(plan: MigrationPlan): Promise<MigrationCounts> {
+// re-run finishes whatever was left: every write is conditional and skips what is done.
+export async function applyPlan(plan: MigrationPlan, scan: Scan): Promise<MigrationCounts> {
 	const accounts = process.env.ACCOUNTS_TABLE;
-	const counts: MigrationCounts = { profiles: 0, members: 0, keys: 0, index: 0 };
+	const counts: MigrationCounts = { profiles: 0, members: 0, keys: 0, index: 0, stale: 0 };
+	const memberOf = (orgId: string) => plan.members.find((m) => m.org_id === orgId);
+	const memberItems = (m: Member, orgName: string) => [
+		{ Put: { TableName: accounts, Item: { pk: k.org(m.org_id), sk: k.member(m.sub), ...m }, ConditionExpression: "attribute_not_exists(pk)" } },
+		{ Put: { TableName: accounts, Item: { pk: k.user(m.sub), sk: k.org(m.org_id), role: "owner", org_name: orgName } } },
+	];
 
 	for (const profile of plan.profiles) {
-		const member = plan.members.find((m) => m.org_id === profile.org_id);
+		const member = memberOf(profile.org_id);
 		const items = [
 			{ Put: { TableName: accounts, Item: { pk: k.org(profile.org_id), sk: "PROFILE", ...profile }, ConditionExpression: "attribute_not_exists(pk)" } },
-			...(member
-				? [
-						{ Put: { TableName: accounts, Item: { pk: k.org(profile.org_id), sk: k.member(member.sub), ...member }, ConditionExpression: "attribute_not_exists(pk)" } },
-						{ Put: { TableName: accounts, Item: { pk: k.user(member.sub), sk: k.org(profile.org_id), role: "owner", org_name: profile.name } } },
-					]
-				: []),
+			...(member ? memberItems(member, profile.name) : []),
 		];
 		try {
 			await ddb.send(new TransactWriteCommand({ TransactItems: items }));
@@ -171,13 +204,56 @@ export async function applyPlan(plan: MigrationPlan): Promise<MigrationCounts> {
 		}
 	}
 
+	// Orgs that already existed with no owner. The count moves in the same transaction, and only
+	// from zero on an active org, so two runs (or an owner added meanwhile) can't both succeed.
+	const created = new Set(plan.profiles.map((p) => p.org_id));
+	for (const member of plan.members) {
+		if (created.has(member.org_id)) continue;
+		const name = scan.profiles.get(member.org_id)?.name;
+		if (name === undefined) throw new Error(`plan attaches an owner to ${member.org_id}, which has no scanned profile`);
+		try {
+			await ddb.send(
+				new TransactWriteCommand({
+					TransactItems: [
+						...memberItems(member, name),
+						{
+							Update: {
+								TableName: accounts,
+								Key: { pk: k.org(member.org_id), sk: "PROFILE" },
+								UpdateExpression: "SET owner_count = owner_count + :one",
+								ConditionExpression: "owner_count = :zero AND #s = :active",
+								ExpressionAttributeNames: { "#s": "status" },
+								ExpressionAttributeValues: { ":one": 1, ":zero": 0, ":active": "active" },
+							},
+						},
+					],
+				}),
+			);
+			counts.members++;
+		} catch (e) {
+			if (!failedCondition(e)) throw e;
+		}
+	}
+
+	const scanned = new Map(scan.rows.map((r) => [r.key_hash, r.status]));
 	for (const record of plan.keys) {
 		const row = plan.index.find((i) => i.key_hash === record.key_hash);
-		if (!row) throw new Error(`plan has no index row for key ${record.key_id}`);
+		const scannedStatus = scanned.get(record.key_hash);
+		if (!row || scannedStatus === undefined) throw new Error(`plan has no scanned index row for key ${record.key_id}`);
 		const item = { pk: k.org(record.org_id), sk: k.key(record.key_id), ...record };
 		if (await putOnce({ TableName: accounts, Item: item, ConditionExpression: "attribute_not_exists(pk)" })) counts.keys++;
-		// Only an old-shape row (no org_id) is replaced; the lean row has no other fields to lose.
-		if (await putOnce({ TableName: process.env.TENANTS_TABLE, Item: row, ConditionExpression: "attribute_not_exists(org_id)" })) counts.index++;
+		// Only an old-shape row (no org_id) is replaced, and only while its status is still what
+		// the plan was made from: a key revoked since the scan must not come back to life. The
+		// lean row has no other fields to lose.
+		const written = await putOnce({
+			TableName: process.env.TENANTS_TABLE,
+			Item: row,
+			ConditionExpression: "attribute_not_exists(org_id) AND #s = :scanned",
+			ExpressionAttributeNames: { "#s": "status" },
+			ExpressionAttributeValues: { ":scanned": scannedStatus },
+		});
+		if (written) counts.index++;
+		else counts.stale++;
 	}
 	return counts;
 }

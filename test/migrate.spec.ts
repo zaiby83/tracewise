@@ -7,9 +7,10 @@ vi.mock("../services/shared/ddb", () => ({ ddb }));
 process.env.ACCOUNTS_TABLE = "accounts";
 process.env.TENANTS_TABLE = "tenants";
 
-const { applyPlan, planMigration, scanKeyIndex, scanProfileIds } = await import("../scripts/lib/migrate");
+const { applyPlan, planMigration, scanKeyIndex, scanProfiles } = await import("../scripts/lib/migrate");
 const { parseLimitOverrides } = await import("../scripts/lib/limits");
 type LegacyRow = import("../scripts/lib/migrate").LegacyRow;
+type ExistingProfile = import("../scripts/lib/migrate").ExistingProfile;
 
 const demo: LegacyRow = { key_hash: "a".repeat(64), tenant_id: "t1", name: "Acme Support", status: "active", events_per_minute: 6000, scope: "read", created_at: "2026-10-01T00:00:00Z" };
 const write: LegacyRow = { ...demo, key_hash: "b".repeat(64), scope: undefined };
@@ -89,11 +90,13 @@ const condFail = () => new ConditionalCheckFailedException({ message: "x", $meta
 const calls = <T extends object>(cmd: new (...a: never[]) => T) => ddb.send.mock.calls.map((c) => c[0]).filter((c): c is T => c instanceof cmd);
 
 describe("applyPlan", () => {
-	const plan = () => planMigration([demo, write], new Set(), { sub: "u1", email: "z@x.io" }, now);
+	const rows = [demo, write];
+	const plan = () => planMigration(rows, new Set(), { sub: "u1", email: "z@x.io" }, now);
+	const scan = { rows, profiles: new Map<string, ExistingProfile>() };
 
 	it("writes the profile with its member and reverse USER row together, then each key, then its index row", async () => {
 		ddb.send.mockReset().mockResolvedValue({});
-		const counts = await applyPlan(plan());
+		const counts = await applyPlan(plan(), scan);
 		const order = ddb.send.mock.calls.map((c) => c[0].constructor.name);
 		expect(order).toEqual(["TransactWriteCommand", "PutCommand", "PutCommand", "PutCommand", "PutCommand"]);
 
@@ -109,13 +112,13 @@ describe("applyPlan", () => {
 		]);
 		expect(puts[0]).toMatchObject({ ConditionExpression: "attribute_not_exists(pk)" });
 		expect(puts[0]!.Item).toMatchObject({ pk: "ORG#t1", org_id: "t1", key_id: "aaaaaaaaaaaaaaaa" });
-		expect(puts[1]).toMatchObject({ ConditionExpression: "attribute_not_exists(org_id)", Item: { key_hash: demo.key_hash, org_id: "t1", key_id: "aaaaaaaaaaaaaaaa", scope: "read", status: "active" } });
-		expect(counts).toEqual({ profiles: 1, members: 1, keys: 2, index: 2 });
+		expect(puts[1]).toMatchObject({ ConditionExpression: "attribute_not_exists(org_id) AND #s = :scanned", ExpressionAttributeValues: { ":scanned": "active" }, Item: { key_hash: demo.key_hash, org_id: "t1", key_id: "aaaaaaaaaaaaaaaa", scope: "read", status: "active" } });
+		expect(counts).toEqual({ profiles: 1, members: 1, keys: 2, index: 2, stale: 0 });
 	});
 
 	it("writes no member or USER item without an owner", async () => {
 		ddb.send.mockReset().mockResolvedValue({});
-		await applyPlan(planMigration([demo], new Set()));
+		await applyPlan(planMigration([demo], new Set()), { rows: [demo], profiles: new Map() });
 		expect(calls(TransactWriteCommand)[0]!.input.TransactItems).toHaveLength(1);
 	});
 
@@ -124,8 +127,9 @@ describe("applyPlan", () => {
 			if (cmd instanceof TransactWriteCommand) throw cancelled("ConditionalCheckFailed", "None", "None");
 			throw condFail();
 		});
-		const counts = await applyPlan(plan());
-		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 0 });
+		const counts = await applyPlan(plan(), scan);
+		// Nothing written; the index rows count as stale because every condition failed here.
+		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 2 });
 		// The keys are still attempted after a profile that already exists.
 		expect(calls(PutCommand)).toHaveLength(4);
 	});
@@ -135,21 +139,169 @@ describe("applyPlan", () => {
 			if (cmd instanceof PutCommand && cmd.input.TableName === "accounts") throw condFail();
 			return {};
 		});
-		const counts = await applyPlan(planMigration([demo], new Set(["t1"])));
-		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 1 });
+		const counts = await applyPlan(planMigration([demo], new Set(["t1"])), { rows: [demo], profiles: new Map() });
+		expect(counts).toEqual({ profiles: 0, members: 0, keys: 0, index: 1, stale: 0 });
 	});
 
 	it("does not swallow real errors", async () => {
 		ddb.send.mockReset().mockRejectedValue(new Error("throttled"));
-		await expect(applyPlan(plan())).rejects.toThrow("throttled");
+		await expect(applyPlan(plan(), scan)).rejects.toThrow("throttled");
 		ddb.send.mockReset().mockRejectedValue(cancelled("ThrottlingError"));
-		await expect(applyPlan(plan())).rejects.toThrow();
+		await expect(applyPlan(plan(), scan)).rejects.toThrow();
 	});
 
 	it("writes nothing for an empty plan", async () => {
 		ddb.send.mockReset().mockResolvedValue({});
-		expect(await applyPlan(planMigration([], new Set()))).toEqual({ profiles: 0, members: 0, keys: 0, index: 0 });
+		expect(await applyPlan(planMigration([], new Set()), { rows: [], profiles: new Map() })).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 0 });
 		expect(ddb.send).not.toHaveBeenCalled();
+	});
+});
+
+const owner = { sub: "u1", email: "z@x.io" };
+const info = (status: ExistingProfile["status"], owner_count: number): ExistingProfile => ({ name: "Acme Support", status, owner_count });
+
+describe("planMigration with scanned profiles", () => {
+	it("attaches the owner to an active profile that has none, and to nothing else", () => {
+		const profiles = new Map([["t1", info("active", 0)], ["t2", info("active", 1)], ["t3", info("suspended", 0)], ["t4", info("deleted", 0)]]);
+		const p = planMigration([], profiles, owner, now);
+		expect(p.profiles).toEqual([]);
+		expect(p.members).toEqual([{ org_id: "t1", sub: "u1", email: "z@x.io", role: "owner", joined_at: now }]);
+	});
+
+	it("plans nothing for a bare Set, and nothing without an owner", () => {
+		expect(planMigration([], new Set(["t1"]), owner).members).toEqual([]);
+		expect(planMigration([], new Map([["t1", info("active", 0)]])).members).toEqual([]);
+	});
+
+	it("skips rows of orgs that are not active: no KEY item, no index rewrite", () => {
+		const rows = [demo, { ...demo, key_hash: "f".repeat(64), tenant_id: "t9" }];
+		const profiles = new Map([["t1", info("deleted", 0)], ["t9", info("active", 1)]]);
+		const p = planMigration(rows, profiles, owner);
+		expect(p.keys.map((x) => x.org_id)).toEqual(["t9"]);
+		expect(p.index.map((x) => x.org_id)).toEqual(["t9"]);
+		for (const status of ["deleting", "deleted", "suspended"] as const) {
+			const q = planMigration([demo], new Map([["t1", info(status, 0)]]));
+			expect(q).toEqual({ profiles: [], members: [], keys: [], index: [] });
+		}
+	});
+});
+
+describe("applyPlan, owner attach and stale rows", () => {
+	it("attaches an owner to an existing profile in one transaction guarded on owner_count 0 and active", async () => {
+		ddb.send.mockReset().mockResolvedValue({});
+		const profiles = new Map([["t1", info("active", 0)]]);
+		const counts = await applyPlan(planMigration([], profiles, owner, now), { rows: [], profiles });
+		expect(counts.members).toBe(1);
+		const items = calls(TransactWriteCommand)[0]!.input.TransactItems!;
+		expect(items).toHaveLength(3);
+		expect(items[0]!.Put).toMatchObject({ ConditionExpression: "attribute_not_exists(pk)", Item: { pk: "ORG#t1", sk: "MEMBER#u1", role: "owner" } });
+		expect(items[1]!.Put!.Item).toEqual({ pk: "USER#u1", sk: "ORG#t1", role: "owner", org_name: "Acme Support" });
+		expect(items[2]!.Update).toMatchObject({
+			Key: { pk: "ORG#t1", sk: "PROFILE" },
+			UpdateExpression: "SET owner_count = owner_count + :one",
+			ConditionExpression: "owner_count = :zero AND #s = :active",
+			ExpressionAttributeValues: { ":one": 1, ":zero": 0, ":active": "active" },
+		});
+	});
+
+	it("treats a failed owner-attach condition as already done", async () => {
+		ddb.send.mockReset().mockRejectedValue(cancelled("None", "None", "ConditionalCheckFailed"));
+		const profiles = new Map([["t1", info("active", 0)]]);
+		expect((await applyPlan(planMigration([], profiles, owner, now), { rows: [], profiles })).members).toBe(0);
+	});
+
+	it("skips, without throwing, an index row whose status changed since the scan", async () => {
+		ddb.send.mockReset().mockImplementation(async (cmd: object) => {
+			if (cmd instanceof PutCommand && cmd.input.TableName === "tenants") throw condFail();
+			return {};
+		});
+		const counts = await applyPlan(planMigration([demo], new Set(["t1"])), { rows: [demo], profiles: new Map() });
+		expect(counts).toEqual({ profiles: 0, members: 0, keys: 1, index: 0, stale: 1 });
+	});
+
+	it("guards the rewrite with the raw scanned status, not the mapped one", async () => {
+		ddb.send.mockReset().mockResolvedValue({});
+		const paused = { ...demo, status: "paused" };
+		await applyPlan(planMigration([paused], new Set(["t1"])), { rows: [paused], profiles: new Map() });
+		const index = calls(PutCommand).map((c) => c.input).find((i) => i.TableName === "tenants")!;
+		expect(index.ExpressionAttributeValues).toEqual({ ":scanned": "paused" });
+		expect(index.Item).toMatchObject({ status: "revoked" });
+	});
+});
+
+// A small in-memory table pair that honours exactly the conditions the migration writes,
+// to show the whole thing converges: run, run with an owner, run again.
+function fakeAws() {
+	const db = new Map<string, Record<string, any>>();
+	const id = (t: string, i: Record<string, any>) => `${t}|${i.pk ?? i.key_hash}|${i.sk ?? ""}`;
+	for (const row of [demo, write]) db.set(id("tenants", row), { ...row });
+	const fail = () => cancelled("ConditionalCheckFailed");
+	const put = (input: any) => {
+		const old = db.get(id(input.TableName, input.Item));
+		const cond = input.ConditionExpression;
+		if (cond === "attribute_not_exists(pk)" && old) throw fail();
+		if (cond?.startsWith("attribute_not_exists(org_id)") && old && (old.org_id || old.status !== input.ExpressionAttributeValues[":scanned"])) throw fail();
+		db.set(id(input.TableName, input.Item), { ...input.Item });
+	};
+	ddb.send.mockReset().mockImplementation(async (cmd: any) => {
+		if (cmd instanceof PutCommand) return put(cmd.input);
+		if (cmd instanceof TransactWriteCommand) {
+			const staged = new Map(db);
+			try {
+				for (const t of cmd.input.TransactItems!) {
+					if (t.Put) put(t.Put);
+					if (t.Update) {
+						const p = db.get(id("accounts", t.Update.Key!));
+						if (!p || p.owner_count !== 0 || p.status !== "active") throw fail();
+						p.owner_count += 1;
+					}
+				}
+			} catch (e) {
+				db.clear();
+				for (const [key, v] of staged) db.set(key, v);
+				throw e;
+			}
+			return {};
+		}
+		if (cmd instanceof ScanCommand) {
+			const table = cmd.input.TableName!;
+			return { Items: [...db].filter(([key]) => key.startsWith(`${table}|`)).map(([, v]) => v).filter((v) => table === "tenants" || v.sk === "PROFILE") };
+		}
+		throw new Error("unexpected command");
+	});
+	return db;
+}
+
+describe("a full migration, run three times", () => {
+	const run = async (who?: { sub: string; email: string }) => {
+		const rows = await scanKeyIndex();
+		const profiles = await scanProfiles();
+		return applyPlan(planMigration(rows, profiles, who, now), { rows, profiles });
+	};
+
+	it("migrates without an owner, attaches one on the second run, and the third changes nothing", async () => {
+		const db = fakeAws();
+		expect(await run()).toEqual({ profiles: 1, members: 0, keys: 2, index: 2, stale: 0 });
+		expect(db.get("accounts|ORG#t1|PROFILE")!.owner_count).toBe(0);
+		expect([...db.keys()].filter((key) => key.startsWith("accounts|ORG#t1|KEY#"))).toHaveLength(2);
+		for (const row of [demo, write]) expect(db.get(`tenants|${row.key_hash}|`)).toMatchObject({ org_id: "t1" });
+
+		expect(await run(owner)).toEqual({ profiles: 0, members: 1, keys: 0, index: 0, stale: 0 });
+		expect(db.get("accounts|ORG#t1|PROFILE")!.owner_count).toBe(1);
+		expect(db.get("accounts|ORG#t1|MEMBER#u1")).toMatchObject({ role: "owner" });
+		expect(db.get("accounts|USER#u1|ORG#t1")).toMatchObject({ role: "owner", org_name: "Acme Support" });
+
+		const before = structuredClone([...db]);
+		expect(await run(owner)).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 0 });
+		expect([...db]).toEqual(before);
+	});
+
+	it("does not touch the keys of an org that is deleting", async () => {
+		const db = fakeAws();
+		db.set("accounts|ORG#t1|PROFILE", { pk: "ORG#t1", sk: "PROFILE", org_id: "t1", name: "Acme Support", status: "deleting", owner_count: 0 });
+		expect(await run(owner)).toEqual({ profiles: 0, members: 0, keys: 0, index: 0, stale: 0 });
+		expect(db.get(`tenants|${demo.key_hash}|`)).not.toHaveProperty("org_id");
+		expect([...db.keys()].some((key) => key.includes("KEY#"))).toBe(false);
 	});
 });
 
@@ -164,11 +316,14 @@ describe("scans", () => {
 		expect(scans[1]!.input.ExclusiveStartKey).toEqual({ key_hash: "x" });
 	});
 
-	it("scanProfileIds collects org ids of every PROFILE, whatever its status", async () => {
+	it("scanProfiles reads status, name and owner count of every PROFILE, whatever its status", async () => {
 		ddb.send.mockReset()
-			.mockResolvedValueOnce({ Items: [{ org_id: "t1" }], LastEvaluatedKey: { pk: "p" } })
-			.mockResolvedValueOnce({ Items: [{ org_id: "t2" }] });
-		expect(await scanProfileIds()).toEqual(new Set(["t1", "t2"]));
+			.mockResolvedValueOnce({ Items: [{ org_id: "t1", name: "A", status: "active", owner_count: 2 }], LastEvaluatedKey: { pk: "p" } })
+			.mockResolvedValueOnce({ Items: [{ org_id: "t2", name: "B", status: "deleted" }] });
+		expect(await scanProfiles()).toEqual(new Map([
+			["t1", { name: "A", status: "active", owner_count: 2 }],
+			["t2", { name: "B", status: "deleted", owner_count: 0 }],
+		]));
 		expect(calls(ScanCommand)[0]!.input).toMatchObject({ TableName: "accounts", FilterExpression: "sk = :p", ExpressionAttributeValues: { ":p": "PROFILE" } });
 	});
 });

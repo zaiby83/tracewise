@@ -1,10 +1,11 @@
 // Moves the pre-self-serve key index into orgs: a PROFILE per tenant, a KEY item per key, and
 // each index row rewritten to the lean shape. With --owner, the Cognito user with that email
-// becomes the owner of the orgs this run creates. Safe to run again: it changes nothing that
-// is already migrated.
+// becomes the owner of the orgs this run creates and of active orgs that have no owner yet,
+// so it can be given on a later run. Safe to run again: it changes nothing that is already
+// migrated.
 // Usage: pnpm exec tsx scripts/migrate-accounts.ts [--owner you@example.com]
 import { CognitoIdentityProviderClient, ListUsersCommand } from "@aws-sdk/client-cognito-identity-provider";
-import { applyPlan, planMigration, scanKeyIndex, scanProfileIds } from "./lib/migrate";
+import { applyPlan, planMigration, scanKeyIndex, scanProfiles } from "./lib/migrate";
 import { stackOutputs } from "./lib/stack";
 
 const usage = () => {
@@ -35,10 +36,15 @@ if (ownerEmail) {
 }
 
 const rows = await scanKeyIndex();
-const plan = planMigration(rows, await scanProfileIds(), owner);
-const counts = await applyPlan(plan);
+const profiles = await scanProfiles();
+const plan = planMigration(rows, profiles, owner);
+const counts = await applyPlan(plan, { rows, profiles });
 
 const pending = rows.filter((r) => !r.org_id).length;
+// Old-shape rows that planned nothing belong to orgs that are not active; they stay as they are.
+const inactive = pending - plan.index.length;
 console.error(`Key index: ${rows.length} rows, ${pending} in the old shape.`);
-console.error(`Wrote ${counts.profiles} profiles (${counts.members} owner memberships), ${counts.keys} key records, ${counts.index} index rows.`);
-if (pending === 0) console.error("Nothing to migrate.");
+console.error(`Wrote ${counts.profiles} profiles, ${counts.members} owner memberships, ${counts.keys} key records, ${counts.index} index rows.`);
+if (inactive > 0) console.error(`Skipped ${inactive} rows of orgs that are deleting, deleted or suspended.`);
+if (counts.stale > 0) console.error(`Skipped ${counts.stale} rows that changed during the run: run it again to pick them up.`);
+if (pending === 0 && counts.members === 0) console.error("Nothing to migrate.");
