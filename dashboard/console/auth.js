@@ -140,7 +140,22 @@ export async function idToken({ force = false } = {}) {
 	return refreshing;
 }
 
-export function signOut(cfg) {
+// Revokes the refresh token first (best effort, a few seconds at most), so a copy of it
+// can't mint new tokens after sign-out. The local sign-out happens whatever the outcome.
+export async function signOut(cfg) {
+	const refreshToken = storage.get(sessionStorage, REFRESH);
+	if (refreshToken) {
+		try {
+			await fetch(`${cfg.domain}/oauth2/revoke`, {
+				method: "POST",
+				headers: { "content-type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({ token: refreshToken, client_id: cfg.clientId }).toString(),
+				signal: AbortSignal.timeout(3000),
+			});
+		} catch {
+			// Offline or Cognito unreachable: sign out locally anyway; the token still expires.
+		}
+	}
 	clear();
 	for (const k of SHELL_KEYS) storage.set(sessionStorage, k, null);
 	const params = new URLSearchParams({ client_id: cfg.clientId, logout_uri: redirectUri() });

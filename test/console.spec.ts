@@ -194,6 +194,16 @@ describe("orgs", () => {
 		expect((await patch({ rubric: "x".repeat(4000) })).statusCode).toBe(200);
 		expect((await patch({ rubric: null })).statusCode).toBe(200);
 	});
+	it("stores an empty or whitespace-only rubric as null (the default), and trims the rest", async () => {
+		store.updateProfile.mockResolvedValue({ ...profile });
+		const patch = (body: unknown) => call("PATCH /v1/orgs/{orgId}", { params: { orgId: "o1" }, body });
+		expect((await patch({ rubric: "   " })).statusCode).toBe(200);
+		expect(store.updateProfile).toHaveBeenLastCalledWith("o1", { rubric: null });
+		expect((await patch({ rubric: "" })).statusCode).toBe(200);
+		expect(store.updateProfile).toHaveBeenLastCalledWith("o1", { rubric: null });
+		expect((await patch({ rubric: "  be kind \n" })).statusCode).toBe(200);
+		expect(store.updateProfile).toHaveBeenLastCalledWith("o1", { rubric: "be kind" });
+	});
 	it("passes only the whitelisted fields to the store", async () => {
 		store.updateProfile.mockResolvedValue({ ...profile, name: "New" });
 		const res = await call("PATCH /v1/orgs/{orgId}", {

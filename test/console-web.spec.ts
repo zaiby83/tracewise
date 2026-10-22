@@ -248,15 +248,37 @@ describe("console auth", () => {
 			expect(await idToken()).toBeNull();
 		});
 
-		it("signs out by clearing storage and redirecting to the Cognito logout", () => {
+		it("signs out by revoking the refresh token, clearing storage and redirecting to the Cognito logout", async () => {
+			const fetch = vi.fn().mockResolvedValue(res(200, {}));
+			vi.stubGlobal("fetch", fetch);
 			session.setItem("tw_refresh", "r");
 			session.setItem("tw_org", "o1");
 			session.setItem("tw_pending_invite", "t");
-			signOut(cfg);
+			await signOut(cfg);
+			expect(fetch).toHaveBeenCalledTimes(1);
+			const [revokeUrl, init] = fetch.mock.calls[0]!;
+			expect(revokeUrl).toBe("https://auth.example.invalid/oauth2/revoke");
+			expect(init).toMatchObject({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" } });
+			expect(Object.fromEntries(new URLSearchParams(init.body))).toEqual({ token: "r", client_id: "client123" });
 			expect(session.dump()).toEqual({});
 			const u = new URL(location.assign.mock.calls[0]![0]);
 			expect(u.origin + u.pathname).toBe("https://auth.example.invalid/logout");
 			expect(Object.fromEntries(u.searchParams)).toEqual({ client_id: "client123", logout_uri: "https://app.example.invalid/console/index.html" });
+		});
+
+		it("still signs out when revoking fails, and skips the call with no refresh token", async () => {
+			vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("network down")));
+			session.setItem("tw_refresh", "r");
+			session.setItem("tw_org", "o1");
+			await signOut(cfg);
+			expect(session.dump()).toEqual({});
+			expect(location.assign).toHaveBeenCalledTimes(1);
+
+			const fetch = vi.fn();
+			vi.stubGlobal("fetch", fetch);
+			await signOut(cfg);
+			expect(fetch).not.toHaveBeenCalled();
+			expect(location.assign).toHaveBeenCalledTimes(2);
 		});
 	});
 });

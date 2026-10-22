@@ -13,8 +13,15 @@ const cloudwatch = new CloudWatchClient({});
 
 const orgName = z.string().trim().min(1).max(100);
 const Create = z.object({ name: orgName });
+// A blank rubric means the default: stored as null, so the judge never gets an empty one.
+const rubric = z
+	.string()
+	.trim()
+	.max(4000)
+	.transform((s) => s || null)
+	.nullable();
 const Patch = z
-	.object({ name: orgName.optional(), rubric: z.string().max(4000).nullable().optional(), evals_enabled: z.boolean().optional() })
+	.object({ name: orgName.optional(), rubric: rubric.optional(), evals_enabled: z.boolean().optional() })
 	.refine((p) => Object.values(p).some((v) => v !== undefined), { message: "at least one field is required" });
 const Delete = z.object({ confirm_name: z.string() });
 
