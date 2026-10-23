@@ -1,4 +1,4 @@
-import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import type Stripe from "stripe";
 import { k, getProfile } from "../shared/accounts";
 import { ddb } from "../shared/ddb";
@@ -23,6 +23,17 @@ export interface BillingRecord {
 	// A meter event claimed (counters already advanced) but not yet confirmed sent. Written and
 	// cleared only by the meter; the next run re-sends exactly this before anything new.
 	pending?: PendingMeterEvent;
+	// Set by applySubscription in the same write that moves BILLING off a period, cleared (conditionally on
+	// `period`) by whoever has reported that period. It outlives a failed flush, so the final usage of a
+	// period can't be forgotten once BILLING no longer shows it.
+	flush_due?: FlushDue;
+}
+
+export interface FlushDue {
+	// YYYY-MM-DD, the counter key of the period still owed a report.
+	period: string;
+	// ISO instant; late events are stamped no later than just before it.
+	period_end: string;
 }
 
 export interface PendingMeterEvent {
@@ -155,6 +166,15 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 	const withPeriod = plan !== "free" && !!periodStart && !!periodEnd;
 	const customerId = sub ? customerIdOf(sub) : (previous?.customer_id ?? null);
 
+	// The period BILLING is leaving, owed a final report: on a rollover, or when a paid plan ends (the
+	// hourly meter no longer scans a canceled org's usage). Written with the move so neither can happen alone.
+	const periodChanged = !!previous?.current_period_start && previous.current_period_start !== periodStart;
+	const paidToFree = !!previous && previous.plan !== "free" && plan === "free";
+	const flushDue: FlushDue | null =
+		(periodChanged || paidToFree) && previous?.current_period_start && previous.current_period_end
+			? { period: previous.current_period_start.slice(0, 10), period_end: previous.current_period_end }
+			: null;
+
 	const items: NonNullable<ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"]> = [
 		{
 			Update: {
@@ -189,7 +209,9 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 				UpdateExpression:
 					"SET customer_id = :cus, subscription_id = :sub, #s = :status, #p = :plan, current_period_start = :cps, current_period_end = :cpe, " +
 					"cancel_at_period_end = :cancel, past_due_since = :pd, org_id = :org, " +
-					"spend_cap_usd = if_not_exists(spend_cap_usd, :cap), reported_events = if_not_exists(reported_events, :zero), reported_period = if_not_exists(reported_period, :none)",
+					"spend_cap_usd = if_not_exists(spend_cap_usd, :cap), reported_events = if_not_exists(reported_events, :zero), reported_period = if_not_exists(reported_period, :none)" +
+					// An older period still owed keeps its place: the meter settles it first.
+					(flushDue ? ", flush_due = if_not_exists(flush_due, :fd)" : ""),
 				ExpressionAttributeNames: { "#s": "status", "#p": "plan" },
 				ExpressionAttributeValues: {
 					":org": orgId,
@@ -205,6 +227,7 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 					":readCap": readCap,
 					":zero": 0,
 					":none": null,
+					...(flushDue ? { ":fd": flushDue } : {}),
 				},
 			},
 		});
@@ -218,8 +241,26 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 		if (customerId && conditionFailedAt(e, 1) && mayRetry) return null;
 		throw e;
 	}
-	const periodChanged = !!previous?.current_period_start && previous.current_period_start !== periodStart;
 	return { plan, periodChanged, previous, applied: true };
+}
+
+// Only the period that was reported is cleared: a newer flush_due written since must stay.
+export async function clearFlushDue(orgId: string, period: string): Promise<void> {
+	try {
+		await ddb.send(
+			new UpdateCommand({
+				TableName: table(),
+				Key: billingKey(orgId),
+				UpdateExpression: "REMOVE flush_due",
+				ConditionExpression: "flush_due.#p = :p",
+				ExpressionAttributeNames: { "#p": "period" },
+				ExpressionAttributeValues: { ":p": period },
+			}),
+		);
+	} catch (e) {
+		// Already cleared by the other of webhook and meter.
+		if ((e as { name?: string }).name !== "ConditionalCheckFailedException") throw e;
+	}
 }
 
 // First delivery wins: false means Stripe already sent this event and it was recorded.

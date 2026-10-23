@@ -6,7 +6,7 @@ import { log } from "../shared/http";
 import { periodBounds } from "./plans";
 import { periodKey, reportOrgUsage } from "./meter";
 import { getStripe } from "./stripe";
-import { applySubscription, getBilling, type BillingRecord } from "./subscriptions";
+import { applySubscription, clearFlushDue, getBilling, type BillingRecord } from "./subscriptions";
 
 const cloudwatch = new CloudWatchClient({});
 const CONCURRENCY = 5;
@@ -21,8 +21,9 @@ async function liveBilling(): Promise<BillingRecord[]> {
 		const page = await ddb.send(
 			new ScanCommand({
 				TableName: process.env.ACCOUNTS_TABLE,
-				// A cancelled org is not live, but an event it claimed and never sent still has to go out.
-				FilterExpression: "sk = :b AND (#s IN (:active, :trialing, :pastDue) OR attribute_exists(#pend))",
+				// A cancelled org is not live, but an event it claimed and never sent, or a period it still owes a
+				// final report for, has to be settled all the same.
+				FilterExpression: "sk = :b AND (#s IN (:active, :trialing, :pastDue) OR attribute_exists(#pend) OR attribute_exists(flush_due))",
 				ExpressionAttributeNames: { "#s": "status", "#pend": "pending" },
 				ExpressionAttributeValues: { ":b": "BILLING", ":active": "active", ":trialing": "trialing", ":pastDue": "past_due" },
 				ExclusiveStartKey: startKey,
@@ -91,20 +92,37 @@ const startSeconds = (b: BillingRecord, period: string) =>
 	// Stripe's real instant when BILLING has one for this period; midnight UTC of the date otherwise.
 	Math.floor(Date.parse(b.current_period_start && periodKey(b.current_period_start) === period ? b.current_period_start : `${period}T00:00:00Z`) / 1000);
 
+const LIVE = new Set(["active", "trialing", "past_due"]);
+
 // Moving to a new period first flushes what is left of the old one, because the counters
 // (reported_events, reported_period) only describe one period and would otherwise forget it.
 async function meterOrg(b: BillingRecord, periodStart: string, now: number): Promise<number> {
 	let view = b;
-	const reportedPeriod = b.reported_period ? periodKey(b.reported_period) : null;
-	if (reportedPeriod && reportedPeriod < periodStart) {
-		await reportOrgUsage(b, { periodStart: reportedPeriod, timestamp: startSeconds(b, periodStart) - 1 });
-		// Pick up whatever the flush (or a concurrent run) recorded rather than trusting the scan's copy.
+	let sentTotal = 0;
+	// A period the webhook left owing (rollover, or a paid plan that ended) goes before anything else.
+	if (b.flush_due) {
+		const end = Date.parse(b.flush_due.period_end) / 1000;
+		const timestamp = Math.floor(Number.isFinite(end) ? Math.min(now / 1000, end - 1) : now / 1000);
+		sentTotal += (await reportOrgUsage(b, { periodStart: b.flush_due.period, timestamp })).sent;
+		await clearFlushDue(b.org_id, b.flush_due.period);
 		view = (await getBilling(b.org_id)) ?? b;
+	}
+	// A canceled org has no current period to meter (its dates may be gone, which would fall back to the
+	// calendar month Free ingest counts into); all that can be owed is a claim it left pending.
+	if (!LIVE.has(view.status)) {
+		if (!view.pending) return sentTotal;
+		return sentTotal + (await reportOrgUsage(view, { periodStart: view.pending.period, timestamp: view.pending.timestamp })).sent;
+	}
+	const reportedPeriod = view.reported_period ? periodKey(view.reported_period) : null;
+	if (reportedPeriod && reportedPeriod < periodStart) {
+		await reportOrgUsage(view, { periodStart: reportedPeriod, timestamp: startSeconds(view, periodStart) - 1 });
+		// Pick up whatever the flush (or a concurrent run) recorded rather than trusting the scan's copy.
+		view = (await getBilling(b.org_id)) ?? view;
 	}
 	// Late events still belong to the Stripe period their counter is for, so never stamp them after its end.
 	const end = view.current_period_end ? Date.parse(view.current_period_end) / 1000 : NaN;
 	const timestamp = Math.floor(Number.isFinite(end) ? Math.min(now / 1000, end - 1) : now / 1000);
-	return (await reportOrgUsage(view, { periodStart, timestamp })).sent;
+	return sentTotal + (await reportOrgUsage(view, { periodStart, timestamp })).sent;
 }
 
 export async function handler(): Promise<void> {

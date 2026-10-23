@@ -3,7 +3,7 @@ import type Stripe from "stripe";
 import { json, log } from "../shared/http";
 import { periodKey, reportOrgUsage } from "./meter";
 import { getStripe, getWebhookSecret } from "./stripe";
-import { applySubscription, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce, type ApplyResult } from "./subscriptions";
+import { applySubscription, clearFlushDue, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } from "./subscriptions";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const idOf = (x: string | { id: string } | null | undefined) => (typeof x === "string" ? x : (x?.id ?? null));
@@ -25,28 +25,27 @@ function invoiceSubscription(invoice: Stripe.Invoice): { id: string | null; orgI
 	return { id: idOf(details?.subscription) ?? idOf(legacy.subscription), orgId: details?.metadata?.org_id ?? null };
 }
 
-// The old period's counter no longer changes once BILLING has moved on, so it is safe to flush after the write.
-// Moving to Free (cancel, unpaid, grace expiry) leaves no live BILLING for the hourly meter to scan, so the
-// last hours of the paid period are flushed here too.
-async function flushPreviousPeriod(orgId: string, result: ApplyResult, now: number): Promise<void> {
-	const { previous } = result;
-	if (!result.applied || !previous?.current_period_start || !previous.current_period_end) return;
-	const paidToFree = previous.plan !== "free" && result.plan === "free";
-	if (!result.periodChanged && !paidToFree) return;
+// applySubscription records the period it just left as `flush_due` in the same write as the move, so
+// this does not depend on this delivery's result: a retry after a failed flush finds it still there.
+// The old period's counter no longer changes once BILLING has moved on, so reporting it now is safe.
+async function settleFlushDue(orgId: string, now: number): Promise<void> {
 	// The current record, not the pre-apply one, so the meter's finalised-period guard and claim condition see today's state.
 	const current = await getBilling(orgId);
-	if (!current) return;
+	const due = current?.flush_due;
+	if (!current || !due) return;
 	// Inside the old period (end - 1 s), but never in the future: Stripe rejects meter events dated ahead,
 	// and a cancellation mid-period leaves the period end ahead of us.
-	const timestamp = Math.floor(Math.min(now, Date.parse(previous.current_period_end) - 1000) / 1000);
-	const { sent } = await reportOrgUsage(current, { periodStart: periodKey(previous.current_period_start), timestamp });
-	// sent: 0 also covers a refused claim or a pending left to the hourly meter, so it is not an error.
-	log("info", "flushed previous period", { org_id: orgId, period: periodKey(previous.current_period_start), sent });
+	const timestamp = Math.floor(Math.min(now, Date.parse(due.period_end) - 1000) / 1000);
+	const { sent } = await reportOrgUsage(current, { periodStart: due.period, timestamp });
+	// sent: 0 also covers a refused claim or a pending left to the hourly meter; either way this period is
+	// no longer ours to report, so it is not an error and the marker can go.
+	await clearFlushDue(orgId, due.period);
+	log("info", "flushed previous period", { org_id: orgId, period: due.period, sent });
 }
 
 async function applyAndFlush(orgId: string, sub: Stripe.Subscription | null, now: number): Promise<void> {
 	const result = await applySubscription(orgId, sub, now);
-	await flushPreviousPeriod(orgId, result, now);
+	if (result.applied) await settleFlushDue(orgId, now);
 }
 
 async function resolveOrg(metadataOrg: string | null | undefined, customerId: string | null): Promise<string | null> {
@@ -74,7 +73,16 @@ async function dispatch(stripe: Stripe, event: Stripe.Event, now: number): Promi
 			const orgId = await resolveOrg(evSub.metadata?.org_id, idOf(evSub.customer));
 			if (!orgId) return null;
 			// The event body may be stale or out of order; Stripe's current state is what counts.
-			await applyAndFlush(orgId, await fetchSubscription(stripe, evSub.id, true), now);
+			const fresh = await fetchSubscription(stripe, evSub.id, true);
+			if (!fresh && event.type === "customer.subscription.deleted") {
+				// Applying "no subscription" would drop the plan of a newer subscription this one was replaced by.
+				const known = (await getBilling(orgId))?.subscription_id;
+				if (known && known !== evSub.id) {
+					log("info", "ignoring deletion of a superseded subscription", { event_id: event.id, org_id: orgId });
+					return orgId;
+				}
+			}
+			await applyAndFlush(orgId, fresh, now);
 			return orgId;
 		}
 		case "invoice.paid":
@@ -135,7 +143,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 		recorded = true;
 		if (!HANDLED.has(type)) return json(200, { ok: true });
 		const orgId = await dispatch(stripe, stripeEvent, Date.now());
-		if (orgId) log("info", "stripe event applied", { event_id: id, type, org_id: orgId });
+		if (orgId) log("info", "stripe event handled", { event_id: id, type, org_id: orgId });
 		// Answering 200 stops Stripe retrying an event that can never find its org.
 		else log("warn", "stripe event not applied: no known org or no subscription", { event_id: id, type });
 		return json(200, { ok: true });

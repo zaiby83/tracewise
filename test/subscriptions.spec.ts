@@ -7,7 +7,7 @@ vi.mock("../services/shared/ddb", () => ({ ddb }));
 process.env.ACCOUNTS_TABLE = "accounts";
 
 const { PLANS } = await import("../services/billing/plans");
-const { applySubscription, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } = await import(
+const { applySubscription, clearFlushDue, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } = await import(
 	"../services/billing/subscriptions"
 );
 
@@ -173,6 +173,50 @@ describe("applySubscription", () => {
 		expect(res.periodChanged).toBe(true);
 		expect(res.previous).toMatchObject({ current_period_start: "2026-09-10T00:00:00.000Z", reported_events: 12 });
 	});
+	describe("flush_due", () => {
+		const prevDue = { period: "2026-09-10", period_end: "2026-11-10T00:00:00.000Z" };
+		const dueOf = () => tx().billing!.ExpressionAttributeValues![":fd"];
+
+		it("is written with the move on a rollover, naming the period left and its end", async () => {
+			setup({ profile: profile({ plan: "team" }), billing: billing({ current_period_start: "2026-09-10T00:00:00.000Z" }) });
+			await applySubscription("o1", sub("active", "team_monthly"), NOW);
+			expect(dueOf()).toEqual(prevDue);
+			// An older owed period keeps its place; the meter settles it first.
+			expect(tx().billing!.UpdateExpression).toMatch(/flush_due = if_not_exists\(flush_due, :fd\)/);
+		});
+
+		it("is written when a paid plan ends, in the same transaction", async () => {
+			setup({ profile: profile({ plan: "team" }), billing: billing() });
+			await applySubscription("o1", sub("canceled", "team_monthly"), NOW);
+			expect(dueOf()).toEqual({ period: "2026-10-10", period_end: "2026-11-10T00:00:00.000Z" });
+			expect(tx().call!.input.TransactItems).toHaveLength(2);
+		});
+
+		it("is written when a deleted subscription drops a paid plan", async () => {
+			setup({ profile: profile({ plan: "pro" }), billing: billing({ plan: "pro" }) });
+			await applySubscription("o1", null, NOW);
+			expect(dueOf()).toEqual({ period: "2026-10-10", period_end: "2026-11-10T00:00:00.000Z" });
+		});
+
+		it.each([
+			["a plain update", { plan: "team" }, () => sub("active", "team_monthly")],
+			["free to free", { plan: "free" }, () => sub("canceled", "team_monthly")],
+		])("is not written for %s", async (_n, over, make) => {
+			setup({ profile: profile(), billing: billing(over) });
+			await applySubscription("o1", make(), NOW);
+			expect(tx().billing!.UpdateExpression).not.toContain("flush_due");
+			expect(tx().billing!.ExpressionAttributeValues).not.toHaveProperty(":fd");
+		});
+
+		it("is not written for a first subscription, or when the old period has no dates", async () => {
+			setup({ profile: profile(), billing: null });
+			await applySubscription("o1", sub("active", "team_monthly"), NOW);
+			expect(tx().billing!.UpdateExpression).not.toContain("flush_due");
+			setup({ profile: profile({ plan: "team" }), billing: billing({ current_period_end: null }) });
+			await applySubscription("o1", sub("canceled", "team_monthly"), NOW);
+			expect(tx().billing!.UpdateExpression).not.toContain("flush_due");
+		});
+	});
 	it("does not report a period change for a first subscription", async () => {
 		setup({ profile: profile(), billing: null });
 		expect(await applySubscription("o1", sub("active", "team_monthly"), NOW)).toMatchObject({ periodChanged: false, previous: null });
@@ -255,6 +299,25 @@ describe("billing records", () => {
 		expect(ddb.send.mock.calls[1]![0].input).toMatchObject({ TableName: "accounts", Item: { pk: "STRIPE#cus_1", sk: "CUSTOMER", org_id: "o1" } });
 		ddb.send.mockReset().mockResolvedValueOnce({});
 		expect(await orgForCustomer("cus_unknown")).toBeNull();
+	});
+});
+
+describe("clearFlushDue", () => {
+	it("removes the marker only for the period that was reported", async () => {
+		setup({ profile: null, billing: null });
+		await clearFlushDue("o1", "2026-09-10");
+		const cmd = ddb.send.mock.calls[0]![0] as { input: Record<string, any> };
+		expect(cmd.input.Key).toEqual({ pk: "ORG#o1", sk: "BILLING" });
+		expect(cmd.input.UpdateExpression).toBe("REMOVE flush_due");
+		expect(cmd.input.ConditionExpression).toBe("flush_due.#p = :p");
+		expect(cmd.input.ExpressionAttributeValues).toEqual({ ":p": "2026-09-10" });
+	});
+	it("treats a marker already cleared or replaced as done, but not other errors", async () => {
+		setup({ profile: null, billing: null, txError: undefined });
+		ddb.send.mockRejectedValueOnce(Object.assign(new Error("x"), { name: "ConditionalCheckFailedException" }));
+		await expect(clearFlushDue("o1", "2026-09-10")).resolves.toBeUndefined();
+		ddb.send.mockRejectedValueOnce(new Error("down"));
+		await expect(clearFlushDue("o1", "2026-09-10")).rejects.toThrow("down");
 	});
 });
 

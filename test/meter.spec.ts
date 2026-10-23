@@ -17,7 +17,7 @@ vi.mock("@aws-sdk/client-cloudwatch", () => ({
 		constructor(public input: unknown) {}
 	},
 }));
-const subs = vi.hoisted(() => ({ applySubscription: vi.fn(), getBilling: vi.fn() }));
+const subs = vi.hoisted(() => ({ applySubscription: vi.fn(), getBilling: vi.fn(), clearFlushDue: vi.fn() }));
 vi.mock("../services/billing/subscriptions", () => subs);
 process.env.ACCOUNTS_TABLE = "accounts";
 process.env.QUOTAS_TABLE = "quotas";
@@ -68,6 +68,13 @@ function world(counters: Record<string, number>, initial: Billing[] = [], opts: 
 			return {};
 		}
 		return { Item: { used: counters[cmd.input.Key!.window] ?? 0 } };
+	});
+	subs.clearFlushDue.mockReset();
+	subs.clearFlushDue.mockImplementation(async (id: string, period: string) => {
+		const s = state.get(id)!;
+		if (s.flush_due?.period !== period) return;
+		delete s.flush_due;
+		events.push("clearDue");
 	});
 	subs.getBilling.mockReset();
 	subs.getBilling.mockImplementation(async (id: string) => (state.has(id) ? { ...state.get(id)! } : null));
@@ -271,13 +278,70 @@ describe("meter handler", () => {
 		expect(cw.send.mock.calls[0]![0].input.Namespace).toBe("Tracewise/Billing");
 	});
 
-	it("also scans BILLING items that still hold a pending event, whatever their status", async () => {
+	it("also scans BILLING items that still hold a pending event, or a flush_due, whatever their status", async () => {
 		world(counters, [org("a")]);
 		await handler();
 		const scan = ddb.send.mock.calls.map(([c]) => c).find((c) => c instanceof ScanCommand) as ScanCommand;
 		// A cancelled org is no longer live, but a claimed-and-unsent event of its last period must still go out.
-		expect(scan.input.FilterExpression).toMatch(/sk = :b AND \(#s IN \(:active, :trialing, :pastDue\) OR attribute_exists\(#pend\)\)/);
+		expect(scan.input.FilterExpression).toBe(
+			"sk = :b AND (#s IN (:active, :trialing, :pastDue) OR attribute_exists(#pend) OR attribute_exists(flush_due))",
+		);
 		expect(scan.input.ExpressionAttributeNames).toEqual({ "#s": "status", "#pend": "pending" });
+	});
+
+	describe("flush_due", () => {
+		const month = new Date().toISOString().slice(0, 8) + "01";
+		const flushDue = { period: "2026-09-15", period_end: "2026-10-15T00:00:00Z" };
+		const canceled = (over: object = {}) =>
+			org("a", { status: "canceled", plan: "free", reported_period: "2026-09-15", reported_events: 100, flush_due: flushDue, ...over });
+
+		it("reports a canceled org's final period, clears the marker, and never reads the calendar month", async () => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.setSystemTime(new Date("2026-10-23T10:00:00Z"));
+			const { state, events } = world({ "a#month#2026-09-15": 250, [`a#month#${month}`]: 30_000 }, [canceled({ current_period_start: null, current_period_end: null })]);
+			await handler();
+			expect(sent().map((p) => [p.identifier, p.payload.value, p.timestamp])).toEqual([["a:2026-09-15:250", "150", Date.parse("2026-10-15T00:00:00Z") / 1000 - 1]]);
+			expect(events).toEqual(["claim", "send", "clear", "clearDue"]);
+			expect(state.get("a")!.flush_due).toBeUndefined();
+			const windows = ddb.send.mock.calls.map(([c]) => c.input?.Key?.window).filter(Boolean);
+			expect(windows).toEqual(["a#month#2026-09-15"]);
+		});
+
+		it("settles it before the live period, for an org that rolled over", async () => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.setSystemTime(new Date("2026-10-23T10:00:00Z"));
+			const b = org("a", {
+				reported_period: "2026-09-15", reported_events: 100, flush_due: flushDue,
+				current_period_start: "2026-10-15T00:00:00.000Z", current_period_end: "2026-11-15T00:00:00.000Z",
+			});
+			const { state, events } = world({ "a#month#2026-09-15": 250, "a#month#2026-10-15": 40 }, [b]);
+			await handler();
+			expect(sent().map((p) => p.identifier)).toEqual(["a:2026-09-15:250", "a:2026-10-15:40"]);
+			expect(events.indexOf("clearDue")).toBeLessThan(events.lastIndexOf("claim"));
+			expect(state.get("a")!.flush_due).toBeUndefined();
+		});
+
+		it("keeps the marker when the report fails, so the next run tries again", async () => {
+			const { state } = world({ "a#month#2026-09-15": 250 }, [canceled()]);
+			stripe.billing.meterEvents.create.mockRejectedValue(new Error("boom"));
+			await expect(handler()).rejects.toThrow("all 1 orgs");
+			expect(state.get("a")!.flush_due).toEqual(flushDue);
+			expect(metrics()).toEqual({ MeterOrgsReported: 0, MeterFailures: 1 });
+		});
+
+		it("sends only a pending claim for a canceled org, never a new period", async () => {
+			const pending = { identifier: "a:2026-09-15:9", value: "9", timestamp: 77, period: "2026-09-15" };
+			const { state } = world({ "a#month#2026-09-15": 9, [`a#month#${month}`]: 500 }, [canceled({ flush_due: undefined, reported_events: 9, pending })]);
+			await handler();
+			expect(sent().map((p) => [p.identifier, p.timestamp])).toEqual([["a:2026-09-15:9", 77]]);
+			expect(state.get("a")!.pending).toBeUndefined();
+		});
+
+		it("leaves a canceled org with nothing owed alone", async () => {
+			world({ [`a#month#${month}`]: 500 }, [canceled({ flush_due: undefined })]);
+			await handler();
+			expect(stripe.billing.meterEvents.create).not.toHaveBeenCalled();
+		});
 	});
 
 	it("follows scan pagination", async () => {

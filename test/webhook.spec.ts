@@ -15,6 +15,7 @@ const subs = vi.hoisted(() => ({
 	recordEventOnce: vi.fn(),
 	forgetEvent: vi.fn(),
 	getBilling: vi.fn(),
+	clearFlushDue: vi.fn(),
 }));
 vi.mock("../services/billing/subscriptions", () => subs);
 const meter = vi.hoisted(() => ({ reportOrgUsage: vi.fn() }));
@@ -39,9 +40,7 @@ function call(payload: string, opts: { header?: string; base64?: boolean; send?:
 
 const sub = (over: object = {}) => ({ id: "sub_1", customer: "cus_1", status: "active", metadata: {}, items: { data: [] }, ...over });
 const apply = (over: object = {}) => ({ plan: "team", applied: true, periodChanged: false, previous: null, ...over });
-const previous = (over: object = {}) => ({
-	org_id: "o1", plan: "team", current_period_start: "2026-09-15T00:00:00.000Z", current_period_end: "2026-10-15T00:00:00Z", ...over,
-});
+const due = (over: object = {}) => ({ period: "2026-09-15", period_end: "2026-10-15T00:00:00Z", ...over });
 
 // Per test: nothing from a previous test may leak through a mock that was configured once.
 beforeEach(() => {
@@ -141,7 +140,7 @@ describe("idempotency and errors", () => {
 		const info = vi.spyOn(console, "info").mockImplementation(() => {});
 		retrieve.mockResolvedValue(sub());
 		await call(evt("customer.subscription.updated", sub({ metadata: { org_id: "o1" } })));
-		const fields = info.mock.calls.map(([l]) => JSON.parse(String(l))).find((l) => l.msg.includes("applied"));
+		const fields = info.mock.calls.map(([l]) => JSON.parse(String(l))).find((l) => l.msg === "stripe event handled");
 		expect(Object.keys(fields).sort()).toEqual(["event_id", "level", "msg", "org_id", "type"]);
 	});
 });
@@ -247,61 +246,96 @@ describe("invoice events", () => {
 });
 
 describe("flushing the previous period", () => {
-	const flush = (res: object) => subs.applySubscription.mockResolvedValue(res);
 	const run = () => {
 		retrieve.mockResolvedValue(sub());
 		return call(evt("customer.subscription.updated", sub({ metadata: { org_id: "o1" } })));
 	};
 
-	it("flushes the old period's usage before switching periods, and before answering", async () => {
+	it("flushes the period applySubscription left due, after applying and before answering, then clears it", async () => {
 		const order: string[] = [];
-		flush(apply({ periodChanged: true, previous: previous() }));
-		const current = { org_id: "o1", plan: "team", reported_period: "2026-09-15" };
+		const current = { org_id: "o1", plan: "team", reported_period: "2026-09-15", flush_due: due() };
+		subs.applySubscription.mockImplementation(async () => (order.push("apply"), apply({ periodChanged: true })));
 		subs.getBilling.mockImplementation(async () => (order.push("getBilling"), current));
 		meter.reportOrgUsage.mockImplementation(async () => (order.push("report"), { sent: 3 }));
-		subs.applySubscription.mockImplementation(async () => (order.push("apply"), apply({ periodChanged: true, previous: previous() })));
+		subs.clearFlushDue.mockImplementation(async () => void order.push("clear"));
 		const res = await run();
 		expect(res.statusCode).toBe(200);
-		expect(order).toEqual(["apply", "getBilling", "report"]);
-		// The freshly read record, not the pre-apply one.
+		expect(order).toEqual(["apply", "getBilling", "report", "clear"]);
+		// The freshly read record, not anything from before the apply.
 		expect(meter.reportOrgUsage).toHaveBeenCalledWith(current, {
 			periodStart: "2026-09-15",
 			timestamp: Date.parse("2026-10-15T00:00:00Z") / 1000 - 1,
 		});
+		expect(subs.clearFlushDue).toHaveBeenCalledWith("o1", "2026-09-15");
 	});
 
-	it("flushes when a paid plan drops to free, stamped now because the period has not ended", async () => {
-		flush(apply({ plan: "free", previous: previous({ current_period_end: "2026-11-15T00:00:00Z" }) }));
+	it("stamps a flush for a period that has not ended with now, never the future", async () => {
+		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "free", flush_due: due({ period_end: "2026-11-15T00:00:00Z" }) });
 		await run();
 		expect(meter.reportOrgUsage).toHaveBeenCalledWith(expect.anything(), { periodStart: "2026-09-15", timestamp: NOW / 1000 });
 	});
 
-	it("does not flush a same-period update, a free-to-free change, an unapplied result or a first subscription", async () => {
-		for (const res of [
-			apply({ previous: previous() }),
-			apply({ plan: "free", previous: previous({ plan: "free" }) }),
-			apply({ periodChanged: true, applied: false, previous: previous() }),
-			apply({ periodChanged: true, previous: null }),
-		]) {
-			flush(res);
-			await run();
-			subs.recordEventOnce.mockResolvedValue(true);
-		}
+	it("does nothing when nothing is due or the apply wrote nothing", async () => {
+		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team" });
+		await run();
+		subs.recordEventOnce.mockResolvedValue(true);
+		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team", flush_due: due() });
+		subs.applySubscription.mockResolvedValue(apply({ applied: false }));
+		await run();
 		expect(meter.reportOrgUsage).not.toHaveBeenCalled();
+		expect(subs.clearFlushDue).not.toHaveBeenCalled();
 	});
 
-	it("accepts { sent: 0 } as handled", async () => {
-		flush(apply({ periodChanged: true, previous: previous() }));
+	it("accepts { sent: 0 } as handled and clears the marker", async () => {
+		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team", flush_due: due() });
 		meter.reportOrgUsage.mockResolvedValue({ sent: 0 });
 		const res = await run();
 		expect(res.statusCode).toBe(200);
+		expect(subs.clearFlushDue).toHaveBeenCalledWith("o1", "2026-09-15");
 		expect(subs.forgetEvent).not.toHaveBeenCalled();
 	});
 
-	it("lets Stripe retry when the flush fails", async () => {
-		flush(apply({ periodChanged: true, previous: previous() }));
+	it("keeps flush_due and lets Stripe retry when the flush fails", async () => {
+		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team", flush_due: due() });
 		meter.reportOrgUsage.mockRejectedValue(new Error("stripe down"));
 		expect((await run()).statusCode).toBe(500);
+		expect(subs.clearFlushDue).not.toHaveBeenCalled();
 		expect(subs.forgetEvent).toHaveBeenCalledWith("evt_1");
+	});
+
+	it("flushes on the retry too, since flush_due survived the failed attempt", async () => {
+		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team", flush_due: due() });
+		meter.reportOrgUsage.mockRejectedValueOnce(new Error("stripe down")).mockResolvedValueOnce({ sent: 1 });
+		expect((await run()).statusCode).toBe(500);
+		subs.recordEventOnce.mockResolvedValue(true);
+		expect((await run()).statusCode).toBe(200);
+		expect(subs.clearFlushDue).toHaveBeenCalledOnce();
+	});
+});
+
+describe("customer.subscription.deleted for a subscription Stripe no longer has", () => {
+	const missing = () => retrieve.mockRejectedValue(Object.assign(new Error("No such subscription"), { statusCode: 404 }));
+
+	it("applies null when the org's known subscription is the deleted one", async () => {
+		missing();
+		subs.getBilling.mockResolvedValue({ org_id: "o1", subscription_id: "sub_1" });
+		expect((await call(evt("customer.subscription.deleted", sub()))).statusCode).toBe(200);
+		expect(subs.applySubscription).toHaveBeenCalledWith("o1", null, NOW);
+	});
+
+	it("skips it when the org has moved on to a different subscription", async () => {
+		missing();
+		subs.getBilling.mockResolvedValue({ org_id: "o1", subscription_id: "sub_2" });
+		const res = await call(evt("customer.subscription.deleted", sub()));
+		expect(res.statusCode).toBe(200);
+		expect(subs.applySubscription).not.toHaveBeenCalled();
+		expect(subs.forgetEvent).not.toHaveBeenCalled();
+	});
+
+	it("still applies null when BILLING knows no subscription", async () => {
+		missing();
+		subs.getBilling.mockResolvedValue({ org_id: "o1", subscription_id: null });
+		await call(evt("customer.subscription.deleted", sub()));
+		expect(subs.applySubscription).toHaveBeenCalledWith("o1", null, NOW);
 	});
 });
