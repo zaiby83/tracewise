@@ -21,8 +21,9 @@ async function liveBilling(): Promise<BillingRecord[]> {
 		const page = await ddb.send(
 			new ScanCommand({
 				TableName: process.env.ACCOUNTS_TABLE,
-				FilterExpression: "sk = :b AND #s IN (:active, :trialing, :pastDue)",
-				ExpressionAttributeNames: { "#s": "status" },
+				// A cancelled org is not live, but an event it claimed and never sent still has to go out.
+				FilterExpression: "sk = :b AND (#s IN (:active, :trialing, :pastDue) OR attribute_exists(#pend))",
+				ExpressionAttributeNames: { "#s": "status", "#pend": "pending" },
 				ExpressionAttributeValues: { ":b": "BILLING", ":active": "active", ":trialing": "trialing", ":pastDue": "past_due" },
 				ExclusiveStartKey: startKey,
 			}),

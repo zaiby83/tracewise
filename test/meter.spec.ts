@@ -271,6 +271,15 @@ describe("meter handler", () => {
 		expect(cw.send.mock.calls[0]![0].input.Namespace).toBe("Tracewise/Billing");
 	});
 
+	it("also scans BILLING items that still hold a pending event, whatever their status", async () => {
+		world(counters, [org("a")]);
+		await handler();
+		const scan = ddb.send.mock.calls.map(([c]) => c).find((c) => c instanceof ScanCommand) as ScanCommand;
+		// A cancelled org is no longer live, but a claimed-and-unsent event of its last period must still go out.
+		expect(scan.input.FilterExpression).toMatch(/sk = :b AND \(#s IN \(:active, :trialing, :pastDue\) OR attribute_exists\(#pend\)\)/);
+		expect(scan.input.ExpressionAttributeNames).toEqual({ "#s": "status", "#pend": "pending" });
+	});
+
 	it("follows scan pagination", async () => {
 		world(counters, [org("a"), org("b")], { scanPages: true });
 		await handler();
