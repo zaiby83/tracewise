@@ -17,6 +17,11 @@ export const CONSOLE_ROUTES = [
 	"DELETE /v1/orgs/{orgId}/invites/{inviteId}",
 	"POST /v1/invites/accept",
 	"GET /v1/orgs/{orgId}/usage",
+	"GET /v1/orgs/{orgId}/billing",
+	"POST /v1/orgs/{orgId}/billing/checkout",
+	"POST /v1/orgs/{orgId}/billing/portal",
+	"POST /v1/orgs/{orgId}/billing/change",
+	"PATCH /v1/orgs/{orgId}/billing",
 ] as const satisfies readonly string[];
 
 // Existing data routes that also accept a console session (JWT) next to an API key.

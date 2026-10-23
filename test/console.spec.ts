@@ -22,13 +22,27 @@ const store = vi.hoisted(() => ({
 }));
 const accounts = vi.hoisted(() => ({ getMember: vi.fn(), getProfile: vi.fn(), listUserOrgs: vi.fn() }));
 const tenants = vi.hoisted(() => ({ consumeCounter: vi.fn(), readCounter: vi.fn() }));
+const billingStore = vi.hoisted(() => ({ getBilling: vi.fn(), linkCustomer: vi.fn(), setSpendCap: vi.fn() }));
+const stripeModule = vi.hoisted(() => ({ getStripe: vi.fn(), findPortalConfigId: vi.fn() }));
+// A stub client: nothing here reaches the network.
+const stripe = vi.hoisted(() => ({
+	customers: { create: vi.fn() },
+	prices: { list: vi.fn() },
+	checkout: { sessions: { create: vi.fn() } },
+	billingPortal: { sessions: { create: vi.fn() } },
+	subscriptions: { retrieve: vi.fn(), update: vi.fn() },
+}));
 vi.mock("../services/console/store", () => store);
+vi.mock("../services/billing/subscriptions", async (orig) => ({ ...(await orig<object>()), ...billingStore }));
+vi.mock("../services/billing/stripe", () => stripeModule);
 vi.mock("../services/shared/accounts", async (orig) => ({ ...(await orig<object>()), ...accounts }));
 vi.mock("../services/shared/tenants", async (orig) => ({ ...(await orig<object>()), ...tenants }));
 process.env.DELETION_QUEUE_URL = "https://sqs.test/deletion";
+process.env.CONSOLE_ORIGIN = "https://d1.cloudfront.net";
 
 const { handler } = await import("../services/console/handler");
 const { CONSOLE_ROUTES } = await import("../services/console/route-keys");
+const { resetPriceCache } = await import("../services/console/routes/billing");
 const { FREE_LIMITS } = await import("../services/shared/accounts");
 const { DEFAULT_RUBRIC } = await import("../services/evals/judge-prompt");
 
@@ -54,7 +68,10 @@ const orgParams = { orgId: "o1", keyId: "k", sub: "s", inviteId: "i" };
 const keyRecord = { org_id: "o1", key_id: "k1", name: "Default", scope: "write", prefix: "tw_ab12cd", key_hash: "SECRET-HASH", created_by: "u1", created_at: "t" };
 
 beforeEach(() => {
-	for (const fn of [...Object.values(store), ...Object.values(accounts), ...Object.values(tenants), sqsSend, cwSend]) fn.mockReset();
+	const stripeFns = [stripe.customers.create, stripe.prices.list, stripe.checkout.sessions.create, stripe.billingPortal.sessions.create, stripe.subscriptions.retrieve, stripe.subscriptions.update];
+	for (const fn of [...Object.values(store), ...Object.values(accounts), ...Object.values(tenants), ...Object.values(billingStore), ...Object.values(stripeModule), ...stripeFns, sqsSend, cwSend]) fn.mockReset();
+	resetPriceCache();
+	stripeModule.getStripe.mockResolvedValue(stripe);
 	accounts.getProfile.mockResolvedValue({ ...profile });
 	sqsSend.mockResolvedValue({} as never);
 	cwSend.mockResolvedValue({} as never);
@@ -69,6 +86,10 @@ const ownerOnly = [
 	"GET /v1/orgs/{orgId}/invites",
 	"POST /v1/orgs/{orgId}/invites",
 	"DELETE /v1/orgs/{orgId}/invites/{inviteId}",
+	"POST /v1/orgs/{orgId}/billing/checkout",
+	"POST /v1/orgs/{orgId}/billing/portal",
+	"POST /v1/orgs/{orgId}/billing/change",
+	"PATCH /v1/orgs/{orgId}/billing",
 ];
 
 describe("authorization", () => {
@@ -441,6 +462,364 @@ describe("usage", () => {
 		store.listMembers.mockResolvedValue([]);
 		store.listInvites.mockResolvedValue([]);
 		expect((await call("GET /v1/orgs/{orgId}/usage", { params: { orgId: "o1" } })).statusCode).toBe(200);
+	});
+});
+
+const GET_BILLING = "GET /v1/orgs/{orgId}/billing";
+const CHECKOUT = "POST /v1/orgs/{orgId}/billing/checkout";
+const PORTAL = "POST /v1/orgs/{orgId}/billing/portal";
+const CHANGE = "POST /v1/orgs/{orgId}/billing/change";
+const PATCH_BILLING = "PATCH /v1/orgs/{orgId}/billing";
+const o1 = { params: { orgId: "o1" } };
+const paidProfile = (plan: "team" | "pro" = "team", over: object = {}) => ({ ...profile, plan, limits: { ...FREE_LIMITS, monthly_events: null }, period_start: "2026-10-10", period_end: "2026-11-10", ...over });
+const billingRecord = (over: object = {}) => ({
+	org_id: "o1", customer_id: "cus_1", subscription_id: "sub_1", status: "active", plan: "team",
+	current_period_start: "2026-10-10T00:00:00.000Z", current_period_end: "2026-11-10T00:00:00.000Z",
+	cancel_at_period_end: false, spend_cap_usd: null, past_due_since: null, reported_events: 0, reported_period: null, ...over,
+});
+// Price ids are derived from the lookup key, so a test can tell which key a call used.
+const priceIdsByKey = () =>
+	stripe.prices.list.mockImplementation(async ({ lookup_keys }: { lookup_keys: string[] }) => ({ data: lookup_keys.map((key) => ({ id: `price_${key}`, lookup_key: key })) }));
+const stripeSub = (base = "team_monthly", metered = "team_metered") => ({
+	id: "sub_1",
+	status: "active",
+	items: { data: [{ id: "si_metered", price: { id: `price_${metered}`, lookup_key: metered } }, { id: "si_base", price: { id: `price_${base}`, lookup_key: base } }] },
+});
+
+describe("billing", () => {
+	it("shows billing to members but lets only owners change it", async () => {
+		asMember("member");
+		accounts.getProfile.mockResolvedValue(paidProfile());
+		billingStore.getBilling.mockResolvedValue(billingRecord());
+		tenants.readCounter.mockResolvedValue(0);
+		expect((await call(GET_BILLING, o1)).statusCode).toBe(200);
+		for (const [route, body] of [[CHECKOUT, { plan: "pro" }], [PORTAL, undefined], [CHANGE, { plan: "pro" }], [PATCH_BILLING, { spend_cap_usd: 5 }]] as const) {
+			const res = await call(route, { ...o1, body });
+			expect(res.statusCode, route).toBe(403);
+			expect(parse(res)).toEqual({ error: "owner only" });
+		}
+		expect(stripeModule.getStripe).not.toHaveBeenCalled();
+		expect(billingStore.setSpendCap).not.toHaveBeenCalled();
+	});
+
+	describe("GET", () => {
+		it("reports a paid org's subscription, usage and estimated overage without any Stripe ids", async () => {
+			vi.useFakeTimers({ now: new Date("2026-10-22T10:30:00Z"), toFake: ["Date"] });
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.getBilling.mockResolvedValue(billingRecord({ cancel_at_period_end: true, spend_cap_usd: 10 }));
+			tenants.readCounter.mockImplementation(async (id: string) => (id === "o1#month#2026-10-10" ? 800_000 : 1));
+			const res = await call(GET_BILLING, o1);
+			vi.useRealTimers();
+			expect(res.statusCode).toBe(200);
+			expect(parse(res)).toEqual({
+				plan: "team",
+				status: "active",
+				current_period_end: "2026-11-10T00:00:00.000Z",
+				cancel_at_period_end: true,
+				events_this_period: 800_000,
+				included_events: 500_000,
+				estimated_overage_usd: 15,
+				spend_cap_usd: 10,
+				past_due: false,
+			});
+			expect(res.body).not.toMatch(/cus_1|sub_1|price_|customer_id|subscription_id/);
+		});
+		it("flags a past-due subscription", async () => {
+			accounts.getProfile.mockResolvedValue(paidProfile("pro"));
+			billingStore.getBilling.mockResolvedValue(billingRecord({ plan: "pro", status: "past_due", past_due_since: "2026-10-20T00:00:00.000Z" }));
+			tenants.readCounter.mockResolvedValue(0);
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "pro", status: "past_due", past_due: true, included_events: 5_000_000 });
+		});
+		it("never reports a negative overage below the included events", async () => {
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.getBilling.mockResolvedValue(billingRecord());
+			tenants.readCounter.mockResolvedValue(499_999);
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ events_this_period: 499_999, estimated_overage_usd: 0 });
+		});
+		it("shows a free org with status none, null Stripe fields and the plan's allowance", async () => {
+			tenants.readCounter.mockResolvedValue(1234);
+			billingStore.getBilling.mockResolvedValue(null);
+			expect(parse(await call(GET_BILLING, o1))).toEqual({
+				plan: "free",
+				status: "none",
+				current_period_end: null,
+				cancel_at_period_end: null,
+				events_this_period: 1234,
+				included_events: 50_000,
+				estimated_overage_usd: 0,
+				spend_cap_usd: null,
+				past_due: false,
+			});
+		});
+		it("shows a custom org with status none and no included allowance, ignoring any stale billing record", async () => {
+			accounts.getProfile.mockResolvedValue({ ...profile, plan: "custom" });
+			billingStore.getBilling.mockResolvedValue(billingRecord({ spend_cap_usd: 5 }));
+			tenants.readCounter.mockResolvedValue(9_000_000);
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "custom", status: "none", current_period_end: null, included_events: null, estimated_overage_usd: 0, spend_cap_usd: null });
+		});
+		it("falls back to none for a paid org the webhook has not written a record for yet", async () => {
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.getBilling.mockResolvedValue(null);
+			tenants.readCounter.mockResolvedValue(0);
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "team", status: "none", current_period_end: null, spend_cap_usd: null });
+		});
+	});
+
+	describe("checkout", () => {
+		it("creates a Checkout session with base + metered prices, tax and the org reference", async () => {
+			billingStore.getBilling.mockResolvedValue(null);
+			priceIdsByKey();
+			stripe.customers.create.mockResolvedValue({ id: "cus_new" });
+			stripe.checkout.sessions.create.mockResolvedValue({ url: "https://checkout.stripe.test/s1" });
+			const res = await call(CHECKOUT, { ...o1, body: { plan: "pro" } });
+			expect(res.statusCode).toBe(200);
+			expect(parse(res)).toEqual({ url: "https://checkout.stripe.test/s1" });
+			expect(stripe.prices.list).toHaveBeenCalledWith({ lookup_keys: ["pro_monthly", "pro_metered"], active: true });
+			expect(stripe.customers.create).toHaveBeenCalledWith({ email: "owner@example.com", metadata: { org_id: "o1" } });
+			expect(billingStore.linkCustomer).toHaveBeenCalledWith("o1", "cus_new");
+			expect(stripe.checkout.sessions.create).toHaveBeenCalledWith({
+				mode: "subscription",
+				customer: "cus_new",
+				client_reference_id: "o1",
+				line_items: [{ price: "price_pro_monthly", quantity: 1 }, { price: "price_pro_metered" }],
+				subscription_data: { metadata: { org_id: "o1" } },
+				automatic_tax: { enabled: true },
+				customer_update: { address: "auto" },
+				allow_promotion_codes: true,
+				success_url: "https://d1.cloudfront.net/console/index.html#/billing?checkout=success",
+				cancel_url: "https://d1.cloudfront.net/console/index.html#/billing",
+			});
+		});
+		it("links the customer before creating the session, and reuses an existing customer", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "canceled", subscription_id: null, plan: "free" }));
+			priceIdsByKey();
+			stripe.checkout.sessions.create.mockResolvedValue({ url: "https://checkout.stripe.test/s2" });
+			const res = await call(CHECKOUT, { ...o1, body: { plan: "team" } });
+			expect(res.statusCode).toBe(200);
+			expect(stripe.customers.create).not.toHaveBeenCalled();
+			expect(billingStore.linkCustomer).not.toHaveBeenCalled();
+			expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: "cus_1", line_items: [{ price: "price_team_monthly", quantity: 1 }, { price: "price_team_metered" }] }));
+		});
+		it("answers 500 without creating a session when the customer belongs to another org", async () => {
+			vi.spyOn(console, "error").mockImplementation(() => {});
+			billingStore.getBilling.mockResolvedValue(null);
+			priceIdsByKey();
+			stripe.customers.create.mockResolvedValue({ id: "cus_new" });
+			billingStore.linkCustomer.mockRejectedValue(new Error("Stripe customer is already linked to a different org"));
+			const res = await call(CHECKOUT, { ...o1, body: { plan: "team" } });
+			expect(res.statusCode).toBe(500);
+			expect(parse(res)).toEqual({ error: "internal error" });
+			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+			vi.mocked(console.error).mockRestore();
+		});
+		it.each(["active", "trialing", "past_due"])("refuses checkout when already subscribed (%s)", async (status) => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status }));
+			const res = await call(CHECKOUT, { ...o1, body: { plan: "pro" } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "already subscribed, use Manage billing" });
+			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+		});
+		it("refuses checkout for a custom org, whose plan the webhook never changes", async () => {
+			accounts.getProfile.mockResolvedValue({ ...profile, plan: "custom" });
+			billingStore.getBilling.mockResolvedValue(null);
+			const res = await call(CHECKOUT, { ...o1, body: { plan: "team" } });
+			expect(res.statusCode).toBe(409);
+			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+		});
+		it.each([{ plan: "free" }, { plan: "enterprise" }, {}, undefined])("rejects the body %j with 400", async (body) => {
+			expect((await call(CHECKOUT, { ...o1, body })).statusCode).toBe(400);
+			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+		});
+		it("resolves each plan's prices once per instance", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "canceled" }));
+			priceIdsByKey();
+			stripe.checkout.sessions.create.mockResolvedValue({ url: "https://checkout.stripe.test/s" });
+			await call(CHECKOUT, { ...o1, body: { plan: "team" } });
+			await call(CHECKOUT, { ...o1, body: { plan: "team" } });
+			expect(stripe.prices.list).toHaveBeenCalledTimes(1);
+		});
+		it("answers 500 when a price is not set up in Stripe", async () => {
+			vi.spyOn(console, "error").mockImplementation(() => {});
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "canceled" }));
+			stripe.prices.list.mockResolvedValue({ data: [{ id: "price_x", lookup_key: "team_monthly" }] });
+			expect((await call(CHECKOUT, { ...o1, body: { plan: "team" } })).statusCode).toBe(500);
+			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+			vi.mocked(console.error).mockRestore();
+		});
+	});
+
+	describe("portal", () => {
+		it("refuses the portal before there's a customer", async () => {
+			billingStore.getBilling.mockResolvedValue(null);
+			const res = await call(PORTAL, o1);
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "no billing account yet" });
+			expect(stripe.billingPortal.sessions.create).not.toHaveBeenCalled();
+		});
+		it("opens a portal session on the maintained configuration", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord());
+			stripeModule.findPortalConfigId.mockResolvedValue("bpc_1");
+			stripe.billingPortal.sessions.create.mockResolvedValue({ url: "https://billing.stripe.test/p1" });
+			const res = await call(PORTAL, o1);
+			expect(parse(res)).toEqual({ url: "https://billing.stripe.test/p1" });
+			expect(stripeModule.findPortalConfigId).toHaveBeenCalledWith(stripe);
+			expect(stripe.billingPortal.sessions.create).toHaveBeenCalledWith({
+				customer: "cus_1",
+				configuration: "bpc_1",
+				return_url: "https://d1.cloudfront.net/console/index.html#/billing",
+			});
+		});
+		it("answers 500 and logs when the portal configuration has not been set up", async () => {
+			const err = vi.spyOn(console, "error").mockImplementation(() => {});
+			billingStore.getBilling.mockResolvedValue(billingRecord());
+			stripeModule.findPortalConfigId.mockResolvedValue(null);
+			const res = await call(PORTAL, o1);
+			expect(res.statusCode).toBe(500);
+			expect(parse(res)).toEqual({ error: "billing portal is not configured" });
+			expect(stripe.billingPortal.sessions.create).not.toHaveBeenCalled();
+			const line = JSON.parse(String(err.mock.calls[0]![0]));
+			expect(line).toMatchObject({ level: "error", org_id: "o1", sub: "u1" });
+			expect(JSON.stringify(line)).not.toContain("cus_1");
+			err.mockRestore();
+		});
+	});
+
+	describe("change", () => {
+		it("swaps both subscription items to the new plan's prices with proration, and returns the billing view", async () => {
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.getBilling.mockResolvedValue(billingRecord());
+			tenants.readCounter.mockResolvedValue(0);
+			priceIdsByKey();
+			stripe.subscriptions.retrieve.mockResolvedValue(stripeSub());
+			stripe.subscriptions.update.mockResolvedValue({});
+			const res = await call(CHANGE, { ...o1, body: { plan: "pro" } });
+			expect(res.statusCode).toBe(200);
+			expect(parse(res)).toMatchObject({ plan: "team", status: "active" });
+			expect(res.body).not.toMatch(/cus_1|sub_1|price_|si_/);
+			expect(stripe.subscriptions.retrieve).toHaveBeenCalledWith("sub_1");
+			expect(stripe.subscriptions.update).toHaveBeenCalledWith("sub_1", {
+				items: [{ id: "si_base", price: "price_pro_monthly" }, { id: "si_metered", price: "price_pro_metered" }],
+				proration_behavior: "create_prorations",
+			});
+		});
+		it.each([
+			["no billing record", null],
+			["a canceled subscription", billingRecord({ status: "canceled", plan: "free" })],
+			["no subscription id", billingRecord({ subscription_id: null })],
+		])("refuses with %s", async (_n, record) => {
+			billingStore.getBilling.mockResolvedValue(record);
+			const res = await call(CHANGE, { ...o1, body: { plan: "pro" } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "no active subscription" });
+			expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+		});
+		it("refuses a switch to the plan the org is already on", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ plan: "pro" }));
+			const res = await call(CHANGE, { ...o1, body: { plan: "pro" } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "already on that plan" });
+			expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+		});
+		it("also refuses when Stripe's own subscription is already on the plan", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ plan: "team" }));
+			priceIdsByKey();
+			stripe.subscriptions.retrieve.mockResolvedValue(stripeSub("pro_monthly", "pro_metered"));
+			const res = await call(CHANGE, { ...o1, body: { plan: "pro" } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "already on that plan" });
+			expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+		});
+		it("answers 500 when the subscription lacks the expected items", async () => {
+			vi.spyOn(console, "error").mockImplementation(() => {});
+			billingStore.getBilling.mockResolvedValue(billingRecord());
+			priceIdsByKey();
+			stripe.subscriptions.retrieve.mockResolvedValue({ id: "sub_1", items: { data: [{ id: "si_x", price: { id: "price_other", lookup_key: null } }] } });
+			expect((await call(CHANGE, { ...o1, body: { plan: "pro" } })).statusCode).toBe(500);
+			expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+			vi.mocked(console.error).mockRestore();
+		});
+		it("rejects an unknown plan with 400", async () => {
+			expect((await call(CHANGE, { ...o1, body: { plan: "free" } })).statusCode).toBe(400);
+		});
+	});
+
+	describe("spend cap", () => {
+		it("applies a spend cap below current usage immediately", async () => {
+			// team at 800_000 events; a 10 USD cap allows 500_000 + 200_000, so ingest is blocked at once.
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.getBilling.mockResolvedValue(billingRecord({ spend_cap_usd: 10 }));
+			billingStore.setSpendCap.mockResolvedValue(true);
+			tenants.readCounter.mockImplementation(async (id: string) => (id === "o1#month#2026-10-10" ? 800_000 : 0));
+			const res = await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: 10 } });
+			expect(res.statusCode).toBe(200);
+			expect(billingStore.setSpendCap).toHaveBeenCalledWith("o1", "team", 10);
+			expect(parse(res)).toMatchObject({ plan: "team", events_this_period: 800_000, estimated_overage_usd: 15, spend_cap_usd: 10 });
+		});
+		it("clears a cap with null", async () => {
+			accounts.getProfile.mockResolvedValue(paidProfile("pro"));
+			billingStore.getBilling.mockResolvedValue(billingRecord({ plan: "pro" }));
+			billingStore.setSpendCap.mockResolvedValue(true);
+			tenants.readCounter.mockResolvedValue(0);
+			expect((await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: null } })).statusCode).toBe(200);
+			expect(billingStore.setSpendCap).toHaveBeenCalledWith("o1", "pro", null);
+		});
+		it.each(["free", "custom"])("rejects caps on %s plans", async (plan) => {
+			accounts.getProfile.mockResolvedValue({ ...profile, plan });
+			const res = await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: 5 } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "spend caps apply to paid plans" });
+			expect(billingStore.setSpendCap).not.toHaveBeenCalled();
+		});
+		it.each([-1, 100_001, "5", undefined])("rejects the cap %j with 400", async (cap) => {
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			expect((await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: cap } })).statusCode).toBe(400);
+			expect(billingStore.setSpendCap).not.toHaveBeenCalled();
+		});
+		it("accepts the range's edges", async () => {
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.getBilling.mockResolvedValue(billingRecord());
+			billingStore.setSpendCap.mockResolvedValue(true);
+			tenants.readCounter.mockResolvedValue(0);
+			for (const cap of [0, 100_000]) expect((await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: cap } })).statusCode).toBe(200);
+		});
+		it("re-reads once when the plan changed under it, and applies the cap to the new plan", async () => {
+			accounts.getProfile.mockResolvedValueOnce(paidProfile("team")).mockResolvedValue(paidProfile("pro"));
+			billingStore.getBilling.mockResolvedValue(billingRecord({ plan: "pro" }));
+			billingStore.setSpendCap.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+			tenants.readCounter.mockResolvedValue(0);
+			const res = await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: 10 } });
+			expect(res.statusCode).toBe(200);
+			expect(billingStore.setSpendCap.mock.calls).toEqual([["o1", "team", 10], ["o1", "pro", 10]]);
+		});
+		it("does not write a paid limit when the retry finds the org downgraded", async () => {
+			accounts.getProfile.mockResolvedValueOnce(paidProfile("team")).mockResolvedValue({ ...profile });
+			billingStore.setSpendCap.mockResolvedValueOnce(false);
+			const res = await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: 10 } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "spend caps apply to paid plans" });
+			expect(billingStore.setSpendCap).toHaveBeenCalledTimes(1);
+		});
+		it("answers 409 when the write keeps conflicting", async () => {
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.setSpendCap.mockResolvedValue(false);
+			const res = await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: 10 } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "billing changed, try again" });
+			expect(billingStore.setSpendCap).toHaveBeenCalledTimes(2);
+		});
+	});
+
+	it("blocks new keys after a downgrade but keeps existing ones", async () => {
+		// Five keys from a paid plan; free allows three. Nothing is deleted, only new creates stop.
+		const keys = Array.from({ length: 5 }, (_, i) => ({ ...keyRecord, key_id: `k${i}` }));
+		store.listKeys.mockResolvedValue(keys);
+		const created = await call("POST /v1/orgs/{orgId}/keys", { ...o1, body: { name: "n", scope: "read" } });
+		expect(created.statusCode).toBe(409);
+		expect(parse(created)).toEqual({ error: "limit reached", limit: "max_keys" });
+		expect(store.createKey).not.toHaveBeenCalled();
+		const listed = await call("GET /v1/orgs/{orgId}/keys", o1);
+		expect(parse(listed).keys).toHaveLength(5);
+		expect(store.revokeKey).not.toHaveBeenCalled();
 	});
 });
 

@@ -277,6 +277,44 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 	return { plan, periodChanged, previous, applied: true };
 }
 
+// The console's spend cap: BILLING keeps the cap and PROFILE the monthly limit derived from it, written together
+// so ingest never enforces a limit the cap no longer matches. Conditioned on the plan the caller read, so a
+// downgrade that landed meanwhile isn't overwritten with a paid limit. False means a condition failed (the
+// plan moved, or there is no BILLING item) and the caller should re-read.
+export async function setSpendCap(orgId: string, plan: Exclude<PlanId, "free">, capUsd: number | null): Promise<boolean> {
+	try {
+		await ddb.send(
+			new TransactWriteCommand({
+				TransactItems: [
+					{
+						Update: {
+							TableName: table(),
+							Key: { pk: k.org(orgId), sk: "PROFILE" },
+							ConditionExpression: "#s = :active AND #p = :plan",
+							UpdateExpression: "SET limits.monthly_events = :events",
+							ExpressionAttributeNames: { "#s": "status", "#p": "plan" },
+							ExpressionAttributeValues: { ":active": "active", ":plan": plan, ":events": deriveMonthlyEvents(PLANS[plan], capUsd) },
+						},
+					},
+					{
+						Update: {
+							TableName: table(),
+							Key: billingKey(orgId),
+							ConditionExpression: "attribute_exists(pk)",
+							UpdateExpression: "SET spend_cap_usd = :cap",
+							ExpressionAttributeValues: { ":cap": capUsd },
+						},
+					},
+				],
+			}),
+		);
+		return true;
+	} catch (e) {
+		if (conditionFailedAt(e, 0) || conditionFailedAt(e, 1)) return false;
+		throw e;
+	}
+}
+
 // Only the period that was reported is cleared: a newer flush_due written since must stay.
 export async function clearFlushDue(orgId: string, period: string): Promise<void> {
 	try {

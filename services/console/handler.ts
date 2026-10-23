@@ -4,6 +4,7 @@ import { jwtClaims, type Claims } from "../shared/auth";
 import { json, log } from "../shared/http";
 import { CONSOLE_ROUTES } from "./route-keys";
 import { BadRequest } from "./routes/common";
+import { billingRoutes } from "./routes/billing";
 import { keyRoutes } from "./routes/keys";
 import { orgRoutes } from "./routes/orgs";
 import { teamRoutes } from "./routes/team";
@@ -32,7 +33,7 @@ export interface Route {
 
 export type RouteTable = Record<string, Route>;
 
-const routes: RouteTable = { ...orgRoutes, ...keyRoutes, ...teamRoutes, ...usageRoutes };
+const routes: RouteTable = { ...orgRoutes, ...keyRoutes, ...teamRoutes, ...usageRoutes, ...billingRoutes };
 
 // The stack wires CONSOLE_ROUTES to this Lambda, so a route missing here (or served here
 // but never wired) is a deploy-time mistake: fail at load rather than 404 in production.

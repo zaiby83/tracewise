@@ -7,7 +7,7 @@ vi.mock("../services/shared/ddb", () => ({ ddb }));
 process.env.ACCOUNTS_TABLE = "accounts";
 
 const { PLANS } = await import("../services/billing/plans");
-const { applySubscription, clearFlushDue, completeEvent, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } = await import(
+const { applySubscription, clearFlushDue, completeEvent, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce, setSpendCap } = await import(
 	"../services/billing/subscriptions"
 );
 
@@ -443,5 +443,49 @@ describe("webhook event records", () => {
 		ddb.send.mockReset().mockResolvedValueOnce({});
 		await forgetEvent("evt_1");
 		expect(ddb.send.mock.calls[0]![0].input).toMatchObject({ Key: { pk: "STRIPE_EVENT#evt_1", sk: "EVENT" } });
+	});
+});
+
+describe("setSpendCap", () => {
+	it("writes the cap and the derived monthly limit in one transaction, conditioned on the plan it read", async () => {
+		setup({});
+		await expect(setSpendCap("o1", "team", 10)).resolves.toBe(true);
+		const { call, profile, billing } = tx();
+		expect(call!.input.TransactItems).toHaveLength(2);
+		// 500_000 included + 10 USD at 5 USD per 100_000 events.
+		expect(profile).toMatchObject({
+			Key: { pk: "ORG#o1", sk: "PROFILE" },
+			ConditionExpression: "#s = :active AND #p = :plan",
+			UpdateExpression: "SET limits.monthly_events = :events",
+			ExpressionAttributeNames: { "#s": "status", "#p": "plan" },
+			ExpressionAttributeValues: { ":active": "active", ":plan": "team", ":events": 700_000 },
+		});
+		expect(billing).toMatchObject({
+			Key: { pk: "ORG#o1", sk: "BILLING" },
+			ConditionExpression: "attribute_exists(pk)",
+			UpdateExpression: "SET spend_cap_usd = :cap",
+			ExpressionAttributeValues: { ":cap": 10 },
+		});
+	});
+	it("writes a null cap as no limit", async () => {
+		setup({});
+		await setSpendCap("o1", "pro", null);
+		expect(tx().profile?.ExpressionAttributeValues).toMatchObject({ ":plan": "pro", ":events": null });
+		expect(tx().billing?.ExpressionAttributeValues).toEqual({ ":cap": null });
+	});
+	it("derives the limit with the plan's own rate", async () => {
+		setup({});
+		await setSpendCap("o1", "pro", 3);
+		expect(tx().profile?.ExpressionAttributeValues).toMatchObject({ ":events": 5_100_000 });
+	});
+	it.each([["the plan changed", 0], ["billing is missing", 1]])("returns false when %s", async (_n, index) => {
+		setup({ txError: cancelled(...Array.from({ length: 2 }, (_, i) => (i === index ? "ConditionalCheckFailed" : "None"))) });
+		await expect(setSpendCap("o1", "team", 10)).resolves.toBe(false);
+	});
+	it("rethrows anything that is not a failed condition", async () => {
+		setup({ txError: cancelled("None", "TransactionConflict") });
+		await expect(setSpendCap("o1", "team", 10)).rejects.toThrow("tx");
+		setup({ txError: new Error("throttled") });
+		await expect(setSpendCap("o1", "team", 10)).rejects.toThrow("throttled");
 	});
 });
