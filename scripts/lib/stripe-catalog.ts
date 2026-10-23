@@ -1,19 +1,29 @@
 import Stripe from "stripe";
 import { PLANS, type Plan } from "../../services/billing/plans";
+import { PORTAL_METADATA } from "../../services/billing/stripe";
 
 export const METER_EVENT_NAME = "tracewise_events";
-const PORTAL_TAG = { tracewise: "plan-switching" };
+// Tag used before plan switching moved out of the portal; such a config is adopted and re-tagged.
+const LEGACY_PORTAL_TAG = "plan-switching";
 const Decimal = Stripe.Decimal;
 
 type PaidPlan = Plan & { stripe: { base: string; metered: string } };
-const paidPlans = (): PaidPlan[] => Object.values(PLANS).filter((p): p is PaidPlan => p.stripe !== null);
+const paidPlans = (): PaidPlan[] => {
+	const plans = Object.values(PLANS).filter((p): p is PaidPlan => p.stripe !== null);
+	// A paid plan with no overage rate would become a free-forever tier; refuse before any Stripe call.
+	for (const plan of plans) overageCentsPerEvent(plan);
+	return plans;
+};
 
 // Fixed ids make "does the product exist" a lookup, and keep a rerun after a half-finished
 // run from creating a second product.
 const productId = (plan: Plan) => `tracewise_${plan.id}`;
 
 // Dollars per 100,000 events -> cents per event, as an exact decimal ($5 -> 0.005).
-const overageCentsPerEvent = (plan: Plan) => Decimal.from(plan.overage_per_100k_usd ?? 0).mul(Decimal.from("0.001"));
+function overageCentsPerEvent(plan: Plan) {
+	if (plan.overage_per_100k_usd === null) throw new Error(`Plan "${plan.id}" is paid but has no overage rate, so its metered price can't be built`);
+	return Decimal.from(plan.overage_per_100k_usd).mul(Decimal.from("0.001"));
+}
 
 // Tiers as the metered price should have them. The wire value of unit_amount_decimal is its
 // decimal string, whichever of Decimal or string Stripe hands back.
@@ -66,6 +76,8 @@ function checkMetered(price: Stripe.Price, plan: PaidPlan, meterId: string): voi
 		price.billing_scheme === "tiered" &&
 		price.tiers_mode === "graduated" &&
 		tiers.length === 2 &&
+		// A flat fee on either tier would bill on top of the per-event rate.
+		tiers.every((t) => t.flat_amount == null && t.flat_amount_decimal == null) &&
 		free?.up_to === plan.included_events &&
 		sameDecimal(free.unit_amount_decimal ?? free.unit_amount, 0) &&
 		overage?.up_to === null &&
@@ -73,11 +85,46 @@ function checkMetered(price: Stripe.Price, plan: PaidPlan, meterId: string): voi
 	if (!ok) mismatch(what, `does not have the graduated tiers 0 up to ${plan.included_events} events, then ${overageCentsPerEvent(plan)} cents per event`);
 }
 
+// Plan changes happen in the console, not the portal: a base + metered subscription can't be
+// swapped reliably there. The portal only handles cancelling, cards and invoices.
+const portalFeatures = () => ({
+	subscription_update: { enabled: false },
+	subscription_cancel: { enabled: true, mode: "at_period_end" as const },
+	payment_method_update: { enabled: true },
+	invoice_history: { enabled: true },
+});
+
+function portalUpToDate(c: Stripe.BillingPortal.Configuration): boolean {
+	const f = c.features;
+	return (
+		c.metadata?.tracewise === PORTAL_METADATA.tracewise &&
+		f.subscription_update.enabled === false &&
+		f.subscription_cancel.enabled === true &&
+		f.subscription_cancel.mode === "at_period_end" &&
+		f.payment_method_update.enabled === true &&
+		f.invoice_history.enabled === true
+	);
+}
+
+// Unlike prices, portal configurations are mutable, so a rerun converges instead of throwing.
+async function ensurePortal(stripe: Stripe): Promise<string> {
+	const configs = (await stripe.billingPortal.configurations.list({ active: true, limit: 100 })).data;
+	const tagged = (value: string) => configs.find((c) => c.metadata?.tracewise === value);
+	const existing = tagged(PORTAL_METADATA.tracewise) ?? tagged(LEGACY_PORTAL_TAG);
+	if (!existing) {
+		return (await stripe.billingPortal.configurations.create({ name: "Tracewise billing", metadata: PORTAL_METADATA, features: portalFeatures() })).id;
+	}
+	if (!portalUpToDate(existing)) await stripe.billingPortal.configurations.update(existing.id, { metadata: PORTAL_METADATA, features: portalFeatures() });
+	return existing.id;
+}
+
 const idOf = (p: string | { id: string }) => (typeof p === "string" ? p : p.id);
 
 // Idempotent: finds the meter by event name and prices by lookup key, creates whatever is
 // missing, and never edits an existing object. Only ids come back; nothing here touches a key.
 export async function ensureStripeCatalog(stripe: Stripe): Promise<{ meterId: string; prices: Record<string, string>; portalConfigId: string }> {
+	// First, so a bad plan table fails before anything is created.
+	const plans = paidPlans();
 	const meters = (await stripe.billing.meters.list({ limit: 100 })).data.filter((m) => m.event_name === METER_EVENT_NAME);
 	let meter = meters.find((m) => m.status === "active") ?? meters[0];
 	if (meter) checkMeter(meter);
@@ -92,13 +139,11 @@ export async function ensureStripeCatalog(stripe: Stripe): Promise<{ meterId: st
 	}
 	const meterId = meter.id;
 
-	const plans = paidPlans();
 	// Tiers only come back from the list when asked for.
 	const existing = (await stripe.prices.list({ lookup_keys: plans.flatMap((p) => [p.stripe.base, p.stripe.metered]), expand: ["data.tiers"], limit: 100 })).data;
 	const byKey = new Map(existing.flatMap((p) => (p.lookup_key ? [[p.lookup_key, p] as const] : [])));
 
 	const prices: Record<string, string> = {};
-	const products: Record<string, string> = {};
 	for (const plan of plans) {
 		const { base, metered } = plan.stripe;
 		const have = { base: byKey.get(base), metered: byKey.get(metered) };
@@ -111,8 +156,6 @@ export async function ensureStripeCatalog(stripe: Stripe): Promise<{ meterId: st
 			const found = (await stripe.products.list({ ids: [productId(plan)] })).data[0];
 			product = found?.id ?? (await stripe.products.create({ id: productId(plan), name: `Tracewise ${plan.name}` })).id;
 		}
-		products[plan.id] = product!;
-
 		const baseId = have.base?.id ?? (await stripe.prices.create({
 			currency: "usd",
 			product,
@@ -135,26 +178,9 @@ export async function ensureStripeCatalog(stripe: Stripe): Promise<{ meterId: st
 		prices[metered] = meteredId;
 	}
 
-	const portals = (await stripe.billingPortal.configurations.list({ active: true, limit: 100 })).data;
-	const portal =
-		portals.find((c) => c.metadata?.tracewise === PORTAL_TAG.tracewise) ??
-		(await stripe.billingPortal.configurations.create({
-			name: "Tracewise plan switching",
-			metadata: PORTAL_TAG,
-			features: {
-				subscription_update: {
-					enabled: true,
-					default_allowed_updates: ["price"],
-					proration_behavior: "create_prorations",
-					products: plans.map((plan) => ({ product: products[plan.id]!, prices: [prices[plan.stripe.base]!] })),
-				},
-				subscription_cancel: { enabled: true, mode: "at_period_end" },
-				payment_method_update: { enabled: true },
-				invoice_history: { enabled: true },
-			},
-		}));
+	const portalConfigId = await ensurePortal(stripe);
 
-	return { meterId, prices, portalConfigId: portal.id };
+	return { meterId, prices, portalConfigId };
 }
 
 const USAGE = "usage: STRIPE_SECRET_KEY=sk_test_... pnpm exec tsx scripts/stripe-setup.ts [--live]";

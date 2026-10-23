@@ -18,12 +18,12 @@ const stubStripe = (seed: Seed = {}) => {
 		// Honours the ids filter, like Stripe does.
 		products: { list: vi.fn(async (p: { ids?: string[] }) => ({ data: (seed.products ?? []).filter((x) => !p.ids || p.ids.includes((x as { id: string }).id)) })), create: create("prod") },
 		prices: { list: list(seed.prices), create: create("price") },
-		billingPortal: { configurations: { list: list(seed.portals), create: create("bpc") } },
+		billingPortal: { configurations: { list: list(seed.portals), create: create("bpc"), update: vi.fn().mockResolvedValue({}) } },
 	} as unknown as Stripe & {
 		billing: { meters: { list: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> } };
 		products: { list: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> };
 		prices: { list: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> };
-		billingPortal: { configurations: { list: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> } };
+		billingPortal: { configurations: { list: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn> } };
 	};
 };
 
@@ -37,7 +37,13 @@ const metered = (key: string, product: string, upTo: number, decimal: string, me
 	recurring: { interval: "month", interval_count: 1, usage_type: "metered", meter: meterId },
 	tiers: [{ up_to: upTo, unit_amount: 0, unit_amount_decimal: "0", flat_amount: null }, { up_to: null, unit_amount: null, unit_amount_decimal: decimal, flat_amount: null }],
 });
-const portal = { id: "bpc_1", active: true, metadata: { tracewise: "plan-switching" } };
+const portalFeatures = {
+	subscription_update: { enabled: false },
+	subscription_cancel: { enabled: true, mode: "at_period_end" },
+	payment_method_update: { enabled: true },
+	invoice_history: { enabled: true },
+};
+const portal = { id: "bpc_1", active: true, metadata: { tracewise: "portal" }, features: portalFeatures };
 const everything = (): Seed => ({
 	meters: [meter],
 	prices: [
@@ -94,25 +100,50 @@ describe("ensureStripeCatalog", () => {
 		expect(byKey.pro_monthly).not.toBe("tracewise_team");
 	});
 
-	it("creates a portal configuration that switches between the two monthly plans", async () => {
+	it("creates a portal configuration with plan switching off, tagged for lookup", async () => {
 		const s = stubStripe({ ...everything(), portals: [] });
 		const out = await ensureStripeCatalog(s);
 		const [config] = callsOf(s.billingPortal.configurations.create) as [{ metadata: unknown; features: Record<string, unknown> }];
-		expect(config.metadata).toEqual({ tracewise: "plan-switching" });
-		expect(config.features).toMatchObject({
-			subscription_cancel: { enabled: true, mode: "at_period_end" },
-			payment_method_update: { enabled: true },
-			invoice_history: { enabled: true },
-			subscription_update: {
-				enabled: true,
-				default_allowed_updates: ["price"],
-				products: [
-					{ product: "prod_team", prices: ["price_team_monthly"] },
-					{ product: "prod_pro", prices: ["price_pro_monthly"] },
-				],
-			},
-		});
+		expect(config.metadata).toEqual({ tracewise: "portal" });
+		expect(config.features).toEqual(portalFeatures);
+		expect(s.billingPortal.configurations.update).not.toHaveBeenCalled();
 		expect(out.portalConfigId).toMatch(/^bpc_/);
+	});
+
+	it("updates an existing portal configuration that still allows plan switching", async () => {
+		const switching = { ...portal, features: { ...portalFeatures, subscription_update: { enabled: true, default_allowed_updates: ["price"] } } };
+		const s = stubStripe({ ...everything(), portals: [switching] });
+		const out = await ensureStripeCatalog(s);
+		expect(s.billingPortal.configurations.create).not.toHaveBeenCalled();
+		expect(s.billingPortal.configurations.update).toHaveBeenCalledWith("bpc_1", { metadata: { tracewise: "portal" }, features: portalFeatures });
+		expect(out.portalConfigId).toBe("bpc_1");
+	});
+
+	it("adopts and re-tags a configuration made under the old plan-switching tag", async () => {
+		const legacy = { ...portal, metadata: { tracewise: "plan-switching" }, features: { ...portalFeatures, subscription_update: { enabled: true } } };
+		const s = stubStripe({ ...everything(), portals: [legacy] });
+		await ensureStripeCatalog(s);
+		expect(s.billingPortal.configurations.create).not.toHaveBeenCalled();
+		expect(s.billingPortal.configurations.update).toHaveBeenCalledWith("bpc_1", expect.objectContaining({ metadata: { tracewise: "portal" } }));
+	});
+
+	it("re-tags a legacy configuration even when its features already match", async () => {
+		const legacy = { ...portal, metadata: { tracewise: "plan-switching" } };
+		const s = stubStripe({ ...everything(), portals: [legacy] });
+		await ensureStripeCatalog(s);
+		expect(s.billingPortal.configurations.update).toHaveBeenCalledTimes(1);
+	});
+
+	it("updates a portal configuration whose cancel mode or other features drifted", async () => {
+		for (const features of [
+			{ ...portalFeatures, subscription_cancel: { enabled: true, mode: "immediately" } },
+			{ ...portalFeatures, payment_method_update: { enabled: false } },
+			{ ...portalFeatures, invoice_history: { enabled: false } },
+		]) {
+			const s = stubStripe({ ...everything(), portals: [{ ...portal, features }] });
+			await ensureStripeCatalog(s);
+			expect(s.billingPortal.configurations.update).toHaveBeenCalledTimes(1);
+		}
 	});
 
 	it("is a no-op when everything exists", async () => {
@@ -122,6 +153,7 @@ describe("ensureStripeCatalog", () => {
 		expect(s.products.create).not.toHaveBeenCalled();
 		expect(s.prices.create).not.toHaveBeenCalled();
 		expect(s.billingPortal.configurations.create).not.toHaveBeenCalled();
+		expect(s.billingPortal.configurations.update).not.toHaveBeenCalled();
 		expect(out).toEqual({
 			meterId: "mtr_1",
 			prices: { team_monthly: "price_team_monthly", team_metered: "price_team_metered", pro_monthly: "price_pro_monthly", pro_metered: "price_pro_metered" },
@@ -162,6 +194,20 @@ describe("ensureStripeCatalog", () => {
 		await expect(ensureStripeCatalog(stubStripe(seed))).rejects.toThrow(/pro_metered/);
 	});
 
+	it("refuses a metered price whose tiers carry a flat amount", async () => {
+		const seed = everything();
+		const withFlat = (tierIndex: number, flat: Record<string, unknown>) => {
+			const price = metered("pro_metered", "prod_pro", 5_000_000, "0.003");
+			price.tiers = price.tiers.map((t, i) => (i === tierIndex ? { ...t, ...flat } : t));
+			return [...seed.prices!.slice(0, 3), price];
+		};
+		for (const [tier, flat] of [[0, { flat_amount: 500 }], [1, { flat_amount: 500 }], [1, { flat_amount_decimal: "12.5" }]] as const) {
+			const s = stubStripe({ ...seed, prices: withFlat(tier, flat) });
+			await expect(ensureStripeCatalog(s)).rejects.toThrow(/pro_metered/);
+			expect(s.prices.create).not.toHaveBeenCalled();
+		}
+	});
+
 	it("refuses a metered price that is bound to a different meter", async () => {
 		const seed = everything();
 		seed.prices = [...seed.prices!.slice(0, 1), metered("team_metered", "prod_team", 500_000, "0.005", "mtr_other"), ...seed.prices!.slice(2)];
@@ -180,6 +226,27 @@ describe("ensureStripeCatalog", () => {
 		const s = stubStripe(seed);
 		await expect(ensureStripeCatalog(s)).rejects.toThrow(/tracewise_events/);
 		expect(s.prices.create).not.toHaveBeenCalled();
+	});
+});
+
+describe("ensureStripeCatalog with a bad plan table", () => {
+	it("throws, before calling Stripe, when a paid plan has no overage rate", async () => {
+		vi.resetModules();
+		vi.doMock("../services/billing/plans", async () => {
+			const actual = await vi.importActual<typeof import("../services/billing/plans")>("../services/billing/plans");
+			return { ...actual, PLANS: { ...actual.PLANS, team: { ...actual.PLANS.team, overage_per_100k_usd: null } } };
+		});
+		try {
+			const { ensureStripeCatalog: ensure } = await import("../scripts/lib/stripe-catalog");
+			const s = stubStripe();
+			await expect(ensure(s)).rejects.toThrow(/team.*no overage rate/);
+			expect(s.billing.meters.list).not.toHaveBeenCalled();
+			expect(s.billing.meters.create).not.toHaveBeenCalled();
+			expect(s.prices.create).not.toHaveBeenCalled();
+		} finally {
+			vi.doUnmock("../services/billing/plans");
+			vi.resetModules();
+		}
 	});
 });
 

@@ -87,4 +87,46 @@ describe("stripe client and secret access", () => {
 		expect((error as Error).message).toMatch(/secret_key and webhook_secret/);
 		expect((error as Error).message).not.toContain("sk_test_leaky");
 	});
+
+	it("rejects a secret that is not JSON without quoting any of it", async () => {
+		send.mockResolvedValue({ SecretString: "sk_test_rawkeynotjson" } as never);
+		const { getStripe } = await load();
+		const error = (await getStripe().catch((e: Error) => e)) as Error;
+		expect(error.message).toBe("Stripe secret is not valid JSON");
+		expect(error.message).not.toContain("rawkeynotjson");
+	});
+
+	it("rejects a secret that is JSON but not an object", async () => {
+		send.mockResolvedValue({ SecretString: "null" } as never);
+		const { getStripe } = await load();
+		await expect(getStripe()).rejects.toThrow(/secret_key and webhook_secret/);
+	});
+});
+
+describe("findPortalConfigId", () => {
+	const stripeWith = (data: unknown[]) => {
+		const list = vi.fn().mockResolvedValue({ data });
+		return { stripe: { billingPortal: { configurations: { list } } } as never, list };
+	};
+
+	it("returns the configuration tagged tracewise: portal, and caches it", async () => {
+		const { findPortalConfigId } = await load();
+		const { stripe, list } = stripeWith([
+			{ id: "bpc_other", metadata: null },
+			{ id: "bpc_legacy", metadata: { tracewise: "plan-switching" } },
+			{ id: "bpc_ours", metadata: { tracewise: "portal" } },
+		]);
+		expect(await findPortalConfigId(stripe)).toBe("bpc_ours");
+		expect(await findPortalConfigId(stripe)).toBe("bpc_ours");
+		expect(list).toHaveBeenCalledTimes(1);
+		expect(list).toHaveBeenCalledWith(expect.objectContaining({ active: true }));
+	});
+
+	it("returns null when none is tagged, and looks again next time", async () => {
+		const { findPortalConfigId } = await load();
+		const none = stripeWith([{ id: "bpc_other", metadata: {} }]);
+		expect(await findPortalConfigId(none.stripe)).toBeNull();
+		const some = stripeWith([{ id: "bpc_ours", metadata: { tracewise: "portal" } }]);
+		expect(await findPortalConfigId(some.stripe)).toBe("bpc_ours");
+	});
 });

@@ -17,8 +17,14 @@ async function loadSecret(arn: string): Promise<StripeSecret> {
 	const res = await secrets.send(new GetSecretValueCommand({ SecretId: arn }));
 	// Error text names the field, never the value: these end up in CloudWatch.
 	if (!res.SecretString) throw new Error("Stripe secret has no SecretString");
-	const parsed = JSON.parse(res.SecretString) as Partial<StripeSecret>;
-	if (!parsed.secret_key || !parsed.webhook_secret) throw new Error("Stripe secret must hold secret_key and webhook_secret");
+	let parsed: Partial<StripeSecret> | null;
+	try {
+		parsed = JSON.parse(res.SecretString);
+	} catch {
+		// V8's own parse error quotes a snippet of the input, which here would be the key.
+		throw new Error("Stripe secret is not valid JSON");
+	}
+	if (!parsed?.secret_key || !parsed.webhook_secret) throw new Error("Stripe secret must hold secret_key and webhook_secret");
 	return { secret_key: parsed.secret_key, webhook_secret: parsed.webhook_secret };
 }
 
@@ -45,4 +51,17 @@ export async function getStripe(): Promise<Stripe> {
 
 export async function getWebhookSecret(): Promise<string> {
 	return process.env.STRIPE_WEBHOOK_SECRET || (await readSecret()).webhook_secret;
+}
+
+// The Customer Portal configuration `stripe-setup` maintains, found by its metadata tag so no
+// id has to be configured. Cached per instance once found; a miss is not cached, so a
+// configuration created after a cold start is picked up.
+export const PORTAL_METADATA = { tracewise: "portal" } as const;
+let portalConfigId: string | undefined;
+
+export async function findPortalConfigId(stripe: Stripe): Promise<string | null> {
+	if (portalConfigId) return portalConfigId;
+	const configs = (await stripe.billingPortal.configurations.list({ active: true, limit: 100 })).data;
+	portalConfigId = configs.find((c) => c.metadata?.tracewise === PORTAL_METADATA.tracewise)?.id;
+	return portalConfigId ?? null;
 }
