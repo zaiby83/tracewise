@@ -35,6 +35,9 @@ const usd = new Intl.NumberFormat("en", { style: "currency", currency: "USD" });
 // Billing periods are UTC, and so is the date shown.
 const day = (value) => new Date(value).toLocaleDateString("en", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
 
+// Whole cents, as the spend cap is stored.
+export const roundCents = (n) => Math.round(n * 100) / 100;
+
 const isPaid = (b) => b.plan === "team" || b.plan === "pro";
 
 // The sentences the plan card shows. Pure, for tests.
@@ -74,8 +77,10 @@ export async function render(root, ctx) {
 		notice.textContent = text ?? "";
 		notice.hidden = !text;
 	};
+	let drawn = "";
 	const draw = (b) => {
 		billing = b;
+		drawn = JSON.stringify(b);
 		body.replaceChildren(planCard(b), ...(b.plan === "free" ? [planOptions()] : []), ...(owner && isPaid(b) ? [spendCapCard(b)] : []));
 	};
 
@@ -89,7 +94,8 @@ export async function render(root, ctx) {
 			try {
 				const b = await ctx.api.get(base);
 				if (mine !== watching || !root.isConnected) return;
-				draw(b);
+				// Redraw only when something changed, so a half-typed cap or an error line survives a poll.
+				if (JSON.stringify(b) !== drawn) draw(b);
 				if (done(b)) {
 					say(finished(b));
 					ctx.refreshBanners?.();
@@ -175,7 +181,7 @@ export async function render(root, ctx) {
 				onsubmit: (e) => {
 					e.preventDefault();
 					const raw = input.value.trim();
-					const value = raw === "" ? null : Number(raw);
+					const value = raw === "" ? null : roundCents(Number(raw));
 					if (value !== null && (!Number.isFinite(value) || value < 0 || value > MAX_CAP_USD)) return showError(error, `Enter an amount from $0 to ${usd.format(MAX_CAP_USD).replace(".00", "")}, or leave it empty for no cap.`);
 					say("");
 					run(save, error, async () => {
@@ -201,7 +207,17 @@ export async function render(root, ctx) {
 				const upgrade = el("button", { class: "button primary", type: "button" }, `Upgrade to ${p.name}`);
 				upgrade.addEventListener("click", () =>
 					run(upgrade, error, async () => {
-						const { url } = await ctx.api.post(`${base}/checkout`, { plan: id });
+						let url;
+						try {
+							({ url } = await ctx.api.post(`${base}/checkout`, { plan: id }));
+						} catch (err) {
+							// Already subscribed means the webhook hasn't landed yet: wait for it rather than point at
+							// a Manage billing button this screen doesn't show yet.
+							if (err.status !== 409 || !/already subscribed/i.test(err.message)) throw err;
+							say("Your subscription is being set up — this page will update shortly.");
+							watch(isPaid, (b) => `Thanks, you're now on ${LABELS[b.plan]}.`);
+							return;
+						}
 						leaveTo(url);
 					}),
 				);

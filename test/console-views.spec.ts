@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { FREE_LIMITS } from "../services/shared/accounts";
 import { curlQuickstart } from "../dashboard/console/views/overview.js";
 import { usageRows } from "../dashboard/console/views/usage.js";
-import { PLAN_DETAILS, billingSummary } from "../dashboard/console/views/billing.js";
+import { PLAN_DETAILS, billingSummary, roundCents } from "../dashboard/console/views/billing.js";
 import { bannersFor } from "../dashboard/console/banners.js";
 import { PLANS } from "../services/billing/plans";
 
@@ -41,6 +41,45 @@ describe("console view helpers", () => {
 		const capped = usageRows({ limits: { ...limits, monthly_events: 900_000 }, used, plan: "team", included: 500_000 })[1]!;
 		expect(capped.limit).toBe(900_000);
 		expect(capped.note).toBe("Ingest returns 429 once your spend cap is reached");
+	});
+});
+
+describe("usage row states", () => {
+	const used = (events: number) => ({ events_this_minute: 1, events_this_period: events, analytics_queries_today: 0, eval_samples_last_night: 0, keys: 1, members: 1, pending_invites: 0 });
+	const period = (args: Parameters<typeof usageRows>[0]) => usageRows(args)[1]!;
+
+	it("marks only a hard stop as full", () => {
+		expect(period({ limits: { ...FREE_LIMITS }, used: used(50_000), plan: "free", included: 50_000 }).state).toBe("full");
+		expect(period({ limits: { ...FREE_LIMITS }, used: used(49_999), plan: "free", included: 50_000 }).state).toBe("");
+		// A spend cap's ceiling is a stop.
+		expect(period({ limits: { ...PLANS.team.limits, monthly_events: 900_000 }, used: used(900_000), plan: "team", included: 500_000 }).state).toBe("full");
+		expect(period({ limits: { ...PLANS.team.limits, monthly_events: 900_000 }, used: used(700_000), plan: "team", included: 500_000 }).state).toBe("");
+	});
+
+	it("shows a paid plan past its allowance, with no ceiling, as over rather than full", () => {
+		expect(period({ limits: { ...PLANS.team.limits, monthly_events: null }, used: used(650_000), plan: "team", included: 500_000 }).state).toBe("over");
+		expect(period({ limits: { ...PLANS.team.limits, monthly_events: null }, used: used(400_000), plan: "team", included: 500_000 }).state).toBe("");
+	});
+
+	it("still renders every row when billing is unavailable", () => {
+		const rows = usageRows({ limits: { ...PLANS.team.limits, monthly_events: null }, used: used(650_000) });
+		expect(rows).toHaveLength(7);
+		expect(rows[1]).toMatchObject({ label: "Events this period", limit: null, note: "No event limit applies", state: "" });
+		expect(usageRows({ limits: { ...FREE_LIMITS }, used: used(50_000) })[1]).toMatchObject({ state: "full", note: "Ingest returns 429 once this limit is reached" });
+	});
+
+	it("keeps the other limits as hard stops", () => {
+		const rows = usageRows({ limits: { ...FREE_LIMITS }, used: { ...used(0), keys: 3 }, plan: "free", included: 50_000 });
+		expect(rows.find((r) => r.label === "Keys")!.state).toBe("full");
+	});
+});
+
+describe("spend cap", () => {
+	it("rounds to whole cents", () => {
+		expect(roundCents(20.499)).toBe(20.5);
+		expect(roundCents(0.294)).toBe(0.29);
+		expect(roundCents(100)).toBe(100);
+		expect(roundCents(1.005)).toBe(1);
 	});
 });
 

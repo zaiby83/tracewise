@@ -83,6 +83,7 @@ dialog .callout { color: var(--text-primary); }
 .usage-bar .magnitude { justify-content: flex-start; font-variant-numeric: tabular-nums; }
 .usage-bar .magnitude .track { width: 90px; }
 .usage-row.full .fill { background: var(--critical); }
+.usage-row.over .fill { background: var(--warning); }
 .usage-note { color: var(--text-muted); font-size: 13px; }
 @media (max-width: 760px) { .usage-row { grid-template-columns: 1fr; } }
 
