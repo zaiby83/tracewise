@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 728" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="tracewise-data-path-title tracewise-data-path-desc" id="data-path-root">
+<title id="tracewise-data-path-title">Tracewise ingest, storage and reads</title>
+<desc id="tracewise-data-path-desc">The ingest Lambda enqueues traces to SQS, the processor writes them to DynamoDB and streams them through Firehose into a Parquet data lake catalogued by Glue; the query Lambda reads recent traces from DynamoDB and the analytics Lambda queries the lake through Athena.</desc>
+<defs>
+      <style>#data-path-root { font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #0b0b0b; }
+      #data-path-root .diagram-container { width: 100%; overflow-x: auto; }
+      @media print {
+#data-path-root .diagram-container { overflow-x: visible; }
+}</style>
+<marker id="data-path-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#52514e"/></marker>
+<marker id="data-path-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#226dc8"/></marker>
+</defs>
+<rect width="100%" height="100%" fill="#f9f9f7"/>
+<!-- zones -->
+<rect x="56" y="40" width="848" height="104" rx="8" fill="#0b0b0b" stroke="rgba(11,11,11,0.10)" stroke-width="0.8" fill-opacity="0.02"/>
+<rect x="68" y="44" width="97" height="12" rx="2" fill="#f9f9f7"/>
+<text x="116.6" y="53" fill="#706e69" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.14em">REQUEST HANDLERS</text>
+<rect x="56" y="176" width="448" height="216" rx="8" fill="#0b0b0b" stroke="rgba(11,11,11,0.10)" stroke-width="0.8" fill-opacity="0.02"/>
+<rect x="68" y="180" width="86" height="12" rx="2" fill="#f9f9f7"/>
+<text x="111.2" y="189" fill="#706e69" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.14em">WRITE PIPELINE</text>
+<rect x="56" y="424" width="848" height="216" rx="8" fill="#0b0b0b" stroke="rgba(11,11,11,0.10)" stroke-width="0.8" fill-opacity="0.02"/>
+<rect x="68" y="428" width="49" height="12" rx="2" fill="#f9f9f7"/>
+<text x="92.6" y="437" fill="#706e69" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.14em">STORAGE</text>
+<!-- arrows (before boxes) -->
+<path d="M180,128 V208" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#data-path-arrow-accent)"/>
+<path d="M180,264 V312" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#data-path-arrow-accent)"/>
+<path d="M280,236 H360" fill="none" stroke="#52514e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#data-path-arrow)"/>
+<path d="M280,340 H461 Q469,340 469,348 V456" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#data-path-arrow-accent)"/>
+<path d="M180,368 V456" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#data-path-arrow)"/>
+<path d="M180,512 V560" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#data-path-arrow)"/>
+<path d="M523,128 V456" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#data-path-arrow)"/>
+<path d="M780,128 V456" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#data-path-arrow)"/>
+<path d="M780,512 V580 Q780,588 772,588 H640" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#data-path-arrow)"/>
+<path d="M280,588 H440" fill="none" stroke="#52514e" stroke-width="1.2"/>
+<!-- arrow labels -->
+<rect x="188.0" y="162" width="51.5" height="12" rx="2" fill="#f9f9f7"/>
+<text x="213.76" y="171" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">ENQUEUES</text>
+<rect x="188.0" y="282" width="78.7" height="12" rx="2" fill="#f9f9f7"/>
+<text x="227.36" y="291" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">BATCHES OF 10</text>
+<rect x="288.8" y="216" width="62.4" height="12" rx="2" fill="#f9f9f7"/>
+<text x="320" y="225" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">5 FAILURES</text>
+<rect x="359.7" y="320" width="40.6" height="12" rx="2" fill="#f9f9f7"/>
+<text x="380" y="329" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">WRITES</text>
+<rect x="188.0" y="406" width="46.1" height="12" rx="2" fill="#f9f9f7"/>
+<text x="211.04" y="415" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">STREAMS</text>
+<rect x="188.0" y="530" width="46.1" height="12" rx="2" fill="#f9f9f7"/>
+<text x="211.04" y="539" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">PARQUET</text>
+<rect x="531.0" y="294" width="78.7" height="12" rx="2" fill="#f9f9f7"/>
+<text x="570.36" y="303" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">RECENT TRACES</text>
+<rect x="788.0" y="294" width="24.3" height="12" rx="2" fill="#f9f9f7"/>
+<text x="800.16" y="303" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">SQL</text>
+<rect x="339.7" y="568" width="40.6" height="12" rx="2" fill="#f9f9f7"/>
+<text x="360" y="577" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">SCHEMA</text>
+<!-- nodes -->
+<rect x="80" y="72" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="80" y="72" width="200" height="56" rx="6" fill="#226dc8" stroke="#226dc8" stroke-width="1" fill-opacity="0.08"/>
+<rect x="88" y="78" width="37.4" height="12" rx="2" fill="none" stroke="#226dc8" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="106.7" y="87" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">LAMBDA</text>
+<text x="180" y="106" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Ingest</text>
+<text x="180" y="120" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">auth · validate · quota</text>
+<rect x="416" y="72" width="160" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="416" y="72" width="160" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="424" y="78" width="37.4" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="442.7" y="87" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">LAMBDA</text>
+<text x="496" y="106" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Query</text>
+<text x="496" y="120" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">recent traces</text>
+<rect x="680" y="72" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="680" y="72" width="200" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="688" y="78" width="37.4" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="706.7" y="87" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">LAMBDA</text>
+<text x="780" y="106" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Analytics</text>
+<text x="780" y="120" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">cost · latency · errors</text>
+<rect x="80" y="208" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="80" y="208" width="200" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="88" y="214" width="32.5" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="104.2" y="223" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">QUEUE</text>
+<text x="180" y="246" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">SQS queue</text>
+<rect x="360" y="208" width="120" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="360" y="208" width="120" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="368" y="214" width="32.5" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="384.2" y="223" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">QUEUE</text>
+<text x="420" y="246" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Dead letters</text>
+<rect x="80" y="312" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="80" y="312" width="200" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="88" y="318" width="37.4" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="106.7" y="327" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">LAMBDA</text>
+<text x="180" y="346" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Processor</text>
+<text x="180" y="360" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">partial-batch retries</text>
+<rect x="80" y="456" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="80" y="456" width="200" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="88" y="462" width="37.4" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="106.7" y="471" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">STREAM</text>
+<text x="180" y="490" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Data Firehose</text>
+<text x="180" y="504" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">JSON → Parquet</text>
+<rect x="416" y="456" width="180" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="416" y="456" width="180" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="424" y="462" width="47.2" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="447.6" y="471" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">DYNAMODB</text>
+<text x="506" y="490" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Traces table</text>
+<text x="506" y="504" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">sharded · TTL</text>
+<rect x="680" y="456" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="680" y="456" width="200" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="688" y="462" width="32.5" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="704.2" y="471" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">QUERY</text>
+<text x="780" y="490" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Athena</text>
+<text x="780" y="504" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">1 GB scan cap</text>
+<rect x="80" y="560" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="80" y="560" width="200" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="88" y="566" width="17.8" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="96.9" y="575" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">S3</text>
+<text x="180" y="594" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Data lake</text>
+<text x="180" y="608" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">tenant_id/dt partitions</text>
+<rect x="440" y="560" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="440" y="560" width="200" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="448" y="566" width="27.6" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="461.8" y="575" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">GLUE</text>
+<text x="540" y="594" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Glue table</text>
+<text x="540" y="608" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">partition projection</text>
+<!-- legend -->
+<line x1="40" y1="680" x2="920" y2="680" stroke="rgba(11,11,11,0.10)" stroke-width="0.8"/>
+<text x="40" y="699" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.14em">LEGEND</text>
+<line x1="112" y1="696" x2="136" y2="696" stroke="#226dc8" stroke-width="1.4" marker-end="url(#data-path-arrow-accent)"/>
+<text x="144" y="699" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">WRITE PATH</text>
+<line x1="231.0" y1="696" x2="255.0" y2="696" stroke="#52514e" stroke-width="1.2" marker-end="url(#data-path-arrow)"/>
+<text x="263.0" y="699" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">READ / STREAM</text>
+<line x1="366.5" y1="696" x2="390.5" y2="696" stroke="#52514e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#data-path-arrow)"/>
+<text x="398.5" y="699" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">ON FAILURE</text>
+<rect x="489.5" y="690" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="489.5" y="690" width="20" height="12" rx="3" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<text x="517.5" y="699" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">SERVICE</text>
+<rect x="592.0" y="690" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="592.0" y="690" width="20" height="12" rx="3" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<text x="620.0" y="699" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">DATA STORE</text>
+</svg>

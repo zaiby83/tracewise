@@ -15,98 +15,24 @@ LLM observability and evaluation on serverless AWS. Apps send every model call t
 
 ## Architecture (Milestones 1–4, plus self-serve accounts)
 
-```mermaid
-flowchart TB
-    subgraph callers["1 · Who calls Tracewise"]
-        direction LR
-        SDK[SDK in your app<br/>batching, retries, redaction]
-        U[Browser<br/>dashboard and console]
-    end
+![Tracewise architecture overview: clients reach the front door, request handlers enqueue into the write pipeline, which writes to storage; nightly evaluations read storage and report to monitoring](docs/architecture/overview.svg)
 
-    subgraph front["2 · Front door"]
-        direction LR
-        CF[CloudFront<br/>security headers, 60 s API cache]
-        SITE[(S3: dashboard<br/>private, OAC)]
-        CONSOLE[(S3: console)]
-        APIGW[API Gateway<br/>HTTP API]
-        COG[Cognito user pool]
-    end
+The overview follows a trace from top to bottom. Each layer is drawn in full below.
 
-    subgraph handlers["3 · Request handlers"]
-        direction LR
-        ING[Lambda: ingest<br/>auth, validate, quota]
-        Q[Lambda: query]
-        AN[Lambda: analytics]
-        ORGS[Lambda: console API]
-    end
+**Front door and accounts**
 
-    subgraph pipeline["4 · Write pipeline"]
-        direction LR
-        SQS[(SQS)]
-        DLQ[(DLQ)]
-        PROC[Lambda: processor]
-    end
+![CloudFront serves the dashboard and console from S3 and forwards API calls to API Gateway, which the SDK calls directly; Cognito authorizes console calls, and the console API manages the accounts table and the org deleter](docs/architecture/front-door.svg)
 
-    subgraph storage["5 · Storage"]
-        direction LR
-        DDB[(DynamoDB: traces<br/>sharded, TTL)]
-        FH[Data Firehose<br/>JSON → Parquet]
-        S3[(S3 data lake<br/>tenant_id/dt partitions)]
-        GLUE[Glue table<br/>partition projection]
-        ATH[Athena workgroup<br/>1 GB scan cap]
-        ACC[(DynamoDB: accounts)]
-        DEL[SQS + Lambda: org deleter]
-    end
+**Ingest, storage and reads**
 
-    subgraph evals["6 · Nightly evaluations"]
-        direction LR
-        SCHED[EventBridge Scheduler<br/>nightly]
-        SFN[Step Functions<br/>sample → grade → record]
-        BR[Bedrock: Nova Pro judge]
-        EV[(DynamoDB: eval runs)]
-    end
+![The ingest Lambda enqueues to SQS; the processor writes to DynamoDB and streams through Firehose to the Parquet data lake catalogued by Glue; query reads DynamoDB and analytics reads the lake through Athena](docs/architecture/data-path.svg)
 
-    subgraph monitoring["7 · Monitoring and alerts"]
-        direction LR
-        CWM[CloudWatch metrics]
-        CW[CloudWatch alarms<br/>on ingest, SQS and DLQ]
-        SNS[SNS alerts]
-    end
+**Nightly evaluations and alerts**
 
-    SDK -->|HTTPS + API key| APIGW
-    U --> CF
-    CF --> SITE
-    CF -->|/console/*| CONSOLE
-    CF -->|/v1/*| APIGW
-    COG -.JWT authorizer.-> APIGW
+![EventBridge Scheduler starts a Step Functions workflow that samples traces, grades them with a Bedrock judge, records the run, publishes scores and alerts SNS on a regression; CloudWatch alarms alert through the same topic](docs/architecture/evals.svg)
 
-    APIGW --> ING
-    APIGW --> Q
-    APIGW --> AN
-    APIGW -->|/v1/orgs/*| ORGS
+Diagram sources are in [`docs/architecture/`](docs/architecture/): each `.svg` is exported from the `.html` beside it.
 
-    ING --> SQS
-    SQS --> PROC
-    SQS -.5 failures.-> DLQ
-    PROC --> DDB
-    PROC --> FH
-    FH --> S3
-    S3 --- GLUE
-
-    Q --> DDB
-    AN --> ATH --> GLUE
-    ORGS --> ACC
-    ORGS --> DEL
-
-    SCHED --> SFN
-    SFN -->|reads samples| DDB
-    SFN --> BR
-    SFN --> EV
-    SFN --> CWM
-    SFN -->|regression| SNS
-
-    CW --> SNS
-```
 
 **Highlights:**
 - **The request path only enqueues.** The ingest function authenticates, validates and sends to SQS, then returns `202`. Storage writes happen asynchronously, so bursts queue up instead of failing.

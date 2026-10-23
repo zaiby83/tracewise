@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 712" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="tracewise-overview-title tracewise-overview-desc" id="overview-root">
+<title id="tracewise-overview-title">Tracewise architecture overview</title>
+<desc id="tracewise-overview-desc">Apps and browsers reach Tracewise through CloudFront and API Gateway; request handlers enqueue traces into a write pipeline that stores them, nightly evaluations grade stored traces, and CloudWatch and SNS raise alerts.</desc>
+<defs>
+      <style>#overview-root { font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #0b0b0b; }
+      #overview-root .diagram-container { width: 100%; overflow-x: auto; }
+      @media print {
+#overview-root .diagram-container { overflow-x: visible; }
+}</style>
+<marker id="overview-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#52514e"/></marker>
+<marker id="overview-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#226dc8"/></marker>
+</defs>
+<rect width="100%" height="100%" fill="#f9f9f7"/>
+<!-- zones -->
+<!-- arrows (before boxes) -->
+<path d="M220,96 V144" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#overview-arrow-accent)"/>
+<path d="M500,96 V144" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#overview-arrow)"/>
+<path d="M360,200 V248" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#overview-arrow-accent)"/>
+<path d="M360,304 V352" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#overview-arrow-accent)"/>
+<path d="M360,408 V456" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#overview-arrow-accent)"/>
+<path d="M160,276 H152 Q144,276 144,284 V456" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#overview-arrow)"/>
+<path d="M720,484 H560" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#overview-arrow)"/>
+<path d="M820,512 V560" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#overview-arrow)"/>
+<path d="M560,380 H592 Q600,380 600,388 V476 a8,8 0 0,0 0,16 V580 Q600,588 608,588 H720" fill="none" stroke="#52514e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#overview-arrow)"/>
+<!-- arrow labels -->
+<rect x="165.9" y="114" width="46.1" height="12" rx="2" fill="#f9f9f7"/>
+<text x="188.96" y="123" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">API KEY</text>
+<rect x="368.0" y="322" width="51.5" height="12" rx="2" fill="#f9f9f7"/>
+<text x="393.76" y="331" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">ENQUEUES</text>
+<rect x="368.0" y="426" width="40.6" height="12" rx="2" fill="#f9f9f7"/>
+<text x="388.32" y="435" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">WRITES</text>
+<rect x="100.8" y="366" width="35.2" height="12" rx="2" fill="#f9f9f7"/>
+<text x="118.4" y="375" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">READS</text>
+<rect x="624.6" y="466" width="78.7" height="12" rx="2" fill="#f9f9f7"/>
+<text x="664" y="475" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">READS SAMPLES</text>
+<rect x="828.0" y="530" width="40.6" height="12" rx="2" fill="#f9f9f7"/>
+<text x="848.32" y="539" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">SCORES</text>
+<rect x="551.4" y="424" width="40.6" height="12" rx="2" fill="#f9f9f7"/>
+<text x="571.68" y="433" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">ALARMS</text>
+<!-- nodes -->
+<rect x="120" y="40" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="120" y="40" width="200" height="56" rx="6" fill="#52514e" stroke="#706e69" stroke-width="1" fill-opacity="0.10"/>
+<rect x="128" y="46" width="37.4" height="12" rx="2" fill="none" stroke="#706e69" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="146.7" y="55" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">CLIENT</text>
+<text x="220" y="74" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">SDK in your app</text>
+<text x="220" y="88" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">batches · retries · redacts</text>
+<rect x="400" y="40" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="400" y="40" width="200" height="56" rx="6" fill="#52514e" stroke="#706e69" stroke-width="1" fill-opacity="0.10"/>
+<rect x="408" y="46" width="37.4" height="12" rx="2" fill="none" stroke="#706e69" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="426.7" y="55" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">CLIENT</text>
+<text x="500" y="74" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Browser</text>
+<text x="500" y="88" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">dashboard · console</text>
+<rect x="160" y="144" width="400" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="160" y="144" width="400" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="168" y="150" width="27.6" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="181.8" y="159" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">EDGE</text>
+<text x="360" y="178" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Front door</text>
+<text x="360" y="192" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">CloudFront · API Gateway · Cognito</text>
+<rect x="160" y="248" width="400" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="160" y="248" width="400" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="168" y="254" width="22.7" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="179.3" y="263" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">API</text>
+<text x="360" y="282" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Request handlers</text>
+<text x="360" y="296" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">ingest · query · analytics · console API</text>
+<rect x="160" y="352" width="400" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="160" y="352" width="400" height="56" rx="6" fill="#226dc8" stroke="#226dc8" stroke-width="1" fill-opacity="0.08"/>
+<rect x="168" y="358" width="32.5" height="12" rx="2" fill="none" stroke="#226dc8" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="184.2" y="367" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">QUEUE</text>
+<text x="360" y="386" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Write pipeline</text>
+<text x="360" y="400" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">SQS → processor · dead-letter queue</text>
+<rect x="120" y="456" width="440" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="120" y="456" width="440" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="128" y="462" width="27.6" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="141.8" y="471" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">DATA</text>
+<text x="340" y="490" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Storage</text>
+<text x="340" y="504" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">DynamoDB · S3 data lake · Glue · Athena</text>
+<rect x="720" y="456" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="720" y="456" width="200" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="728" y="462" width="22.7" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="739.4" y="471" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">JOB</text>
+<text x="820" y="490" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Nightly evaluations</text>
+<text x="820" y="504" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">Step Functions · Bedrock</text>
+<rect x="720" y="560" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="720" y="560" width="200" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="728" y="566" width="22.7" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="739.4" y="575" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">OPS</text>
+<text x="820" y="594" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Monitoring and alerts</text>
+<text x="820" y="608" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">CloudWatch · SNS</text>
+<!-- legend -->
+<line x1="40" y1="664" x2="920" y2="664" stroke="rgba(11,11,11,0.10)" stroke-width="0.8"/>
+<text x="40" y="683" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.14em">LEGEND</text>
+<line x1="112" y1="680" x2="136" y2="680" stroke="#226dc8" stroke-width="1.4" marker-end="url(#overview-arrow-accent)"/>
+<text x="144" y="683" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">INGEST PATH</text>
+<line x1="236.5" y1="680" x2="260.5" y2="680" stroke="#52514e" stroke-width="1.2" marker-end="url(#overview-arrow)"/>
+<text x="268.5" y="683" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">CALL / READ</text>
+<line x1="361.0" y1="680" x2="385.0" y2="680" stroke="#52514e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#overview-arrow)"/>
+<text x="393.0" y="683" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">ALARM</text>
+<rect x="456.5" y="674" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="456.5" y="674" width="20" height="12" rx="3" fill="#52514e" stroke="#706e69" stroke-width="1" fill-opacity="0.10"/>
+<text x="484.5" y="683" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">CLIENT</text>
+<rect x="553.5" y="674" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="553.5" y="674" width="20" height="12" rx="3" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<text x="581.5" y="683" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">SERVICE</text>
+<rect x="656.0" y="674" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="656.0" y="674" width="20" height="12" rx="3" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<text x="684.0" y="683" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">DATA STORE</text>
+</svg>

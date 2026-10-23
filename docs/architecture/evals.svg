@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 504" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="tracewise-evals-title tracewise-evals-desc" id="evals-root">
+<title id="tracewise-evals-title">Tracewise nightly evaluations and alerts</title>
+<desc id="tracewise-evals-desc">Each night EventBridge Scheduler starts a Step Functions workflow that samples traces from DynamoDB, grades them with a Bedrock judge, stores the run and publishes scores to CloudWatch, alerting through SNS on a regression; CloudWatch alarms on the ingest path alert through the same topic.</desc>
+<defs>
+      <style>#evals-root { font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #0b0b0b; }
+      #evals-root .diagram-container { width: 100%; overflow-x: auto; }
+      @media print {
+#evals-root .diagram-container { overflow-x: visible; }
+}</style>
+<marker id="evals-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#52514e"/></marker>
+<marker id="evals-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#226dc8"/></marker>
+</defs>
+<rect width="100%" height="100%" fill="#f9f9f7"/>
+<!-- zones -->
+<!-- arrows (before boxes) -->
+<path d="M380,96 V144" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#evals-arrow)"/>
+<path d="M280,172 H184" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#evals-arrow)"/>
+<path d="M480,158 H576" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#evals-arrow)"/>
+<path d="M330,200 V216 Q330,224 322,224 H184 Q176,224 176,232 V248" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#evals-arrow)"/>
+<path d="M380,200 V248" fill="none" stroke="#52514e" stroke-width="1.2" marker-end="url(#evals-arrow)"/>
+<path d="M480,186 H528 Q536,186 536,194 V352" fill="none" stroke="#226dc8" stroke-width="1.4" marker-end="url(#evals-arrow-accent)"/>
+<path d="M720,304 V372 Q720,380 712,380 H616" fill="none" stroke="#52514e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#evals-arrow)"/>
+<!-- arrow labels -->
+<rect x="388.0" y="114" width="46.1" height="12" rx="2" fill="#f9f9f7"/>
+<text x="411.04" y="123" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">NIGHTLY</text>
+<rect x="192.6" y="152" width="78.7" height="12" rx="2" fill="#f9f9f7"/>
+<text x="232" y="161" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">READS SAMPLES</text>
+<rect x="507.7" y="138" width="40.6" height="12" rx="2" fill="#f9f9f7"/>
+<text x="528" y="147" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">GRADES</text>
+<rect x="219.1" y="204" width="67.8" height="12" rx="2" fill="#f9f9f7"/>
+<text x="253" y="213" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">RECORDS RUN</text>
+<rect x="388.0" y="218" width="40.6" height="12" rx="2" fill="#f9f9f7"/>
+<text x="408.32" y="227" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">SCORES</text>
+<rect x="544.0" y="294" width="62.4" height="12" rx="2" fill="#f9f9f7"/>
+<text x="575.2" y="303" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">REGRESSION</text>
+<rect x="650.4" y="360" width="35.2" height="12" rx="2" fill="#f9f9f7"/>
+<text x="668" y="369" fill="#706e69" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.06em">ALARM</text>
+<!-- nodes -->
+<rect x="280" y="40" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="280" y="40" width="200" height="56" rx="6" fill="#52514e" stroke="#706e69" stroke-width="1" fill-opacity="0.10"/>
+<rect x="288" y="46" width="47.2" height="12" rx="2" fill="none" stroke="#706e69" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="311.6" y="55" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">SCHEDULE</text>
+<text x="380" y="74" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">EventBridge Scheduler</text>
+<text x="380" y="88" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">nightly</text>
+<rect x="280" y="144" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="280" y="144" width="200" height="56" rx="6" fill="#226dc8" stroke="#226dc8" stroke-width="1" fill-opacity="0.08"/>
+<rect x="288" y="150" width="47.2" height="12" rx="2" fill="none" stroke="#226dc8" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="311.6" y="159" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">WORKFLOW</text>
+<text x="380" y="178" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Step Functions</text>
+<text x="380" y="192" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">sample → grade → record</text>
+<rect x="40" y="144" width="144" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="40" y="144" width="144" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="48" y="150" width="47.2" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="71.6" y="159" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">DYNAMODB</text>
+<text x="112" y="178" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Traces table</text>
+<text x="112" y="192" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">sampled calls</text>
+<rect x="576" y="144" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="576" y="144" width="200" height="56" rx="6" fill="#0b0b0b" stroke="rgba(11,11,11,0.30)" stroke-width="1" fill-opacity="0.03"/>
+<rect x="584" y="150" width="42.3" height="12" rx="2" fill="none" stroke="rgba(11,11,11,0.30)" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="605.1" y="159" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">BEDROCK</text>
+<text x="676" y="178" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">AI judge</text>
+<text x="676" y="192" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">Nova Pro · tenant rubric</text>
+<rect x="96" y="248" width="160" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="96" y="248" width="160" height="56" rx="6" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<rect x="104" y="254" width="47.2" height="12" rx="2" fill="none" stroke="#52514e" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="127.6" y="263" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">DYNAMODB</text>
+<text x="176" y="282" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Eval runs</text>
+<text x="176" y="296" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">scores per run</text>
+<rect x="292" y="248" width="180" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="292" y="248" width="180" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="300" y="254" width="57.0" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="328.5" y="263" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">CLOUDWATCH</text>
+<text x="382" y="282" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">CloudWatch metrics</text>
+<text x="382" y="296" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">per tenant</text>
+<rect x="620" y="248" width="200" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="620" y="248" width="200" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="628" y="254" width="57.0" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="656.5" y="263" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">CLOUDWATCH</text>
+<text x="720" y="282" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">CloudWatch alarms</text>
+<text x="720" y="296" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">ingest · SQS · DLQ</text>
+<rect x="456" y="352" width="160" height="56" rx="6" fill="#f9f9f7"/>
+<rect x="456" y="352" width="160" height="56" rx="6" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<rect x="464" y="358" width="22.7" height="12" rx="2" fill="none" stroke="#0b0b0b" stroke-opacity="0.5" stroke-width="0.8"/>
+<text x="475.4" y="367" fill="#52514e" font-size="7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle" letter-spacing="0.08em">SNS</text>
+<text x="536" y="386" fill="#0b0b0b" font-size="12" font-weight="600" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" text-anchor="middle">Alerts topic</text>
+<text x="536" y="400" fill="#52514e" font-size="9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">email, if set</text>
+<!-- legend -->
+<line x1="40" y1="456" x2="920" y2="456" stroke="rgba(11,11,11,0.10)" stroke-width="0.8"/>
+<text x="40" y="475" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.14em">LEGEND</text>
+<line x1="112" y1="472" x2="136" y2="472" stroke="#226dc8" stroke-width="1.4" marker-end="url(#evals-arrow-accent)"/>
+<text x="144" y="475" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">REGRESSION ALERT</text>
+<line x1="264.0" y1="472" x2="288.0" y2="472" stroke="#52514e" stroke-width="1.2" marker-end="url(#evals-arrow)"/>
+<text x="296.0" y="475" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">WORKFLOW STEP</text>
+<line x1="399.5" y1="472" x2="423.5" y2="472" stroke="#52514e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#evals-arrow)"/>
+<text x="431.5" y="475" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">ALARM</text>
+<rect x="495.0" y="466" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="495.0" y="466" width="20" height="12" rx="3" fill="#52514e" stroke="#706e69" stroke-width="1" fill-opacity="0.10"/>
+<text x="523.0" y="475" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">TRIGGER</text>
+<rect x="597.5" y="466" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="597.5" y="466" width="20" height="12" rx="3" fill="#ffffff" stroke="#0b0b0b" stroke-width="1"/>
+<text x="625.5" y="475" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">SERVICE</text>
+<rect x="700.0" y="466" width="20" height="12" rx="3" fill="#f9f9f7"/>
+<rect x="700.0" y="466" width="20" height="12" rx="3" fill="#0b0b0b" stroke="#52514e" stroke-width="1" fill-opacity="0.05"/>
+<text x="728.0" y="475" fill="#52514e" font-size="8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" letter-spacing="0.06em">DATA STORE</text>
+</svg>
