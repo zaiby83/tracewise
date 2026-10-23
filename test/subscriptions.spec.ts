@@ -1,4 +1,4 @@
-import { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import type Stripe from "stripe";
 import { describe, expect, it, vi } from "vitest";
 
@@ -7,7 +7,7 @@ vi.mock("../services/shared/ddb", () => ({ ddb }));
 process.env.ACCOUNTS_TABLE = "accounts";
 
 const { PLANS } = await import("../services/billing/plans");
-const { applySubscription, clearFlushDue, completeEvent, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce, setSpendCap } = await import(
+const { applySubscription, clearFlushDue, completeEvent, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce, rememberCustomer, setSpendCap } = await import(
 	"../services/billing/subscriptions"
 );
 
@@ -487,5 +487,28 @@ describe("setSpendCap", () => {
 		await expect(setSpendCap("o1", "team", 10)).rejects.toThrow("tx");
 		setup({ txError: new Error("throttled") });
 		await expect(setSpendCap("o1", "team", 10)).rejects.toThrow("throttled");
+	});
+});
+
+describe("rememberCustomer", () => {
+	const update = () => ddb.send.mock.calls.map(([c]) => c).find((c) => c instanceof UpdateCommand) as UpdateCommand;
+	it("records the customer only if BILLING has none, creating an inert item when the webhook has not", async () => {
+		ddb.send.mockReset().mockResolvedValue({ Attributes: { customer_id: "cus_1" } });
+		await expect(rememberCustomer("o1", "cus_1")).resolves.toBe("cus_1");
+		const { input } = update();
+		expect(input.Key).toEqual({ pk: "ORG#o1", sk: "BILLING" });
+		expect(input.UpdateExpression).toContain("customer_id = if_not_exists(customer_id, :cus)");
+		// Nothing that overwrites what the webhook or the console wrote: every field but org_id is only initialised.
+		const assignments = String(input.UpdateExpression).replace(/^SET /, "").replace(/if_not_exists\([^)]*\)/g, "INIT").split(", ");
+		expect(assignments.filter((x) => !x.endsWith("= INIT"))).toEqual(["org_id = :org"]);
+		expect(input.ExpressionAttributeValues).toMatchObject({ ":cus": "cus_1", ":org": "o1", ":none": "none", ":free": "free", ":null": null, ":zero": 0 });
+		expect(input.ReturnValues).toBe("ALL_NEW");
+		// Status "none" and no subscription: not live, so the meter and the stale-subscription guard skip it.
+		expect(input.UpdateExpression).toContain("#s = if_not_exists(#s, :none)");
+		expect(input.UpdateExpression).toContain("subscription_id = if_not_exists(subscription_id, :null)");
+	});
+	it("returns the id that was already recorded when another checkout won", async () => {
+		ddb.send.mockReset().mockResolvedValue({ Attributes: { customer_id: "cus_winner" } });
+		await expect(rememberCustomer("o1", "cus_mine")).resolves.toBe("cus_winner");
 	});
 });

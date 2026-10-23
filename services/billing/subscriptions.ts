@@ -277,11 +277,34 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 	return { plan, periodChanged, previous, applied: true };
 }
 
+// One Stripe customer per org from the first Checkout on: records the customer on BILLING (creating the item
+// if the webhook hasn't yet) unless one is already there, and returns whichever id won, so two racing
+// checkouts end up on the same customer. The item is created in a state nothing treats as live (status
+// "none", no subscription), so the meter, the webhook's stale-subscription guard and the plan logic skip it.
+export async function rememberCustomer(orgId: string, customerId: string): Promise<string> {
+	const { Attributes } = await ddb.send(
+		new UpdateCommand({
+			TableName: table(),
+			Key: billingKey(orgId),
+			UpdateExpression:
+				"SET customer_id = if_not_exists(customer_id, :cus), org_id = :org, #s = if_not_exists(#s, :none), #p = if_not_exists(#p, :free), " +
+				"subscription_id = if_not_exists(subscription_id, :null), current_period_start = if_not_exists(current_period_start, :null), " +
+				"current_period_end = if_not_exists(current_period_end, :null), cancel_at_period_end = if_not_exists(cancel_at_period_end, :false), " +
+				"spend_cap_usd = if_not_exists(spend_cap_usd, :null), past_due_since = if_not_exists(past_due_since, :null), " +
+				"reported_events = if_not_exists(reported_events, :zero), reported_period = if_not_exists(reported_period, :null)",
+			ExpressionAttributeNames: { "#s": "status", "#p": "plan" },
+			ExpressionAttributeValues: { ":cus": customerId, ":org": orgId, ":none": "none", ":free": "free", ":null": null, ":false": false, ":zero": 0 },
+			ReturnValues: "ALL_NEW",
+		}),
+	);
+	return (Attributes?.customer_id as string | undefined) ?? customerId;
+}
+
 // The console's spend cap: BILLING keeps the cap and PROFILE the monthly limit derived from it, written together
 // so ingest never enforces a limit the cap no longer matches. Conditioned on the plan the caller read, so a
 // downgrade that landed meanwhile isn't overwritten with a paid limit. False means a condition failed (the
 // plan moved, or there is no BILLING item) and the caller should re-read.
-export async function setSpendCap(orgId: string, plan: Exclude<PlanId, "free">, capUsd: number | null): Promise<boolean> {
+export async function setSpendCap(orgId: string, plan: "team" | "pro", capUsd: number | null): Promise<boolean> {
 	try {
 		await ddb.send(
 			new TransactWriteCommand({
