@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tracewise pricing</title>
+<meta name="description" content="Tracewise plans: Free, Team and Pro, billed monthly, with extra events billed per 100,000.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232a78d6'/%3E%3Cpath d='M7 20l5-6 4 4 6-8 3 3' stroke='%23fff' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="bar">
+	<div class="bar-inner">
+		<a class="brand" href="./" aria-label="Tracewise home">
+			<svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M7 20l5-6 4 4 6-8 3 3"/></svg>
+			<span>Tracewise</span>
+		</a>
+		<div class="bar-right">
+			<a class="button" href="./">Demo</a>
+			<a class="button primary" href="console/index.html">Open the console</a>
+		</div>
+	</div>
+</header>
+
+<main>
+	<section class="hero">
+		<p class="eyebrow">Pricing</p>
+		<h1>Pay for the events you send</h1>
+		<p class="lede">Every plan includes the dashboard, nightly answer scoring and the API. Plans are billed monthly, in US dollars.</p>
+		<div class="pricing-actions">
+			<a class="button primary" href="console/index.html">Start for free</a>
+		</div>
+	</section>
+
+	<section class="card plans-card" aria-label="Plan comparison">
+		<div class="table-wrap">
+			<table class="plans" id="plans">
+				<thead>
+					<tr><th scope="col"><span class="visually-hidden">Plan</span></th><th scope="col">Free</th><th scope="col">Team</th><th scope="col">Pro</th><th scope="col">Enterprise</th></tr>
+				</thead>
+				<tbody>
+					<tr><th scope="row">Price</th><td>$0</td><td>$29/mo</td><td>$199/mo</td><td>Contact us</td></tr>
+					<tr><th scope="row">Included events</th><td>50,000</td><td>500,000</td><td>5,000,000</td><td>Custom</td></tr>
+					<tr><th scope="row">Extra events</th><td>&mdash;</td><td>$5 per 100k</td><td>$3 per 100k</td><td>Custom</td></tr>
+					<tr><th scope="row">Judge samples per night</th><td>20</td><td>100</td><td>500</td><td>Custom</td></tr>
+					<tr><th scope="row">Hot retention</th><td>7 days</td><td>30 days</td><td>90 days</td><td>Custom</td></tr>
+					<tr><th scope="row">Events per minute</th><td>600</td><td>6,000</td><td>30,000</td><td>Custom</td></tr>
+					<tr><th scope="row">Members</th><td>2</td><td>10</td><td>50</td><td>Custom</td></tr>
+				</tbody>
+			</table>
+		</div>
+	</section>
+
+	<ul class="pricing-notes">
+		<li>An event is one AI model call sent to Tracewise. Allowances are counted per billing period, and Free uses the calendar month (UTC).</li>
+		<li>Free is a hard cap: once a month's 50,000 events are used, ingest returns HTTP 429 until the next month starts.</li>
+		<li>Team and Pro keep accepting events after the allowance and bill the extra events at the rate shown. You can set a spend cap in the console to stop at an amount you choose.</li>
+		<li>Free organizations share a pool of nightly judge samples. Team and Pro each get their own.</li>
+		<li>Hot retention is how long traces stay available to query.</li>
+		<li>Taxes are added at checkout where they apply. Enterprise plans are set up by hand to fit your needs.</li>
+	</ul>
+</main>
+
+<footer>
+	<p><a href="./">Tracewise</a> &middot; <a href="console/index.html">Console</a></p>
+</footer>
+</body>
+</html>

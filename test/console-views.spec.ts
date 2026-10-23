@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { FREE_LIMITS } from "../services/shared/accounts";
 import { curlQuickstart } from "../dashboard/console/views/overview.js";
 import { usageRows } from "../dashboard/console/views/usage.js";
+import { PLAN_DETAILS, billingSummary } from "../dashboard/console/views/billing.js";
+import { bannersFor } from "../dashboard/console/banners.js";
+import { PLANS } from "../services/billing/plans";
 
 describe("console view helpers", () => {
 	it("builds a working curl quickstart", () => {
@@ -19,13 +22,74 @@ describe("console view helpers", () => {
 	});
 
 	it("lists usage against every limit, with what happens at the cap", () => {
-		// Explicit fixture: the view still reads events_per_day until Task 11 updates it.
-		const limits = { ...FREE_LIMITS, events_per_day: 50_000, max_keys: 10, max_members: 5, max_pending_invites: 10 };
-		const rows = usageRows({ limits, used: { events_this_minute: 1, events_today: 2, analytics_queries_today: 3, eval_samples_last_night: 4, keys: 1, members: 1, pending_invites: 0 } });
-		expect(rows.map((r) => r.label)).toEqual(["Events this minute", "Events today", "Analytics queries today", "Eval samples last night", "Keys", "Members", "Pending invites"]);
+		const limits = { ...FREE_LIMITS, max_keys: 10, max_members: 5, max_pending_invites: 10 };
+		const used = { events_this_minute: 1, events_this_period: 2, analytics_queries_today: 3, eval_samples_last_night: 4, keys: 1, members: 1, pending_invites: 0 };
+		const rows = usageRows({ limits, used, plan: "free", included: 50_000 });
+		expect(rows.map((r) => r.label)).toEqual(["Events this minute", "Events this period", "Analytics queries today", "Eval samples last night", "Keys", "Members", "Pending invites"]);
 		expect(rows[1]).toMatchObject({ used: 2, limit: 50_000 });
-		expect(rows[1]!.note).toBe("Ingest returns 429 until UTC midnight");
+		expect(rows[1]!.note).toBe("Ingest returns 429 until the period ends");
 		expect(rows.map((r) => r.limit)).toEqual([600, 50_000, 200, 20, 10, 5, 10]);
 		expect(rows.every((r) => r.note.length > 0)).toBe(true);
+	});
+
+	it("shows a paid plan's period events against what it includes, and says overage is billed", () => {
+		const limits = { ...PLANS.team.limits, monthly_events: null };
+		const used = { events_this_minute: 1, events_this_period: 650_000, analytics_queries_today: 0, eval_samples_last_night: 0, keys: 1, members: 1, pending_invites: 0 };
+		const row = usageRows({ limits, used, plan: "team", included: 500_000 })[1]!;
+		expect(row).toMatchObject({ label: "Events this period", used: 650_000, limit: 500_000, note: "Paid plans keep accepting events and bill overage" });
+		// A spend cap turns the allowance into a ceiling, and ingest stops there.
+		const capped = usageRows({ limits: { ...limits, monthly_events: 900_000 }, used, plan: "team", included: 500_000 })[1]!;
+		expect(capped.limit).toBe(900_000);
+		expect(capped.note).toBe("Ingest returns 429 once your spend cap is reached");
+	});
+});
+
+describe("billing screen helpers", () => {
+	const team = { plan: "team", status: "active", events_this_period: 650_000, included_events: 500_000, estimated_overage_usd: 7.5, spend_cap_usd: null, current_period_end: "2026-11-15T00:00:00Z", cancel_at_period_end: false };
+
+	it("summarises a paid plan's usage and overage", () => {
+		expect(billingSummary(team)).toMatchObject({ planLabel: "Team", overageLine: expect.stringContaining("$7.50") });
+		expect(billingSummary(team).usageLine).toBe("650,000 of 500,000 events this period");
+		expect(billingSummary(team).renewalLine).toBe("Renews on Nov 15, 2026");
+		expect(billingSummary({ ...team, cancel_at_period_end: true }).renewalLine).toBe("Cancels on Nov 15, 2026");
+		expect(billingSummary({ ...team, estimated_overage_usd: 0 }).overageLine).toBeNull();
+	});
+
+	it("summarises free and custom orgs, which have no subscription", () => {
+		const free = billingSummary({ plan: "free", status: "none", events_this_period: 41_000, included_events: 50_000, estimated_overage_usd: 0, spend_cap_usd: null, current_period_end: null, cancel_at_period_end: null });
+		expect(free).toMatchObject({ planLabel: "Free", usageLine: "41,000 of 50,000 events this period", overageLine: null });
+		expect(free.renewalLine).toMatch(/first of each month/);
+		const custom = billingSummary({ plan: "custom", status: "none", events_this_period: 9, included_events: null, estimated_overage_usd: 0, spend_cap_usd: null, current_period_end: null, cancel_at_period_end: null });
+		expect(custom).toMatchObject({ planLabel: "Custom", usageLine: "9 events this period", overageLine: null });
+	});
+
+	it("shows the same plan cards the code enforces", () => {
+		for (const id of ["team", "pro"] as const) {
+			expect(PLAN_DETAILS[id]).toEqual({ name: PLANS[id].name, price_usd: PLANS[id].price_usd, included_events: PLANS[id].included_events, overage_per_100k_usd: PLANS[id].overage_per_100k_usd, retention_days: PLANS[id].retention_days, max_members: PLANS[id].limits.max_members });
+		}
+	});
+
+	it("raises the right banners", () => {
+		expect(bannersFor({ plan: "free", events_this_period: 41_000, included_events: 50_000 }, {}).map((b) => b.kind)).toEqual(["warn"]);
+		expect(bannersFor({ plan: "team", past_due: true, events_this_period: 0, included_events: 500_000 }, {}).map((b) => b.kind)).toEqual(["danger"]);
+		expect(bannersFor({ plan: "free", events_this_period: 10, included_events: 50_000 }, {})).toEqual([]);
+		expect(bannersFor(null, null)).toEqual([]);
+	});
+
+	it("tells a free org it has hit the cap, and a paid org it is being billed for overage", () => {
+		const free = bannersFor({ plan: "free", events_this_period: 50_000, included_events: 50_000 }, {});
+		expect(free).toEqual([{ kind: "danger", text: expect.stringContaining("429") }]);
+		const paid = bannersFor({ plan: "team", events_this_period: 500_000, included_events: 500_000, estimated_overage_usd: 0, spend_cap_usd: null }, {});
+		expect(paid.map((b) => b.kind)).toEqual(["info"]);
+		expect(bannersFor({ plan: "pro", events_this_period: 4_100_000, included_events: 5_000_000 }, {}).map((b) => b.kind)).toEqual(["warn"]);
+	});
+
+	it("flags a reached spend cap, but not a cap of zero that has not been touched", () => {
+		const capped = { plan: "team", events_this_period: 900_000, included_events: 500_000, estimated_overage_usd: 20, spend_cap_usd: 20 };
+		expect(bannersFor(capped, {}).map((b) => b.kind)).toEqual(["danger"]);
+		expect(bannersFor(capped, { limits: { monthly_events: 900_000 } }).map((b) => b.kind)).toEqual(["danger"]);
+		// Over the allowance but under the ceiling the usage endpoint reports.
+		expect(bannersFor({ ...capped, estimated_overage_usd: 10, events_this_period: 700_000 }, { limits: { monthly_events: 900_000 } }).map((b) => b.kind)).toEqual(["info"]);
+		expect(bannersFor({ plan: "team", events_this_period: 100, included_events: 500_000, estimated_overage_usd: 0, spend_cap_usd: 0 }, {})).toEqual([]);
 	});
 });

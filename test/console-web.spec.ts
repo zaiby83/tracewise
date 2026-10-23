@@ -85,6 +85,10 @@ describe("console routes", () => {
 		expect(parseHash("#/team")).toEqual({ view: "team" });
 		expect(parseHash("#/usage")).toEqual({ view: "usage" });
 		expect(parseHash("#/settings")).toEqual({ view: "settings" });
+		expect(parseHash("#/billing")).toEqual({ view: "billing" });
+		// Checkout returns to #/billing?checkout=success; the query is part of the fragment.
+		expect(parseHash("#/billing?checkout=success")).toEqual({ view: "billing", param: "success" });
+		expect(parseHash("#/billing?checkout=other")).toEqual({ view: "billing" });
 		expect(parseHash("#/orgs/new")).toEqual({ view: "orgs-new" });
 		expect(parseHash("#/invite/abc_DEF-1")).toEqual({ view: "invite", param: "abc_DEF-1" });
 		expect(parseHash("#/invite/")).toEqual({ view: "overview" });

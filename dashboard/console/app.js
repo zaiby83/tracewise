@@ -5,6 +5,7 @@
 import { $, el, storage } from "../shared/dom.js";
 import { AuthError, createApi } from "./api.js";
 import { decodeJwt, handleCallback, idToken, prepareSignIn, signOut } from "./auth.js";
+import { bannersFor } from "./banners.js";
 import { parseHash } from "./router.js";
 
 const ORG_KEY = "tw_org";
@@ -19,6 +20,7 @@ const NAV = [
 	["keys", "#/keys", "API keys"],
 	["team", "#/team", "Team"],
 	["usage", "#/usage", "Usage"],
+	["billing", "#/billing", "Billing"],
 	["settings", "#/settings", "Settings"],
 ];
 
@@ -32,6 +34,7 @@ let signedIn = false;
 let renderId = 0;
 let signedOutId = 0;
 let dropping = null;
+let bannerId = 0;
 
 // ---- Theme ------------------------------------------------------------------------------
 
@@ -53,6 +56,7 @@ function chrome(on) {
 	if (!on) {
 		$("org-switch").hidden = true;
 		$("nav").hidden = true;
+		showBanners([]);
 	}
 }
 
@@ -111,7 +115,33 @@ function renderHeader() {
 
 function renderNav(view) {
 	$("nav").hidden = !org;
-	$("nav-links").replaceChildren(...NAV.map(([name, href, label]) => el("a", { href, "aria-current": name === view ? "page" : null }, label)));
+	// Pricing is a public page beside the console, so it is a plain link rather than a route.
+	$("nav-links").replaceChildren(...NAV.map(([name, href, label]) => el("a", { href, "aria-current": name === view ? "page" : null }, label)), el("a", { href: "../pricing.html" }, "Pricing"));
+}
+
+// ---- Plan banners -----------------------------------------------------------------------
+
+function showBanners(banners) {
+	const onBilling = parseHash(location.hash).view === "billing";
+	$("banners").hidden = !banners.length;
+	$("banners").replaceChildren(
+		...banners.map((b) => el("div", { class: `banner ${b.kind}`, role: b.kind === "danger" ? "alert" : "status" }, el("span", {}, b.text), onBilling ? null : el("a", { class: "button", href: "#/billing" }, "View billing"))),
+	);
+}
+
+// Looks at the current org's billing and shows what bannersFor says. A failure just means no banner:
+// the screen underneath reports its own errors. Only the newest call may show anything, so a slow
+// answer for an org you've left can't land on the one you're in.
+async function refreshBanners() {
+	const mine = ++bannerId;
+	const target = org;
+	let banners = [];
+	if (target && signedIn) {
+		try {
+			banners = bannersFor(await api.get(`/v1/orgs/${target.org_id}/billing`), null);
+		} catch {}
+	}
+	if (mine === bannerId && signedIn) showBanners(banners);
 }
 
 // A view got a 404 for the current org. If the list says the org is gone (deleted, or the
@@ -170,12 +200,13 @@ async function route() {
 	// Without an org there is nothing to show but creating one (or accepting an invitation).
 	if (!org && view !== "orgs-new" && view !== "invite") view = "orgs-new";
 	renderNav(view);
+	refreshBanners();
 	const root = el("div", { class: "view" });
 	$("view").replaceChildren(root);
 	try {
 		const mod = await import(`./views/${view}.js`);
 		if (id !== renderId) return;
-		await mod.render(root, { api, org, orgs, me, navigate, refreshOrgs, param });
+		await mod.render(root, { api, org, orgs, me, navigate, refreshOrgs, refreshBanners, param });
 	} catch (err) {
 		// A newer navigation replaced this view, or the session ended (the guard already showed sign-in).
 		if (id !== renderId || err instanceof AuthError) return;
