@@ -1,7 +1,9 @@
 import { App } from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { beforeAll, describe, expect, it } from "vitest";
+import { PLANS } from "../../services/billing/plans";
 import { CONSOLE_ROUTES, JWT_DATA_ROUTES } from "../../services/console/route-keys";
+import { MAX_RETENTION_DAYS } from "../../services/shared/keys";
 import { TracewiseStack } from "../lib/tracewise-stack";
 
 // Assertions on the synthesized CloudFormation: the guarantees the design doc makes
@@ -18,6 +20,32 @@ const TOUCH_KEY_CONDITION = { "ForAllValues:StringEquals": { "dynamodb:Attribute
 // The IAM policies attached to the roles whose logical IDs match.
 const policiesFor = (re: RegExp) =>
 	Object.values(template.findResources("AWS::IAM::Policy")).filter((p) => re.test(JSON.stringify(p.Properties.Roles)));
+
+// The IAM policies that grant an action, and the role (logical ID) each is attached to.
+const policiesMentioning = (action: string) =>
+	Object.values(template.findResources("AWS::IAM::Policy")).filter((p) => JSON.stringify(p.Properties.PolicyDocument).includes(`"${action}"`));
+const rolesOf = (p: ReturnType<typeof policiesMentioning>[number]) => (p.Properties.Roles as { Ref: string }[]).map((r) => r.Ref).join(",");
+
+const routeByKey = (key: string) =>
+	Object.values(template.findResources("AWS::ApiGatewayV2::Route"))
+		.map((r) => r.Properties)
+		.find((r) => r.RouteKey === key);
+
+// Our functions by logical ID; CDK's own custom-resource provider functions are excluded.
+const ownFunctions = () => Object.entries(template.findResources("AWS::Lambda::Function")).filter(([id]) => !id.startsWith("Custom"));
+const functionNamed = (re: RegExp) => {
+	const matches = ownFunctions().filter(([id]) => re.test(id));
+	expect(matches, String(re)).toHaveLength(1);
+	return matches[0]!;
+};
+
+const BILLING_ROUTES = [
+	"GET /v1/orgs/{orgId}/billing",
+	"POST /v1/orgs/{orgId}/billing/checkout",
+	"POST /v1/orgs/{orgId}/billing/portal",
+	"POST /v1/orgs/{orgId}/billing/change",
+	"PATCH /v1/orgs/{orgId}/billing",
+];
 
 describe("TracewiseStack", () => {
 	it("encrypts every table and expires hot data with TTL", () => {
@@ -52,10 +80,8 @@ describe("TracewiseStack", () => {
 
 	it("runs every function on Graviton with X-Ray tracing", () => {
 		// Our functions only: CDK's own custom-resource provider functions are excluded.
-		const fns = Object.entries(template.findResources("AWS::Lambda::Function"))
-			.filter(([id]) => !id.startsWith("Custom"))
-			.map(([, f]) => f);
-		expect(fns).toHaveLength(11);
+		const fns = ownFunctions().map(([, f]) => f);
+		expect(fns).toHaveLength(13);
 		for (const f of fns) {
 			expect(f.Properties.Architectures).toEqual(["arm64"]);
 			expect(f.Properties.TracingConfig).toEqual({ Mode: "Active" });
@@ -68,8 +94,8 @@ describe("TracewiseStack", () => {
 		expect(JSON.stringify(policies[0])).not.toMatch(/Traces/);
 	});
 
-	it("alarms on dead letters, backlog, ingest errors, failed deletions, global caps and failed eval runs, and emails them", () => {
-		template.resourceCountIs("AWS::CloudWatch::Alarm", 7);
+	it("alarms on dead letters, backlog, ingest errors, failed deletions, global caps, failed eval runs and billing, and emails them", () => {
+		template.resourceCountIs("AWS::CloudWatch::Alarm", 10);
 		for (const cap of ["orgs", "judge"])
 			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
 				Namespace: "Tracewise/Limits",
@@ -310,5 +336,126 @@ describe("TracewiseStack", () => {
 		});
 		template.hasResourceProperties("AWS::Lambda::EventSourceMapping", { BatchSize: 1, FunctionResponseTypes: ["ReportBatchItemFailures"] });
 		template.hasResourceProperties("AWS::Lambda::Function", { Timeout: 60, Environment: { Variables: Match.objectLike({ LAKE_BUCKET: Match.anyValue(), DELETION_QUEUE_URL: Match.anyValue() }) } });
+	});
+	describe("billing", () => {
+		it("leaves the Stripe webhook public and puts every billing route behind the JWT authorizer", () => {
+			const webhook = routeByKey("POST /v1/stripe/webhook");
+			expect(webhook).toBeDefined();
+			expect(webhook?.AuthorizationType ?? "NONE").toBe("NONE");
+			// Stripe signs the body; the handler verifies that instead of a token.
+			expect(JSON.stringify(template.findResources("AWS::ApiGatewayV2::Integration"))).toMatch(/BillingWebhook/);
+			expect(CONSOLE_ROUTES).toHaveLength(21);
+			for (const k of BILLING_ROUTES) {
+				expect(CONSOLE_ROUTES as readonly string[]).toContain(k);
+				expect(routeByKey(k), k).toMatchObject({ AuthorizationType: "JWT" });
+			}
+		});
+
+		it("keeps the Stripe keys in a retained secret, created with placeholders", () => {
+			const secrets = template.findResources("AWS::SecretsManager::Secret");
+			expect(Object.keys(secrets)).toHaveLength(1);
+			const [secret] = Object.values(secrets);
+			expect(secret!.Properties.Name).toBe("tracewise/stripe");
+			// A redeploy or a stack deletion must never take the keys an operator put in.
+			expect(secret!.DeletionPolicy).toBe("Retain");
+			expect(secret!.UpdateReplacePolicy).toBe("Retain");
+			expect(JSON.parse(secret!.Properties.GenerateSecretString.SecretStringTemplate)).toEqual({ secret_key: "replace-me", webhook_secret: "replace-me" });
+			expect(secret!.Properties.SecretString).toBeUndefined();
+		});
+
+		it("lets only the billing and console functions read the Stripe secret", () => {
+			const readers = policiesMentioning("secretsmanager:GetSecretValue").map(rolesOf);
+			expect(readers.sort()).toEqual([expect.stringMatching(/BillingMeter/), expect.stringMatching(/BillingWebhook/), expect.stringMatching(/ConsoleFn/)]);
+			// The data plane, the deleter and every eval step (the regexes must each find a role, or this proves nothing).
+			for (const r of [/Ingest/, /Processor/, /Query/, /Summary/, /EvalsApi/, /DeleterFn/, /Eval(?!sApi)/]) {
+				expect(policiesFor(r).length, String(r)).toBeGreaterThan(0);
+				expect(JSON.stringify(policiesFor(r)), String(r)).not.toContain("secretsmanager");
+			}
+			// The ARN, never the key: STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are for operator scripts.
+			for (const [id, f] of ownFunctions()) {
+				const vars = Object.keys(f.Properties.Environment?.Variables ?? {});
+				expect(vars, id).not.toContain("STRIPE_SECRET_KEY");
+				expect(vars, id).not.toContain("STRIPE_WEBHOOK_SECRET");
+				expect(vars.includes("STRIPE_SECRET_ARN"), id).toBe(/BillingMeter|BillingWebhook|ConsoleFn/.test(id));
+			}
+		});
+
+		it("gives the billing functions Accounts read/write and Quotas read only", () => {
+			for (const re of [/BillingWebhook/, /BillingMeter/]) {
+				const [, f] = functionNamed(new RegExp(`^${re.source}[A-F0-9]{8}$`));
+				expect(Object.keys(f.Properties.Environment.Variables), String(re)).toEqual(expect.arrayContaining(["ACCOUNTS_TABLE", "QUOTAS_TABLE", "STRIPE_SECRET_ARN"]));
+				const statements = policiesFor(new RegExp(`${re.source}ServiceRole`)).flatMap((p) => p.Properties.PolicyDocument.Statement as { Action: unknown; Resource: unknown }[]);
+				const on = (table: string) => JSON.stringify(statements.filter((st) => new RegExp(table).test(JSON.stringify(st.Resource))).map((st) => st.Action));
+				expect(on("Accounts"), String(re)).toMatch(/dynamodb:UpdateItem/);
+				expect(on("Quotas"), String(re)).toMatch(/dynamodb:GetItem/);
+				expect(on("Quotas"), String(re)).not.toMatch(/dynamodb:(PutItem|UpdateItem|DeleteItem|BatchWriteItem)/);
+				expect(JSON.stringify(statements), String(re)).not.toMatch(/Traces|Tenants|Lake|EvalsRuns/);
+			}
+			// Only the meter publishes metrics, and only to its own namespace.
+			const metricStatements = (re: RegExp) =>
+				policiesFor(re)
+					.flatMap((p) => p.Properties.PolicyDocument.Statement as { Action: unknown; Condition?: unknown }[])
+					.filter((st) => JSON.stringify(st.Action).includes("cloudwatch:PutMetricData"));
+			expect(metricStatements(/BillingMeterServiceRole/)).toEqual([
+				expect.objectContaining({ Condition: { StringEquals: { "cloudwatch:namespace": "Tracewise/Billing" } } }),
+			]);
+			expect(metricStatements(/BillingWebhookServiceRole/)).toEqual([]);
+		});
+
+		it("gives the webhook time to outlast its Stripe calls but not its event lease", () => {
+			const [, webhook] = functionNamed(/^BillingWebhook[A-F0-9]{8}$/);
+			// Each Stripe call can take ~30 s with retries; the event lease (LEASE_SECONDS) is 90 s.
+			expect(webhook.Properties.Timeout).toBe(60);
+			expect(webhook.Properties.Timeout).toBeLessThan(90);
+			const [, meter] = functionNamed(/^BillingMeter[A-F0-9]{8}$/);
+			expect(meter.Properties.Timeout).toBe(300);
+		});
+
+		it("reports usage hourly and alarms when metering stalls or fails", () => {
+			template.resourceCountIs("AWS::Scheduler::Schedule", 2);
+			const [meterId] = functionNamed(/^BillingMeter[A-F0-9]{8}$/);
+			template.hasResourceProperties("AWS::Scheduler::Schedule", {
+				ScheduleExpression: "rate(1 hour)",
+				Target: Match.objectLike({ Arn: { "Fn::GetAtt": [meterId, "Arn"] } }),
+			});
+			const [webhookId] = functionNamed(/^BillingWebhook[A-F0-9]{8}$/);
+			const errorsAlarm = (fnId: string, period: number) =>
+				template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+					Namespace: "AWS/Lambda",
+					MetricName: "Errors",
+					Dimensions: [{ Name: "FunctionName", Value: { Ref: fnId } }],
+					Period: period,
+					Threshold: 1,
+					ComparisonOperator: "GreaterThanOrEqualToThreshold",
+					EvaluationPeriods: 1,
+					AlarmActions: [Match.anyValue()],
+				});
+			errorsAlarm(webhookId, 300);
+			errorsAlarm(meterId, 3600);
+			// The meter publishes this datapoint only after a fully successful run, so its absence for 3 hours fires.
+			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+				Namespace: "Tracewise/Billing",
+				MetricName: "MeterLastSuccessAgeMinutes",
+				Statistic: "SampleCount",
+				Period: 10800,
+				EvaluationPeriods: 1,
+				Threshold: 1,
+				ComparisonOperator: "LessThanThreshold",
+				TreatMissingData: "breaching",
+				AlarmActions: [Match.anyValue()],
+			});
+			const ids = Object.keys(template.findResources("AWS::CloudWatch::Alarm"));
+			for (const name of ["BillingWebhookErrors", "BillingMeterErrors", "BillingMeterStale"]) expect(ids.some((id) => id.includes(name)), name).toBe(true);
+		});
+
+		it("outputs the secret's ARN and the URL to register with Stripe", () => {
+			const outputs = template.findOutputs("*");
+			expect(Object.keys(outputs)).toEqual(expect.arrayContaining(["StripeSecretArn", "StripeWebhookUrl"]));
+			expect(JSON.stringify(outputs.StripeWebhookUrl!.Value)).toContain("/v1/stripe/webhook");
+		});
+
+		it("covers the longest plan retention in the deleter", () => {
+			expect(Math.max(...Object.values(PLANS).map((p) => p.retention_days))).toBeLessThanOrEqual(MAX_RETENTION_DAYS);
+		});
 	});
 });
