@@ -3,6 +3,7 @@ import { SNSClient } from "@aws-sdk/client-sns";
 import { GetCommand, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FREE_LIMITS } from "../services/shared/accounts";
+import { PLANS } from "../services/billing/plans";
 
 const ddb = vi.hoisted(() => ({ send: vi.fn() }));
 vi.mock("../services/shared/ddb", () => ({ ddb }));
@@ -28,6 +29,7 @@ const profile = (org_id: string, extra: Record<string, unknown> = {}) => ({
 	org_id,
 	name: org_id.toUpperCase(),
 	status: "active",
+	plan: "free",
 	limits: FREE_LIMITS,
 	rubric: null,
 	evals_enabled: true,
@@ -126,6 +128,50 @@ describe("listTenants", () => {
 		const { tenants } = await listTenants({ day: "2026-10-21" });
 		expect(tenants.every((t) => t.sample_budget === 20)).toBe(true);
 		expect(metric()).toBeUndefined();
+	});
+
+	it("gives paid orgs their full allowance outside the free pool", async () => {
+		scans([...Array.from({ length: 150 }, (_, i) => profile(`o${i}`)), profile("pro", { plan: "pro", limits: PLANS.pro.limits })]);
+		const { tenants } = await listTenants({ day: "2026-10-21" });
+		// The pool divides among the 150 free orgs only: floor(2000 / 150) = 13, not 2000 / 151.
+		expect(tenants.filter((t) => t.tenant_id !== "pro").every((t) => t.sample_budget === 13 && t.sample_limit === 20)).toBe(true);
+		expect(tenants.find((t) => t.tenant_id === "pro")).toMatchObject({ sample_budget: 500, sample_limit: 500 });
+	});
+
+	it("caps a paid org at SAMPLE_SIZE, read when the run starts", async () => {
+		vi.stubEnv("SAMPLE_SIZE", "50");
+		scans([profile("pro", { plan: "pro", limits: PLANS.pro.limits }), profile("team", { plan: "team", limits: PLANS.team.limits })]);
+		const { tenants } = await listTenants({ day: "2026-10-21" });
+		expect(tenants.map((t) => [t.sample_budget, t.sample_limit])).toEqual([
+			[50, 500],
+			[50, 100],
+		]);
+		vi.unstubAllEnvs();
+	});
+
+	it("treats custom orgs and legacy key rows as outside the free pool", async () => {
+		scans(
+			[...Array.from({ length: 150 }, (_, i) => profile(`o${i}`)), profile("cust", { plan: "custom", limits: { ...FREE_LIMITS, eval_samples_per_night: 300 } })],
+			[{ tenant_id: "t", name: "Old", status: "active", events_per_minute: 600 }],
+		);
+		const { tenants } = await listTenants({ day: "2026-10-21" });
+		expect(tenants.find((t) => t.tenant_id === "cust")).toMatchObject({ sample_budget: 300, sample_limit: 300 });
+		expect(tenants.find((t) => t.tenant_id === "t")).toMatchObject({ sample_budget: 20, sample_limit: 20 });
+		expect(tenants.filter((t) => t.tenant_id.startsWith("o")).every((t) => t.sample_budget === 13)).toBe(true);
+	});
+
+	it("reports the judge cap only for free-pool shortfalls", async () => {
+		scans([...Array.from({ length: 50 }, (_, i) => profile(`o${i}`)), ...Array.from({ length: 10 }, (_, i) => profile(`p${i}`, { plan: "pro", limits: PLANS.pro.limits }))]);
+		await listTenants({ day: "2026-10-21" });
+		expect(metric()).toBeUndefined();
+	});
+
+	it("does not report the cap when only a paid org is trimmed by SAMPLE_SIZE", async () => {
+		vi.stubEnv("SAMPLE_SIZE", "50");
+		scans([profile("pro", { plan: "pro", limits: PLANS.pro.limits })]);
+		await listTenants({ day: "2026-10-21" });
+		expect(metric()).toBeUndefined();
+		vi.unstubAllEnvs();
 	});
 
 	it("handles no tenants at all", async () => {

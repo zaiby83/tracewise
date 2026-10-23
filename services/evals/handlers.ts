@@ -16,7 +16,9 @@ import { DEFAULT_RUBRIC, isRegression, judgeMessages, parseScores, summarize, ty
 const bedrock = new BedrockRuntimeClient({});
 const cloudwatch = new CloudWatchClient({});
 const sns = new SNSClient({});
-const SAMPLE_SIZE = Number(process.env.SAMPLE_SIZE ?? 20);
+// Most traces judged for one org in a night. Sized for Pro's 500-sample allowance; read at
+// call time so a run can lower it without a redeploy.
+const sampleSize = () => Number(process.env.SAMPLE_SIZE ?? 500);
 
 interface TenantRef {
 	tenant_id: string;
@@ -31,13 +33,13 @@ interface TenantRef {
 }
 
 // Step 1: every active org with evals on, with the day to evaluate (yesterday by default)
-// and its share of tonight's judge budget. Tenants that predate self-serve have no profile
-// yet, only key rows, so those are read too until the migration has rewritten them. The
-// table holds one item per API key and a tenant can have several (e.g. a read-only
-// dashboard key), so they are de-duplicated by id.
+// and its judge budget: a share of the free pool, or its own allowance for paid orgs.
+// Tenants that predate self-serve have no profile yet, only key rows, so those are read too
+// until the migration has rewritten them. The table holds one item per API key and a tenant
+// can have several (e.g. a read-only dashboard key), so they are de-duplicated by id.
 export async function listTenants(input: { day?: string }): Promise<{ tenants: TenantRef[] }> {
 	const day = input.day ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-	const candidates: { tenant_id: string; name: string; rubric: string | null; limit: number }[] = [];
+	const candidates: { tenant_id: string; name: string; rubric: string | null; limit: number; pooled: boolean }[] = [];
 	const seen = new Set<string>();
 
 	for (const p of await listProfiles()) {
@@ -46,7 +48,9 @@ export async function listTenants(input: { day?: string }): Promise<{ tenants: T
 		seen.add(p.org_id);
 		// Rubrics (up to 4,000 characters each) stay out of this state, which Step Functions
 		// caps at 256 KB across every org; the sample step loads them.
-		if (p.status === "active" && p.evals_enabled) candidates.push({ tenant_id: p.org_id, name: p.name, rubric: null, limit: p.limits.eval_samples_per_night });
+		// Anything that isn't a known paid plan stays in the pool, so an odd row can't spend outside it.
+		const pooled = p.plan !== "team" && p.plan !== "pro" && p.plan !== "custom";
+		if (p.status === "active" && p.evals_enabled) candidates.push({ tenant_id: p.org_id, name: p.name, rubric: null, limit: p.limits.eval_samples_per_night, pooled });
 	}
 
 	let start: Record<string, unknown> | undefined;
@@ -60,16 +64,26 @@ export async function listTenants(input: { day?: string }): Promise<{ tenants: T
 				name: t.name,
 				rubric: t.rubric ?? null,
 				limit: legacyLimits(t.events_per_minute).eval_samples_per_night,
+				// Legacy rows count as custom orgs: they predate the pool and keep their own allowance.
+				pooled: false,
 			});
 		}
 		start = page.LastEvaluatedKey;
 	} while (start);
 
-	// An equal split is simple and predictable; budget an org doesn't use isn't redistributed.
-	const share = Math.floor(GLOBAL_JUDGE_CALLS_PER_NIGHT / Math.max(candidates.length, 1));
-	const tenants = candidates.map(({ limit, ...c }) => ({ ...c, day, sample_budget: Math.min(limit, share), sample_limit: limit }));
+	// Only free orgs share the pool, split equally: simple and predictable, and budget an org
+	// doesn't use isn't redistributed. Paid and custom orgs sit outside it, so they neither
+	// shrink the free share nor get shrunk by it. SAMPLE_SIZE still caps what one run judges.
+	const share = Math.floor(GLOBAL_JUDGE_CALLS_PER_NIGHT / Math.max(candidates.filter((c) => c.pooled).length, 1));
+	const tenants = candidates.map(({ limit, pooled, ...c }) => ({
+		...c,
+		day,
+		sample_budget: pooled ? Math.min(limit, share) : Math.min(limit, sampleSize()),
+		sample_limit: limit,
+	}));
 
-	if (tenants.some((t) => t.sample_budget < t.sample_limit)) {
+	// The metric is about the free pool running short; a paid org trimmed by SAMPLE_SIZE isn't that.
+	if (candidates.some((c, i) => c.pooled && tenants[i]!.sample_budget < tenants[i]!.sample_limit)) {
 		try {
 			await cloudwatch.send(
 				new PutMetricDataCommand({
@@ -115,7 +129,7 @@ export async function sample(tenant: TenantRef): Promise<TenantRef & { keys: { p
 		const j = Math.floor(Math.random() * (i + 1));
 		[all[i], all[j]] = [all[j]!, all[i]!];
 	}
-	const keys = all.slice(0, Math.min(tenant.sample_budget, SAMPLE_SIZE));
+	const keys = all.slice(0, Math.min(tenant.sample_budget, sampleSize()));
 
 	// The usage route reads the night's count from here, so it needs no access to eval runs.
 	await ddb.send(
