@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { PLANS, deriveMonthlyEvents, estimatedOverageUsd, periodBounds, planForLookupKey, type PlanId } from "../services/billing/plans";
-import { legacyLimits } from "../services/shared/accounts";
+import { PLANS, deriveMonthlyEvents, estimatedOverageUsd, monthlyEventsFor, periodBounds, planFields, planForLookupKey, retentionFor, type PlanId } from "../services/billing/plans";
+import { legacyLimits, type OrgProfile } from "../services/shared/accounts";
 
 describe("plans", () => {
 	it("matches the published plan values", () => {
@@ -42,4 +42,22 @@ describe("plans", () => {
 		expect(periodBounds({ plan: "custom", period_start: "2026-10-15" }, Date.parse("2026-10-23T00:00:00Z"))).toEqual({ start: "2026-10-01", end: "2026-11-01" });
 	});
 	it("keeps migrated tenants unlimited per month", () => expect(legacyLimits(6000)).toMatchObject({ events_per_minute: 6000, monthly_events: null }));
+	it.each([
+		["free", undefined, 7], ["team", undefined, 30], ["pro", undefined, 90], ["custom", undefined, 30], ["custom", 365, 365], ["pro", 14, 14], ["weird", undefined, 30],
+	])("retentionFor(%s, %s) = %s", (plan, days, want) => expect(retentionFor({ plan, retention_days: days })).toBe(want));
+	it("resolves retention to 30 when there is no profile at all", () => expect(retentionFor(undefined)).toBe(30));
+	it.each([
+		["free", undefined, 50_000], ["team", undefined, null], ["pro", undefined, null], ["custom", undefined, null],
+		["free", 10, 10], ["team", 900_000, 900_000], ["team", null, null], ["free", null, null],
+	])("monthlyEventsFor(%s, stored %s) = %s", (plan, stored, want) => {
+		expect(monthlyEventsFor({ plan, limits: { monthly_events: stored } })).toBe(want);
+	});
+	it("builds the tenant plan fields from a profile", () => {
+		const now = Date.parse("2026-10-23T12:00:00Z");
+		const base = { limits: PLANS.pro.limits } as unknown as OrgProfile;
+		expect(planFields({ ...base, plan: "pro", period_start: "2026-10-15", period_end: "2026-11-15" }, now)).toMatchObject({
+			plan: "pro", retention_days: 90, period_start: "2026-10-15", period_end: "2026-11-15",
+		});
+		expect(planFields({ ...base, plan: "free" }, now)).toMatchObject({ plan: "free", retention_days: 7, period_start: "2026-10-01", period_end: "2026-11-01" });
+	});
 });

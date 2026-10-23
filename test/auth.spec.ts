@@ -45,6 +45,12 @@ describe("resolveTenant", () => {
 		expect(accounts.touchKey).not.toHaveBeenCalled();
 	});
 
+	it("gives a member's tenant the org's plan, retention and period", async () => {
+		accounts.getMember.mockResolvedValue({ role: "member" });
+		accounts.getProfile.mockResolvedValue({ ...profile, plan: "pro", period_start: "2026-10-15", period_end: "2026-11-15" });
+		expect(await resolveTenant(jwtEvent({ sub: "u" }))).toMatchObject({ plan: "pro", retention_days: 90, period_start: "2026-10-15", period_end: "2026-11-15" });
+	});
+
 	it("returns null for a non-member or an inactive org", async () => {
 		accounts.getMember.mockResolvedValueOnce(null);
 		expect(await resolveTenant(jwtEvent({ sub: "u" }))).toBeNull();

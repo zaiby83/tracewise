@@ -1,4 +1,4 @@
-import type { Limits } from "../shared/accounts";
+import type { Limits, OrgProfile } from "../shared/accounts";
 
 export type PlanId = "free" | "team" | "pro";
 
@@ -88,4 +88,28 @@ export function periodBounds(
 export function estimatedOverageUsd(plan: Plan, used: number): number {
 	if (plan.overage_per_100k_usd === null) return 0;
 	return (Math.max(0, used - plan.included_events) / 100_000) * plan.overage_per_100k_usd;
+}
+
+// Hot retention for an org. Custom and legacy orgs (and any plan this table doesn't know) get
+// 30 days, never free's 7, so migrating them doesn't shorten what they already had.
+export function retentionFor(profile?: { plan: string; retention_days?: number } | null): number {
+	return profile?.retention_days ?? PLANS[profile?.plan as PlanId]?.retention_days ?? 30;
+}
+
+// Profiles written before `monthly_events` existed have none: free gets its plan cap and
+// everything else stays uncapped, so an old paid or custom org is never throttled by a gap.
+export function monthlyEventsFor(profile: { plan: string; limits: { monthly_events?: number | null } }): number | null {
+	return profile.limits.monthly_events !== undefined ? profile.limits.monthly_events : (PLANS[profile.plan as PlanId]?.limits.monthly_events ?? null);
+}
+
+// The plan-derived Tenant fields, shared by every place that builds a tenant from a profile.
+export function planFields(profile: OrgProfile, now = Date.now()) {
+	const { start, end } = periodBounds(profile, now);
+	return {
+		plan: profile.plan,
+		limits: { ...profile.limits, monthly_events: monthlyEventsFor(profile) },
+		retention_days: retentionFor(profile),
+		period_start: start,
+		period_end: end,
+	};
 }

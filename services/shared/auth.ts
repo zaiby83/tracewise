@@ -1,4 +1,5 @@
 import type { APIGatewayProxyEventV2 } from "aws-lambda";
+import { planFields } from "../billing/plans";
 import { getMember, getProfile, normalizeEmail, touchKey } from "./accounts";
 import { bearerToken } from "./keys";
 import { tenantForKey, type Tenant } from "./tenants";
@@ -47,7 +48,7 @@ async function tenantForMember(orgId: string | undefined, sub: string): Promise<
 		status: "active",
 		// Members can read an org's data; changing it goes through the console routes.
 		scope: "read",
-		limits: profile.limits,
+		...planFields(profile),
 		rubric: profile.rubric,
 		evals_enabled: profile.evals_enabled,
 	};

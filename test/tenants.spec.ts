@@ -1,6 +1,6 @@
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import { randomBytes } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const ddb = vi.hoisted(() => ({ send: vi.fn() }));
 vi.mock("../services/shared/ddb", () => ({ ddb }));
@@ -10,15 +10,16 @@ process.env.TENANTS_TABLE = "tenants";
 process.env.QUOTAS_TABLE = "quotas";
 
 const { FREE_LIMITS, legacyLimits } = await import("../services/shared/accounts");
-const { consumeCounter, consumeQuota, counterIds, readCounter, secondsUntilUtcMidnight, tenantForKey } = await import("../services/shared/tenants");
+const { PLANS } = await import("../services/billing/plans");
+const { consumeCounter, consumeQuota, counterIds, readCounter, releaseQuota, secondsUntil, secondsUntilUtcMidnight, tenantForKey } = await import("../services/shared/tenants");
 
 // A fresh key per test: tenantForKey caches by key hash for a minute.
 const newApiKey = () => `tw_${randomBytes(32).toString("base64url")}`;
 const row = { key_hash: "h", org_id: "o1", key_id: "k1", scope: "write", status: "active" };
-const profile = { org_id: "o1", name: "Acme", status: "active", limits: FREE_LIMITS, rubric: null, evals_enabled: true };
-const tenant = { tenant_id: "o1", org_id: "o1", name: "Acme", status: "active" as const, limits: FREE_LIMITS, rubric: null, evals_enabled: true };
+const profile = { org_id: "o1", name: "Acme", status: "active", plan: "free", limits: FREE_LIMITS, rubric: null, evals_enabled: true };
+const tenant = { tenant_id: "o1", org_id: "o1", name: "Acme", status: "active" as const, plan: "free", retention_days: 7, period_start: "2026-10-01", period_end: "2026-11-01", limits: FREE_LIMITS, rubric: null, evals_enabled: true };
 
-const refused = () => new ConditionalCheckFailedException({ message: "x", $metadata: {} });
+const ccf = () => new ConditionalCheckFailedException({ message: "x", $metadata: {} });
 
 describe("tenantForKey", () => {
 	it("resolves a new-shape key row through the org profile", async () => {
@@ -61,6 +62,36 @@ describe("tenantForKey", () => {
 		ddb.send.mockResolvedValueOnce({ Item: legacyRow });
 		expect(await tenantForKey(newApiKey())).toBeNull();
 	});
+	afterEach(() => vi.useRealTimers());
+	it("stamps the plan, retention and period on the tenant", async () => {
+		vi.useFakeTimers({ now: new Date("2026-10-23T12:00:00Z"), toFake: ["Date"] });
+		ddb.send.mockResolvedValueOnce({ Item: row });
+		accounts.getProfile.mockResolvedValueOnce({ ...profile, plan: "pro", limits: PLANS.pro.limits, period_start: "2026-10-15", period_end: "2026-11-15" });
+		expect(await tenantForKey(newApiKey())).toMatchObject({ plan: "pro", retention_days: 90, period_start: "2026-10-15", period_end: "2026-11-15" });
+		ddb.send.mockResolvedValueOnce({ Item: row });
+		accounts.getProfile.mockResolvedValueOnce(profile);
+		expect(await tenantForKey(newApiKey())).toMatchObject({ plan: "free", retention_days: 7, period_start: "2026-10-01", period_end: "2026-11-01" });
+	});
+	it.each([["custom", undefined, 30], ["custom", 365, 365], ["team", undefined, 30]])("resolves %s retention %s to %s days", async (plan, days, want) => {
+		ddb.send.mockResolvedValueOnce({ Item: row });
+		accounts.getProfile.mockResolvedValueOnce({ ...profile, plan, retention_days: days });
+		expect((await tenantForKey(newApiKey()))!.retention_days).toBe(want);
+	});
+	it("fills a missing monthly_events from the plan: 50,000 for free, uncapped otherwise", async () => {
+		const { monthly_events: _drop, ...old } = FREE_LIMITS;
+		ddb.send.mockResolvedValueOnce({ Item: row });
+		accounts.getProfile.mockResolvedValueOnce({ ...profile, limits: old });
+		expect((await tenantForKey(newApiKey()))!.limits.monthly_events).toBe(50_000);
+		ddb.send.mockResolvedValueOnce({ Item: row });
+		accounts.getProfile.mockResolvedValueOnce({ ...profile, plan: "team", limits: old });
+		expect((await tenantForKey(newApiKey()))!.limits.monthly_events).toBeNull();
+	});
+	it("treats an old-shape row as custom with 30-day retention and a calendar-month period", async () => {
+		vi.useFakeTimers({ now: new Date("2026-10-23T12:00:00Z"), toFake: ["Date"] });
+		accounts.getProfile.mockReset().mockResolvedValue(null);
+		ddb.send.mockResolvedValueOnce({ Item: { key_hash: "h", tenant_id: "t1", name: "Demo", status: "active", events_per_minute: 6000 } });
+		expect(await tenantForKey(newApiKey())).toMatchObject({ plan: "custom", retention_days: 30, period_start: "2026-10-01", period_end: "2026-11-01" });
+	});
 	it("caches the result per key for a minute", async () => {
 		const key = newApiKey();
 		ddb.send.mockClear().mockResolvedValueOnce({ Item: row });
@@ -72,13 +103,56 @@ describe("tenantForKey", () => {
 });
 
 describe("counters and quota", () => {
-	// The monthly check returns with Task 2; until then only the minute window can refuse.
-	it("consumeQuota reports when the minute window refused", async () => {
+	const sentUpdates = () => ddb.send.mock.calls.map((c) => c[0] as { input: Record<string, any> }).filter((c) => c.input.UpdateExpression);
+	it("consumeQuota reports when the minute window refused, without touching the period counter", async () => {
 		const t = { ...tenant, limits: { ...FREE_LIMITS, events_per_minute: 10 } };
-		ddb.send.mockRejectedValueOnce(refused());
+		ddb.send.mockReset().mockRejectedValueOnce(ccf());
 		expect(await consumeQuota(t, 5)).toBe("minute");
-		ddb.send.mockResolvedValueOnce({});
+		expect(ddb.send).toHaveBeenCalledTimes(1);
+		ddb.send.mockReset().mockResolvedValue({});
 		expect(await consumeQuota(t, 5)).toBe("ok");
+	});
+	it("counts events per billing period and names the refusal by plan", async () => {
+		const free = { ...tenant, plan: "free", limits: { ...PLANS.free.limits, monthly_events: 10 }, period_start: "2026-10-01", period_end: "2026-11-01" };
+		ddb.send.mockReset().mockResolvedValueOnce({}).mockRejectedValueOnce(ccf());
+		expect(await consumeQuota(free, 5)).toBe("month");
+		expect(sentUpdates()[1]!.input.Key).toEqual({ window: "o1#month#2026-10-01" });
+		expect(sentUpdates()[1]!.input.ExpressionAttributeValues).toMatchObject({ ":n": 5, ":max": 5 });
+		const team = { ...free, plan: "team", limits: { ...PLANS.team.limits, monthly_events: 900_000 } };
+		ddb.send.mockReset().mockResolvedValueOnce({}).mockRejectedValueOnce(ccf());
+		expect(await consumeQuota(team, 5)).toBe("spend_cap");
+	});
+	it("expires the period counter 40 days after the period ends", async () => {
+		ddb.send.mockReset().mockResolvedValue({});
+		await consumeQuota(tenant, 1);
+		expect(sentUpdates()[1]!.input.ExpressionAttributeValues[":exp"]).toBe(Date.parse("2026-11-01") / 1000 + 40 * 86_400);
+	});
+	it("always counts paid usage even without a cap, so the meter can read it", async () => {
+		const pro = { ...tenant, plan: "pro", limits: { ...PLANS.pro.limits, monthly_events: null } };
+		ddb.send.mockReset().mockResolvedValue({});
+		expect(await consumeQuota(pro, 5)).toBe("ok");
+		expect(sentUpdates()).toHaveLength(2);
+		expect(sentUpdates()[1]!.input.ExpressionAttributeValues[":max"]).toBe(Number.MAX_SAFE_INTEGER - 5);
+	});
+	it("starts a new counter when the period rolls over", async () => {
+		ddb.send.mockReset().mockResolvedValue({});
+		await consumeQuota({ ...tenant, period_start: "2026-11-15", period_end: "2026-12-15" }, 1);
+		expect(sentUpdates()[1]!.input.Key).toEqual({ window: "o1#month#2026-11-15" });
+	});
+	it("releases counted events after a failed enqueue", async () => {
+		ddb.send.mockReset().mockResolvedValue({});
+		await releaseQuota(tenant, 5);
+		const u = sentUpdates()[0]!.input;
+		expect(u.Key).toEqual({ window: "o1#month#2026-10-01" });
+		expect(u.UpdateExpression).toBe("ADD used :neg");
+		expect(u.ExpressionAttributeValues).toEqual({ ":neg": -5 });
+	});
+	it("never throws from releaseQuota", async () => {
+		const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+		ddb.send.mockReset().mockRejectedValueOnce(new Error("throttled"));
+		await expect(releaseQuota(tenant, 5)).resolves.toBeUndefined();
+		expect(warn).toHaveBeenCalled();
+		warn.mockRestore();
 	});
 	it("consumeCounter propagates errors that are not a refusal", async () => {
 		ddb.send.mockRejectedValueOnce(new Error("boom"));
@@ -90,13 +164,18 @@ describe("counters and quota", () => {
 		ddb.send.mockResolvedValueOnce({});
 		expect(await readCounter("o#x")).toBe(0);
 	});
-	it("names counters by day in UTC", () => {
+	it("names counters by window", () => {
 		const now = Date.parse("2026-10-22T23:59:00Z");
-		expect(counterIds.day("o", now)).toBe("o#day#2026-10-22");
+		expect(counterIds.period("o", "2026-10-15")).toBe("o#month#2026-10-15");
+		expect("day" in counterIds).toBe(false);
 		expect(counterIds.athena("o", now)).toBe("o#athena#2026-10-22");
 		expect(counterIds.evals("o", "2026-10-22")).toBe("o#evals#2026-10-22");
 		expect(counterIds.minute("o", now)).toBe(`o#${Math.floor(now / 60_000)}`);
 		expect(counterIds.globalOrgs(Date.parse("2026-10-22T01:00:00Z"))).toBe("global#orgs#2026-10-22");
+	});
+	it("counts seconds until a date, never negative", () => {
+		expect(secondsUntil("2026-11-01", Date.parse("2026-10-31T23:00:00Z"))).toBe(3600);
+		expect(secondsUntil("2026-11-01", Date.parse("2026-11-02T00:00:00Z"))).toBe(0);
 	});
 	it("counts seconds to UTC midnight", () => expect(secondsUntilUtcMidnight(Date.parse("2026-10-22T23:59:00Z"))).toBe(60));
 });

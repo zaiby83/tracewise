@@ -4,7 +4,7 @@ import { touchKey } from "../shared/accounts";
 import { json, log } from "../shared/http";
 import { bearerToken } from "../shared/keys";
 import { IngestRequest, validateEvents, type QueuedEvent } from "../shared/schema";
-import { canWrite, consumeQuota, secondsUntilUtcMidnight, tenantForKey } from "../shared/tenants";
+import { canWrite, consumeQuota, releaseQuota, secondsUntil, tenantForKey } from "../shared/tenants";
 
 const sqs = new SQSClient({});
 const SQS_BATCH = 10; // SendMessageBatch's maximum
@@ -36,8 +36,9 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const quota = await consumeQuota(tenant, valid.length);
 	if (quota !== "ok") {
 		log("warn", "quota exceeded", { tenant_id: tenant.tenant_id, events: valid.length, limit: quota });
-		if (quota === "day") {
-			return json(429, { error: "daily event cap reached" }, { "retry-after": String(secondsUntilUtcMidnight()), "x-tracewise-limit": "day" });
+		if (quota === "month" || quota === "spend_cap") {
+			const error = quota === "month" ? "monthly event allowance used" : "spend cap reached";
+			return json(429, { error }, { "retry-after": String(secondsUntil(tenant.period_end)), "x-tracewise-limit": quota });
 		}
 		return json(429, { error: "events-per-minute quota exceeded" }, { "retry-after": "60", "x-tracewise-limit": "minute" });
 	}
@@ -45,13 +46,16 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const received_at = new Date().toISOString();
 	const entries: SendMessageBatchRequestEntry[] = valid.map((e, i) => ({
 		Id: String(i),
-		MessageBody: JSON.stringify({ ...e, tenant_id: tenant.tenant_id, received_at } satisfies QueuedEvent),
+		MessageBody: JSON.stringify({ ...e, tenant_id: tenant.tenant_id, received_at, retention_days: tenant.retention_days } satisfies QueuedEvent),
 	}));
 
 	const failed = await enqueue(entries);
 	if (failed > 0) {
 		// The client retries the whole batch; event ids make the retry idempotent.
 		log("error", "enqueue failed", { tenant_id: tenant.tenant_id, failed, total: entries.length });
+		// The retry will be counted again, so give these back. Only the failed entries never
+		// reached the queue, but the client resends the whole batch, so all are released.
+		await releaseQuota(tenant, valid.length);
 		return json(503, { error: "temporarily unable to accept events, retry" }, { "retry-after": "2" });
 	}
 

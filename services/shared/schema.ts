@@ -34,6 +34,8 @@ export const IngestRequest = z.object({
 export interface QueuedEvent extends TraceEvent {
 	tenant_id: string;
 	received_at: string;
+	// The tenant's hot-retention days when the event was accepted, for the processor's TTL.
+	retention_days: number;
 }
 
 export interface Rejected {

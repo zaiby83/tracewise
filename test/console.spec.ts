@@ -409,6 +409,7 @@ describe("usage", () => {
 		tenants.readCounter.mockImplementation(async (id: string) => {
 			if (id.includes("#evals#")) return id.endsWith("2026-10-21") ? 17 : 99;
 			if (id.includes("#athena#")) return 4;
+			if (id.includes("#month#")) return id === "o1#month#2026-10-01" ? 1234 : 99;
 			return 33;
 		});
 		store.listKeys.mockResolvedValue([{}, {}]);
@@ -418,8 +419,20 @@ describe("usage", () => {
 		vi.useRealTimers();
 		expect(parse(res)).toEqual({
 			limits: FREE_LIMITS,
-			used: { events_this_minute: 33, events_today: 0, analytics_queries_today: 4, eval_samples_last_night: 17, keys: 2, members: 3, pending_invites: 1 },
+			period: { start: "2026-10-01", end: "2026-11-01" },
+			used: { events_this_minute: 33, events_this_period: 1234, analytics_queries_today: 4, eval_samples_last_night: 17, keys: 2, members: 3, pending_invites: 1 },
 		});
+	});
+	it("reads the paid period counter by the stored period start, and fills a missing monthly cap from the plan", async () => {
+		const { monthly_events: _drop, ...old } = FREE_LIMITS;
+		accounts.getProfile.mockResolvedValue({ ...profile, plan: "team", limits: old, period_start: "2026-10-15", period_end: "2026-11-15" });
+		tenants.readCounter.mockResolvedValue(0);
+		store.listKeys.mockResolvedValue([]);
+		store.listMembers.mockResolvedValue([]);
+		store.listInvites.mockResolvedValue([]);
+		const res = await call("GET /v1/orgs/{orgId}/usage", { params: { orgId: "o1" } });
+		expect(tenants.readCounter).toHaveBeenCalledWith("o1#month#2026-10-15");
+		expect(parse(res)).toMatchObject({ period: { start: "2026-10-15", end: "2026-11-15" }, limits: { monthly_events: null } });
 	});
 	it("is open to plain members", async () => {
 		asMember("member");
