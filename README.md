@@ -123,17 +123,17 @@ Do this in Stripe **test mode** first, in order. The values called "outputs" bel
 
 3. **Register the webhook.** In the Stripe Dashboard (test mode) add an endpoint at the `StripeWebhookUrl` output, listening to exactly these events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid` and `invoice.payment_failed`. Copy the endpoint's signing secret (`whsec_...`) and put it into the secret from step 2 with the same `put-secret-value` command.
 
-4. **Force a cold start.** Each Lambda reads the secret once and caches it for the life of the instance, so a changed secret isn't seen until the functions restart. Redeploy (`pnpm run deploy`, with the environment variables from [Run it](#run-it)), or change a setting on each of the BillingWebhook, BillingMeter and console functions (for example `aws lambda update-function-configuration --function-name <name> --description "restart"`, with the names from `aws lambda list-functions`).
+4. **Force a cold start.** Each Lambda reads the secret once and caches it for the life of the instance, so a changed secret isn't seen until the functions restart. Redeploy (`pnpm run deploy`, with the environment variables from [Run it](#run-it)), or change an environment variable on each of the BillingWebhook, BillingMeter and console functions (a description change may not recycle running execution environments, an environment change does). Take the names from `aws lambda list-functions`, and copy the function's existing variables into `--environment`, because that call replaces them all. Setting a throwaway variable is enough.
 
 5. **Expect `BillingMeterStale` to fire.** The alarm goes off when the hourly meter hasn't reported a successful run for 3 hours, and it counts missing data as breaching, so it fires on a fresh deploy until the first hourly run succeeds. Wait for that run (or invoke the BillingMeter function once) and it clears.
 
-6. **Run the smoke test.** It needs the stack deployed with the smoke client (see `smoke-selfserve` below), and is test mode only (live keys are refused):
+6. **Run the smoke test.** It needs the stack deployed with the smoke client (see `smoke-selfserve` below), and is test mode only (live keys are refused). Your AWS credentials need `cloudformation:DescribeStacks` on the stack, Cognito admin on its user pool (`AdminCreateUser`, `AdminSetUserPassword`, `AdminInitiateAuth`, `AdminDeleteUser`), and read and write access to the Accounts table and read access to the Quotas table:
 
    ```sh
    STRIPE_SECRET_KEY=sk_test_... pnpm exec tsx scripts/smoke-billing.ts
    ```
 
-   It creates a throwaway user and org, a Stripe test clock with a customer and a Team subscription, and checks that the webhook moved the org to Team, that ingest and the meter agree with Stripe's meter summary, that the invoice after advancing the clock has the $29 base line and the metered line, and that cancelling returns the org to Free. It removes everything it made, even on failure. `--overage` also ingests 500,001 events to price a real overage line: it is paced by Team's 6,000 events a minute limit, so it takes about 90 minutes and costs about $1.50 of AWS. Then click through Checkout and the Customer Portal once by hand in the console.
+   It creates a throwaway user and org, a Stripe test clock with a customer and a Team subscription, and checks that the webhook moved the org to Team, that ingest and the meter agree with Stripe's meter summary, that the invoice after advancing the clock has the $29 base line and the metered line, and that cancelling returns the org to Free. It cleans up afterwards, even on failure: it deletes the test clock (and so its customer and subscription) and the Cognito user, and requests the org's deletion, which the deleter then finishes in the background. If a cleanup step fails it says what to remove by hand and the run fails. `--overage` also ingests 500,001 events to price a real overage line: it is paced by Team's 6,000 events a minute limit, so it takes about 90 minutes and costs about $1.50 of AWS. Then click through Checkout and the Customer Portal once by hand in the console.
 
 7. **Before going live (the owner's side):**
    - Check in test mode what Stripe answers for a **duplicate meter-event identifier**. The meter treats a recognised duplicate as success (it retries an unconfirmed send with the same identifier), so the error's shape has to match what `isDuplicateIdentifier` in `services/billing/meter.ts` recognises. Send the same event twice with the Stripe CLI or API and confirm.
@@ -170,7 +170,7 @@ Requirements: Node 22+, pnpm, AWS CLI v2, and AWS CDK.
 
 ```sh
 pnpm install
-pnpm test                 # 700 tests: logic, SDK, console API, and CDK assertions on the synthesized stack
+pnpm test                 # the tests: logic, SDK, console API, and CDK assertions on the synthesized stack
 pnpm synth                # build the CloudFormation template locally, no AWS needed
 
 aws sso login             # with a profile from `aws configure sso`
@@ -200,7 +200,7 @@ pnpm exec tsx scripts/set-limits.ts "<org name or id>" monthly_events=200000 max
 - **`migrate-accounts`** creates an org for each existing tenant, with its current rate as the per-minute limit and no monthly cap, so the public demo and load tests keep working. Running it again changes nothing already migrated. With `--owner`, the Cognito user with that email (they must have signed up first) becomes owner of every active org that has no owner yet, not only the ones this run creates. Keys of orgs that are deleting, deleted or suspended are retired as revoked, so unsuspending an org later doesn't restore them. Create new keys instead.
 - **`apply-plan-limits`** moves every active `free` org to the Free plan's current limits (a monthly cap, 2 members, 3 keys, 2 pending invites) and sets 7-day retention for the traces it writes from then on. It leaves `custom`, paid and non-active orgs alone, writes each change conditionally on the org still being active and free, and prints counts. Running it again changes nothing already current. New Free orgs get the new limits at sign-up, so this only matters for orgs created before billing. Run it once the billing deploy is live, after `migrate-accounts`.
 - **`smoke-selfserve`** creates two throwaway Cognito users and an org, ingests, checks that the key's `last_used_at` was stamped, queries, invites, checks permissions, revokes the key, then deletes the org. It waits (up to 25 minutes) for the deleter to tombstone the org's profile, then checks that the org's lake prefix and today's trace partitions are empty. It deletes the users afterwards, even on failure. It needs your operator credentials, including `s3:ListBucket` on the lake and read access to the Accounts and Traces tables. It creates one real org, so it counts toward the daily sign-up cap.
-- **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`, with 30-day retention. Unnamed limits keep their value. `monthly_events=null` removes the monthly cap. A custom org is never moved by the Stripe webhook.
+- **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`, with 30-day retention (unless it was already custom, in which case its retention is left as set). Unnamed limits keep their value. `monthly_events=null` removes the monthly cap. A custom org is never moved by the Stripe webhook.
 - **`smoke-billing`** is described in [Stripe setup](#stripe-setup).
 
 ```sh

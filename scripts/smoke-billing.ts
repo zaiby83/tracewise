@@ -56,8 +56,18 @@ const cognito = new CognitoIdentityProviderClient({});
 // Cognito's password policy asks for length, upper, lower, digits and a symbol. Never printed.
 const password = () => `Tw-${crypto.randomUUID()}-aA1!`;
 
+// Kept so the run can sign in again: the ID token lasts an hour and --overage runs for longer.
+const pw = password();
+
+async function signIn(): Promise<string> {
+	const { AuthenticationResult } = await cognito.send(
+		new AdminInitiateAuthCommand({ UserPoolId, ClientId: SmokeClientId, AuthFlow: "ADMIN_USER_PASSWORD_AUTH", AuthParameters: { USERNAME: email, PASSWORD: pw } }),
+	);
+	if (!AuthenticationResult?.IdToken) throw new Error("no ID token for the test user");
+	return AuthenticationResult.IdToken;
+}
+
 async function signUp(): Promise<string> {
-	const pw = password();
 	await cognito.send(
 		new AdminCreateUserCommand({
 			UserPoolId,
@@ -70,12 +80,10 @@ async function signUp(): Promise<string> {
 			MessageAction: "SUPPRESS",
 		}),
 	);
+	// Flagged now, so a failure in the next two calls still deletes the user.
+	userCreated = true;
 	await cognito.send(new AdminSetUserPasswordCommand({ UserPoolId, Username: email, Password: pw, Permanent: true }));
-	const { AuthenticationResult } = await cognito.send(
-		new AdminInitiateAuthCommand({ UserPoolId, ClientId: SmokeClientId, AuthFlow: "ADMIN_USER_PASSWORD_AUTH", AuthParameters: { USERNAME: email, PASSWORD: pw } }),
-	);
-	if (!AuthenticationResult?.IdToken) throw new Error("no ID token for the test user");
-	return AuthenticationResult.IdToken;
+	return signIn();
 }
 
 async function api(method: string, path: string, token: string, body?: unknown): Promise<{ status: number; body: any }> {
@@ -86,6 +94,8 @@ async function api(method: string, path: string, token: string, body?: unknown):
 	});
 	return { status: res.status, body: await res.json().catch(() => null) };
 }
+
+let userCreated = false;
 
 // Polls until `done` returns a value, or gives up after `ms`.
 async function waitFor<T>(ms: number, every: number, done: () => Promise<T | undefined>): Promise<T | undefined> {
@@ -125,14 +135,12 @@ const planOf = async (token: string, orgId: string) => (await api("GET", `/v1/or
 
 let token = "";
 let orgId = "";
-let userCreated = false;
 let clockId = "";
 const stripe = await getStripe();
 
 try {
 	// 1. A user and an org, through the console API as the browser would.
 	token = await signUp();
-	userCreated = true;
 	const created = await api("POST", "/v1/orgs", token, { name: orgName });
 	orgId = created.body?.org?.org_id ?? "";
 	const secret: string = created.body?.key?.secret ?? "";
@@ -228,18 +236,38 @@ try {
 		if (overage) check("overage is on the invoice's metered line", Number(metered?.quantity) === PLANS.team.included_events + 1);
 	}
 
-	// 10. Cancel, and the webhook puts the org back on Free.
+	// 10. Cancel, and the webhook puts the org back on Free. The first token may have expired during --overage.
+	token = await signIn();
 	await stripe.subscriptions.cancel(subscription.id);
 	const free = await waitFor(60_000, 2_000, async () => ((await planOf(token, orgId)) === "free" ? true : undefined));
 	check("cancellation returned the org to Free within 60 s", free === true, `plan ${await planOf(token, orgId)}`);
 } catch (e) {
 	check("script ran to completion", false, e instanceof Error ? e.message : String(e));
 } finally {
+	const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
 	// Deleting the clock deletes its customer and subscription with it.
-	if (clockId) await stripe.testHelpers.testClocks.del(clockId).catch((e: unknown) => console.error(`could not delete test clock ${clockId}: ${e instanceof Error ? e.message : String(e)}`));
-	// Asks for the org's deletion without waiting: the deleter finishes it in the background.
-	if (orgId && token) await api("DELETE", `/v1/orgs/${orgId}`, token, { confirm_name: orgName }).catch(() => undefined);
-	if (userCreated) await cognito.send(new AdminDeleteUserCommand({ UserPoolId, Username: email })).catch(() => undefined);
+	if (clockId) {
+		await stripe.testHelpers.testClocks.del(clockId).catch((e: unknown) => {
+			console.error(`could not delete test clock ${clockId} (${why(e)}): delete it in the Stripe test-mode Dashboard, which removes its customer too`);
+			failures++;
+		});
+	}
+	// Asks for the org's deletion without waiting: the deleter finishes it in the background. A fresh token, because the run may have outlived the first.
+	if (orgId) {
+		try {
+			const res = await api("DELETE", `/v1/orgs/${orgId}`, await signIn(), { confirm_name: orgName });
+			if (res.status !== 202) throw new Error(`status ${res.status}`);
+		} catch (e) {
+			console.error(`could not request deletion of org ${orgId} "${orgName}" (${why(e)}): delete it in the console, signed in as a user that owns it, or remove it by hand`);
+			failures++;
+		}
+	}
+	if (userCreated) {
+		await cognito.send(new AdminDeleteUserCommand({ UserPoolId, Username: email })).catch((e: unknown) => {
+			console.error(`could not delete Cognito user ${email} (${why(e)}): delete it from user pool ${UserPoolId} by hand`);
+			failures++;
+		});
+	}
 }
 
 process.exit(failures ? 1 : 0);
