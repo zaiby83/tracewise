@@ -4,11 +4,16 @@ import { SnsAction } from "aws-cdk-lib/aws-cloudwatch-actions";
 import type { ITableV2 } from "aws-cdk-lib/aws-dynamodb";
 import { PolicyStatement } from "aws-cdk-lib/aws-iam";
 import type { NodejsFunction, NodejsFunctionProps } from "aws-cdk-lib/aws-lambda-nodejs";
+import { FilterPattern, MetricFilter } from "aws-cdk-lib/aws-logs";
 import { Schedule, ScheduleExpression } from "aws-cdk-lib/aws-scheduler";
 import { LambdaInvoke } from "aws-cdk-lib/aws-scheduler-targets";
 import { Secret } from "aws-cdk-lib/aws-secretsmanager";
 import type { ITopic } from "aws-cdk-lib/aws-sns";
 import { Construct } from "constructs";
+
+// The lines services/billing/webhook.ts logs whenever it answers Stripe with a 500 (no secret to
+// verify with, or an event that failed). The stack spec checks the handler still logs exactly these.
+export const WEBHOOK_FAILURE_MESSAGES = ["stripe webhook could not be verified", "stripe event failed"] as const;
 
 export interface BillingProps {
 	// Builds a Lambda the same way the rest of the stack does.
@@ -35,9 +40,10 @@ export class Billing extends Construct {
 		// ---- Secret ---------------------------------------------------------------
 		// Created with placeholders; operators put the real keys in (see the README). CloudFormation
 		// regenerates the value only if GenerateSecretString itself changes, and RETAIN keeps the
-		// secret through a stack deletion, so the real keys are never wiped by CDK.
+		// secret through a stack deletion, so the real keys are never wiped by CDK. CDK names it: a
+		// fixed name would make a redeploy after `cdk destroy` fail on the retained secret. Scripts
+		// and operators find it through the StripeSecretArn output.
 		this.secret = new Secret(this, "StripeSecret", {
-			secretName: "tracewise/stripe",
 			description: "Stripe secret_key and webhook_secret for the billing and console functions",
 			generateSecretString: {
 				secretStringTemplate: JSON.stringify({ secret_key: "replace-me", webhook_secret: "replace-me" }),
@@ -90,6 +96,24 @@ export class Billing extends Construct {
 		new Alarm(this, "BillingWebhookErrors", {
 			alarmDescription: "The Stripe webhook function is failing: subscription changes may not be applied",
 			metric: this.webhookFn.metricErrors({ period: Duration.minutes(5), statistic: Stats.SUM }),
+			threshold: 1,
+			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+			evaluationPeriods: 1,
+			treatMissingData: TreatMissingData.NOT_BREACHING,
+		}).addAlarmAction(notify);
+
+		// The handler catches its own failures and answers 500 so Stripe retries, so Errors above never
+		// sees them. Its error log lines do.
+		const webhookFailures = new MetricFilter(this, "WebhookFailureFilter", {
+			logGroup: this.webhookFn.logGroup,
+			filterPattern: FilterPattern.any(...WEBHOOK_FAILURE_MESSAGES.map((m) => FilterPattern.all(FilterPattern.stringValue("$.level", "=", "error"), FilterPattern.stringValue("$.msg", "=", m)))),
+			metricNamespace: "Tracewise/Billing",
+			metricName: "WebhookFailures",
+			metricValue: "1",
+		});
+		new Alarm(this, "BillingWebhookFailures", {
+			alarmDescription: "Stripe webhook events are failing (answered 500): subscription changes aren't being applied",
+			metric: webhookFailures.metric({ period: Duration.minutes(5), statistic: Stats.SUM }),
 			threshold: 1,
 			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
 			evaluationPeriods: 1,

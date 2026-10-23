@@ -100,7 +100,9 @@ export class Accounts extends Construct {
 		});
 
 		// ---- Console --------------------------------------------------------------
-		this.consoleFn = props.fn("ConsoleFn", "console/handler.ts", { timeout: Duration.seconds(10) });
+		// The billing routes call Stripe (10 s per attempt, with retries), so the console gets just
+		// under API Gateway's 30 s integration limit rather than failing a slow Checkout or plan change.
+		this.consoleFn = props.fn("ConsoleFn", "console/handler.ts", { timeout: Duration.seconds(29) });
 		this.consoleFn.addEnvironment("ACCOUNTS_TABLE", props.accounts.tableName);
 		this.consoleFn.addEnvironment("TENANTS_TABLE", props.keyIndex.tableName);
 		this.consoleFn.addEnvironment("QUOTAS_TABLE", props.quotas.tableName);

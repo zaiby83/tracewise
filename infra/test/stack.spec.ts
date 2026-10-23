@@ -1,9 +1,11 @@
+import { readFileSync } from "node:fs";
 import { App } from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { beforeAll, describe, expect, it } from "vitest";
 import { PLANS } from "../../services/billing/plans";
 import { CONSOLE_ROUTES, JWT_DATA_ROUTES } from "../../services/console/route-keys";
 import { MAX_RETENTION_DAYS } from "../../services/shared/keys";
+import { WEBHOOK_FAILURE_MESSAGES } from "../lib/billing";
 import { TracewiseStack } from "../lib/tracewise-stack";
 
 // Assertions on the synthesized CloudFormation: the guarantees the design doc makes
@@ -95,7 +97,7 @@ describe("TracewiseStack", () => {
 	});
 
 	it("alarms on dead letters, backlog, ingest errors, failed deletions, global caps, failed eval runs and billing, and emails them", () => {
-		template.resourceCountIs("AWS::CloudWatch::Alarm", 10);
+		template.resourceCountIs("AWS::CloudWatch::Alarm", 11);
 		for (const cap of ["orgs", "judge"])
 			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
 				Namespace: "Tracewise/Limits",
@@ -355,7 +357,8 @@ describe("TracewiseStack", () => {
 			const secrets = template.findResources("AWS::SecretsManager::Secret");
 			expect(Object.keys(secrets)).toHaveLength(1);
 			const [secret] = Object.values(secrets);
-			expect(secret!.Properties.Name).toBe("tracewise/stripe");
+			// CDK names it, so a redeploy after `cdk destroy` doesn't collide with the retained secret.
+			expect(secret!.Properties.Name).toBeUndefined();
 			// A redeploy or a stack deletion must never take the keys an operator put in.
 			expect(secret!.DeletionPolicy).toBe("Retain");
 			expect(secret!.UpdateReplacePolicy).toBe("Retain");
@@ -409,6 +412,38 @@ describe("TracewiseStack", () => {
 			expect(webhook.Properties.Timeout).toBeLessThan(90);
 			const [, meter] = functionNamed(/^BillingMeter[A-F0-9]{8}$/);
 			expect(meter.Properties.Timeout).toBe(300);
+			// The console's billing routes call Stripe: just under HTTP API's 30 s integration limit.
+			const [, consoleFn] = functionNamed(/^ConsoleFn[A-F0-9]{8}$/);
+			expect(consoleFn.Properties.Timeout).toBe(29);
+		});
+
+		it("alarms on webhook events the handler answers with a 500", () => {
+			const filters = Object.values(template.findResources("AWS::Logs::MetricFilter"));
+			expect(filters).toHaveLength(1);
+			const [filter] = filters;
+			expect(JSON.stringify(filter!.Properties.LogGroupName)).toMatch(/BillingWebhookLogs/);
+			expect(filter!.Properties.MetricTransformations).toEqual([
+				expect.objectContaining({ MetricNamespace: "Tracewise/Billing", MetricName: "WebhookFailures", MetricValue: "1" }),
+			]);
+			const pattern = filter!.Properties.FilterPattern as string;
+			expect(pattern).toContain('$.level = "error"');
+			// Each message must be one the handler really logs on its 500 path, or the alarm can never fire.
+			const handler = readFileSync(new URL("../../services/billing/webhook.ts", import.meta.url), "utf8");
+			for (const msg of WEBHOOK_FAILURE_MESSAGES) {
+				expect(pattern).toContain(`$.msg = "${msg}"`);
+				expect(handler).toContain(`log("error", "${msg}"`);
+			}
+			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+				Namespace: "Tracewise/Billing",
+				MetricName: "WebhookFailures",
+				Statistic: "Sum",
+				Period: 300,
+				Threshold: 1,
+				ComparisonOperator: "GreaterThanOrEqualToThreshold",
+				EvaluationPeriods: 1,
+				TreatMissingData: "notBreaching",
+				AlarmActions: [Match.anyValue()],
+			});
 		});
 
 		it("reports usage hourly and alarms when metering stalls or fails", () => {
@@ -445,7 +480,7 @@ describe("TracewiseStack", () => {
 				AlarmActions: [Match.anyValue()],
 			});
 			const ids = Object.keys(template.findResources("AWS::CloudWatch::Alarm"));
-			for (const name of ["BillingWebhookErrors", "BillingMeterErrors", "BillingMeterStale"]) expect(ids.some((id) => id.includes(name)), name).toBe(true);
+			for (const name of ["BillingWebhookErrors", "BillingWebhookFailures", "BillingMeterErrors", "BillingMeterStale"]) expect(ids.some((id) => id.includes(name)), name).toBe(true);
 		});
 
 		it("outputs the secret's ARN and the URL to register with Stripe", () => {
