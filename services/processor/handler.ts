@@ -2,7 +2,7 @@ import { FirehoseClient, PutRecordBatchCommand } from "@aws-sdk/client-firehose"
 import { BatchWriteCommand } from "@aws-sdk/lib-dynamodb";
 import type { SQSBatchResponse, SQSEvent, SQSRecord } from "aws-lambda";
 import { log } from "../shared/http";
-import { HOT_RETENTION_DAYS, expiresAt, partitionKey, sortKey } from "../shared/keys";
+import { HOT_RETENTION_DAYS, MAX_RETENTION_DAYS, expiresAt, partitionKey, sortKey } from "../shared/keys";
 import type { QueuedEvent } from "../shared/schema";
 import { ddb } from "../shared/tenants";
 
@@ -29,7 +29,7 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 	}
 
 	const now = Date.now();
-	const hot = items.filter(({ item }) => inHotWindow(String(item.ts), now));
+	const hot = items.filter(({ item }) => inHotWindow(String(item.ts), now, retentionOf(item.retention_days)));
 	// Content stays out of the log: just how many, so a misconfigured client clock shows up.
 	if (hot.length < items.length) log("warn", "events outside the hot store window, streamed only", { skipped: items.length - hot.length, total: items.length });
 
@@ -49,7 +49,7 @@ export function toItem(record: SQSRecord): Record<string, unknown> | null {
 		return {
 			pk: partitionKey(e.tenant_id, e.ts, e.event_id),
 			sk: sortKey(e.ts, e.event_id),
-			expires_at: expiresAt(e.ts),
+			expires_at: expiresAt(e.ts, retentionOf(e.retention_days)),
 			...e,
 			// With received_at, this gives the pipeline's own latency (queue + processing).
 			processed_at: new Date().toISOString(),
@@ -60,14 +60,24 @@ export function toItem(record: SQSRecord): Record<string, unknown> | null {
 	}
 }
 
+// Ingest stamps the plan's retention on each event. Anything missing or unusable (a message
+// queued before plans, a corrupt value) gets the default, and nothing exceeds the longest
+// plan, because the deleter only visits partitions that far back.
+function retentionOf(days: unknown): number {
+	if (typeof days !== "number" || !(days > 0)) return HOT_RETENTION_DAYS;
+	return Math.min(days, MAX_RETENTION_DAYS);
+}
+
 // The client sets ts, and the hot store derives the partition (ts.slice(0, 10)) and TTL from
-// it. The org deleter only visits partitions from tomorrow back to HOT_RETENTION_DAYS + 2, and
-// TTL ignores expiries more than five years past, so a far-future or very old event would
-// outlive its org's deletion. Those go to the lake only, which the deleter clears by prefix.
+// it. The org deleter only visits partitions from tomorrow back to MAX_RETENTION_DAYS + 2, so
+// an event is kept only within the event's own retention (+1 day for client time zones, which
+// is always inside that coverage). TTL also ignores expiries more than five years past. A
+// far-future or too-old event would outlive its org's deletion, so those go to the lake only,
+// which the deleter clears by prefix.
 // The day check catches a +14:00 stamp whose instant is in range but whose date is past tomorrow.
-export function inHotWindow(ts: string, now = Date.now()): boolean {
+export function inHotWindow(ts: string, now = Date.now(), retentionDays = HOT_RETENTION_DAYS): boolean {
 	const at = Date.parse(ts);
-	if (!(at >= now - (HOT_RETENTION_DAYS + 1) * DAY_MS && at <= now + DAY_MS)) return false;
+	if (!(at >= now - (retentionDays + 1) * DAY_MS && at <= now + DAY_MS)) return false;
 	return ts.slice(0, 10) <= new Date(now + DAY_MS).toISOString().slice(0, 10);
 }
 

@@ -1,7 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 
 export const SHARDS = 10;
+// The default for events that carry no retention (queued before plans existed). The longest
+// plan retention is MAX_RETENTION_DAYS; the org deleter's window is sized from it.
 export const HOT_RETENTION_DAYS = 30;
+export const MAX_RETENTION_DAYS = 90;
 
 // API keys are 256 random bits, shown to the tenant once. Only the hash is stored, so
 // a leaked table doesn't leak working keys.

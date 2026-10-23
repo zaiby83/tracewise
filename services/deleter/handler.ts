@@ -5,7 +5,7 @@ import type { SQSBatchResponse, SQSEvent } from "aws-lambda";
 import { k } from "../shared/accounts";
 import { ddb } from "../shared/ddb";
 import { log } from "../shared/http";
-import { HOT_RETENTION_DAYS, partitionsForDay } from "../shared/keys";
+import { MAX_RETENTION_DAYS, partitionsForDay } from "../shared/keys";
 
 export type Phase = "dynamo" | "evals" | "s3" | "sweep" | "accounts";
 
@@ -28,10 +28,10 @@ const S3_BATCH = 1000; // DeleteObjects' maximum
 const S3_CALLS_PER_RUN = 3;
 const MAX_ATTEMPTS = 4;
 const SWEEP_DELAY_SECONDS = 900;
-// Day offsets back from the anchor. Traces expire 30 days after their event and two more
-// days cover TTL lag. Partitions use the client's own date (ts.slice(0, 10)), so an event
+// Day offsets back from the anchor. Traces expire at most MAX_RETENTION_DAYS (the longest plan)
+// after their event and two more days cover TTL lag. Partitions use the client's own date (ts.slice(0, 10)), so an event
 // stamped with a +14:00 offset already lands on tomorrow (-1), which is checked last.
-const TRACE_DAYS = [...Array.from({ length: HOT_RETENTION_DAYS + 3 }, (_, i) => i), -1];
+const TRACE_DAYS = [...Array.from({ length: MAX_RETENTION_DAYS + 3 }, (_, i) => i), -1];
 // The sweep re-checks the days around the anchor for writes that landed after the first pass.
 const SWEEP_DAYS = [-1, 0, 1];
 

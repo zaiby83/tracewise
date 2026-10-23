@@ -34,6 +34,20 @@ describe("processor", () => {
 		expect(item.expires_at).toBe(Math.floor(Date.parse("2026-10-21T18:00:00.000Z") / 1000) + 30 * 86400);
 	});
 
+	it("sets each item's TTL from the event's retention", () => {
+		const ttl = (over: object) => toItem({ messageId: "m", body: JSON.stringify(queued(over)) } as never)!.expires_at;
+		const at = Math.floor(Date.parse("2026-10-21T18:00:00.000Z") / 1000);
+		expect(ttl({ retention_days: 7 })).toBe(at + 7 * 86400);
+		expect(ttl({ retention_days: 90 })).toBe(at + 90 * 86400);
+		// Messages queued before the deploy carry no retention.
+		expect(ttl({})).toBe(at + 30 * 86400);
+	});
+
+	it.each([0, -5, 1000, "90", null, Number.NaN])("falls back to the default retention for a bad retention_days (%s)", (bad) => {
+		const item = toItem({ messageId: "m", body: JSON.stringify(queued({ retention_days: bad })) } as never)!;
+		expect(item.expires_at).toBe(Math.floor(Date.parse("2026-10-21T18:00:00.000Z") / 1000) + (bad === 1000 ? 90 : 30) * 86400);
+	});
+
 	it("writes in chunks of 25 and reports no failures on success", async () => {
 		const res = await handler(sqsEvent(Array.from({ length: 60 }, () => JSON.stringify(queued()))));
 		expect(ddb.send).toHaveBeenCalledTimes(3);
@@ -105,6 +119,23 @@ describe("processor", () => {
 			warn.mockRestore();
 		});
 
+		it("keeps a Pro event from 60 days ago in the hot table, and a Free event from 10 days ago in the lake only", async () => {
+			const now = Date.now();
+			const pro = queued({ retention_days: 90, ts: new Date(now - 60 * 86_400_000).toISOString() });
+			const free = queued({ retention_days: 7, ts: new Date(now - 10 * 86_400_000).toISOString() });
+			const legacy = queued({ ts: new Date(now - 40 * 86_400_000).toISOString() });
+			const tooOldForPro = queued({ retention_days: 90, ts: new Date(now - 92 * 86_400_000).toISOString() });
+			await handler(sqsEvent([pro, free, legacy, tooOldForPro].map((e) => JSON.stringify(e))));
+			expect(putItems()).toEqual([pro.event_id]);
+			expect(streamed().sort()).toEqual([pro, free, legacy, tooOldForPro].map((e) => e.event_id).sort());
+		});
+
+		it("keeps a Pro event at the 91-day edge", async () => {
+			const edge = queued({ retention_days: 90, ts: new Date(Date.now() - 91 * 86_400_000 + 60_000).toISOString() });
+			await handler(sqsEvent([JSON.stringify(edge)]));
+			expect(putItems()).toEqual([edge.event_id]);
+		});
+
 		it("keeps events at the window's edges, including a +14:00 stamp for tomorrow", async () => {
 			const now = Date.now();
 			const edges = [
@@ -118,7 +149,7 @@ describe("processor", () => {
 
 		it("keeps a +14:00 event out of DynamoDB when its partition day is past tomorrow", async () => {
 			// Within a day of now as an instant, but its local date (the partition) is the 24th,
-			// which the deleter (tomorrow back to HOT_RETENTION_DAYS + 2) never visits.
+			// which the deleter (tomorrow back to MAX_RETENTION_DAYS + 2) never visits.
 			const late = queued({ ts: "2026-10-24T00:30:00.000+14:00" });
 			await handler(sqsEvent([JSON.stringify(late)]));
 			expect(putItems()).toEqual([]);

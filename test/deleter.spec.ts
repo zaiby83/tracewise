@@ -15,7 +15,7 @@ Object.assign(process.env, {
 });
 
 const { handler, runPhase } = await import("../services/deleter/handler");
-const { HOT_RETENTION_DAYS } = await import("../services/shared/keys");
+const { MAX_RETENTION_DAYS } = await import("../services/shared/keys");
 
 const s3Send = vi.spyOn(S3Client.prototype, "send");
 const sqsSend = vi.spyOn(SQSClient.prototype, "send");
@@ -53,30 +53,41 @@ describe("deleter: dynamo phase", () => {
 		expect(first[0]).toEqual({ DeleteRequest: { Key: { pk: "p", sk: "0" } } });
 	});
 
-	it("covers tomorrow through HOT_RETENTION_DAYS + 2 days back before moving on", async () => {
+	it("covers tomorrow through MAX_RETENTION_DAYS + 2 days back before moving on", async () => {
 		ddbImpl(async () => ({ Items: [] }));
 		const next = await runPhase({ org_id: "o1", phase: "dynamo" }, now);
 		expect(next).toEqual({ org_id: "o1", phase: "evals", cursor: { anchor: "2026-10-22" } });
 		const pks = sent(QueryCommand).map((q) => q.input.ExpressionAttributeValues![":pk"]);
-		expect(pks).toHaveLength((HOT_RETENTION_DAYS + 4) * 10);
+		expect(pks).toHaveLength((MAX_RETENTION_DAYS + 4) * 10);
 		expect(pks).toContain(`o1#${day("2026-10-22", 0)}#0`);
 		// Clients stamp events in their own time zone, so a +14:00 event is already tomorrow.
 		expect(pks).toContain("o1#2026-10-23#0");
-		expect(pks).toContain(`o1#${day("2026-10-22", HOT_RETENTION_DAYS + 2)}#9`);
-		expect(pks).not.toContain(`o1#${day("2026-10-22", HOT_RETENTION_DAYS + 3)}#0`);
+		expect(pks).toContain(`o1#${day("2026-10-22", MAX_RETENTION_DAYS + 2)}#9`);
+		expect(pks).not.toContain(`o1#${day("2026-10-22", MAX_RETENTION_DAYS + 3)}#0`);
 		expect(pks).not.toContain("o1#2026-10-24#0");
 		expect(pks.every((p) => String(p).startsWith("o1#"))).toBe(true);
+	});
+
+	it("visits every partition a Pro org can hold", async () => {
+		ddbImpl(async () => ({ Items: [] }));
+		await runPhase({ org_id: "o1", phase: "dynamo" }, now);
+		const pks = sent(QueryCommand).map((q) => q.input.ExpressionAttributeValues![":pk"]);
+		expect(MAX_RETENTION_DAYS).toBe(90);
+		expect(pks).toContain(`o1#${day("2026-10-22", 92)}#9`);
+		expect(pks).toContain(`o1#${day("2026-10-22", -1)}#0`);
+		expect(pks).not.toContain(`o1#${day("2026-10-22", 93)}#0`);
+		expect(pks).toHaveLength(94 * 10);
 	});
 
 	it("resumes from its cursor and keeps the day anchored across midnight", async () => {
 		ddbImpl(async () => ({ Items: [] }));
 		const later = Date.parse("2026-10-23T00:30:00Z");
 		// A cursor taken on the 22nd and resumed after midnight still counts days from the 22nd.
-		const next = await runPhase({ org_id: "o1", phase: "dynamo", cursor: { day: 31, shard: 8, anchor: "2026-10-22" } }, later);
+		const next = await runPhase({ org_id: "o1", phase: "dynamo", cursor: { day: 91, shard: 8, anchor: "2026-10-22" } }, later);
 		expect(next).toEqual({ org_id: "o1", phase: "evals", cursor: { anchor: "2026-10-22" } });
 		const q = sent(QueryCommand).map((c) => c.input.ExpressionAttributeValues![":pk"]);
 		const shards = (date: string, from = 0) => Array.from({ length: 10 - from }, (_, i) => `o1#${date}#${from + i}`);
-		expect(q).toEqual([...shards("2026-09-21", 8), ...shards("2026-09-20"), ...shards("2026-10-23")]);
+		expect(q).toEqual([...shards(day("2026-10-22", 91), 8), ...shards(day("2026-10-22", 92)), ...shards("2026-10-23")]);
 	});
 
 	it("passes the cursor's lastKey on as ExclusiveStartKey and only asks for keys", async () => {

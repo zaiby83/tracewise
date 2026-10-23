@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bearerToken, hashApiKey, newApiKey, partitionKey, partitionsForDay, SHARDS, shardOf } from "../services/shared/keys";
+import { bearerToken, expiresAt, HOT_RETENTION_DAYS, MAX_RETENTION_DAYS, hashApiKey, newApiKey, partitionKey, partitionsForDay, SHARDS, shardOf } from "../services/shared/keys";
 import { validateEvents } from "../services/shared/schema";
 
 const event = (over: object = {}) => ({
@@ -56,5 +56,18 @@ describe("event validation", () => {
 
 	it("rejects oversized events", () => {
 		expect(validateEvents([event({ output: "x".repeat(40_000) })]).rejected).toHaveLength(1);
+	});
+});
+
+describe("retention", () => {
+	it("keeps 30 days as the default and 90 as the longest plan", () => {
+		expect(HOT_RETENTION_DAYS).toBe(30);
+		expect(MAX_RETENTION_DAYS).toBe(90);
+	});
+
+	it("expires an item the given number of days after its event, 30 by default", () => {
+		const at = Math.floor(Date.parse("2026-10-21T18:00:00.000Z") / 1000);
+		expect(expiresAt("2026-10-21T18:00:00.000Z", 7)).toBe(at + 7 * 86_400);
+		expect(expiresAt("2026-10-21T18:00:00.000Z")).toBe(at + 30 * 86_400);
 	});
 });
