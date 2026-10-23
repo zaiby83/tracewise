@@ -9,6 +9,7 @@
 		"skipLibCheck": true,
 		"noEmit": true,
 		"isolatedModules": true,
+		"allowJs": true,
 		"types": ["node"]
 	},
 	"include": ["infra", "services", "scripts", "test"]

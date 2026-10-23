@@ -1,0 +1,18 @@
+import { FREE_LIMITS, type Limits } from "../../services/shared/accounts";
+
+// Applies `key=value` overrides to an org's current limits. The keys are checked against
+// the Limits type itself (via FREE_LIMITS), so a typo can't write a stray field.
+export function parseLimitOverrides(pairs: string[], current: Limits): Limits {
+	if (pairs.length === 0) throw new Error("give at least one key=value limit");
+	const next = { ...current };
+	for (const pair of pairs) {
+		const at = pair.indexOf("=");
+		if (at < 1) throw new Error(`"${pair}" is not key=value`);
+		const key = pair.slice(0, at);
+		const raw = pair.slice(at + 1);
+		if (!Object.hasOwn(FREE_LIMITS, key)) throw new Error(`unknown limit "${key}" (known: ${Object.keys(FREE_LIMITS).join(", ")})`);
+		if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error(`${key} must be a non-negative integer, got "${raw}"`);
+		next[key as keyof Limits] = Number(raw);
+	}
+	return next;
+}

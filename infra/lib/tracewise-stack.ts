@@ -1,11 +1,12 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CfnOutput, Duration, RemovalPolicy, Stack, type StackProps } from "aws-cdk-lib";
+import { Aws, CfnOutput, Duration, RemovalPolicy, Stack, type StackProps } from "aws-cdk-lib";
 import { HttpApi, HttpMethod } from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
-import { Alarm, ComparisonOperator, TreatMissingData } from "aws-cdk-lib/aws-cloudwatch";
+import { Alarm, ComparisonOperator, Stats, TreatMissingData } from "aws-cdk-lib/aws-cloudwatch";
 import { SnsAction } from "aws-cdk-lib/aws-cloudwatch-actions";
 import { AttributeType, Billing, TableEncryptionV2, TableV2 } from "aws-cdk-lib/aws-dynamodb";
+import { PolicyStatement } from "aws-cdk-lib/aws-iam";
 import { Architecture, Runtime, Tracing } from "aws-cdk-lib/aws-lambda";
 import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 import { NodejsFunction, OutputFormat, type NodejsFunctionProps } from "aws-cdk-lib/aws-lambda-nodejs";
@@ -14,6 +15,7 @@ import { Topic } from "aws-cdk-lib/aws-sns";
 import { EmailSubscription } from "aws-cdk-lib/aws-sns-subscriptions";
 import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
+import { Accounts } from "./accounts";
 import { Analytics } from "./analytics";
 import { Dashboard } from "./dashboard";
 import { Evals } from "./evals";
@@ -34,6 +36,10 @@ export interface TracewiseStackProps extends StackProps {
 	judgeModel?: string;
 	// Read-only key the public dashboard uses to show the demo tenant.
 	dashboardKey?: string;
+	// Prefix of the Cognito managed login domain; must be unique within the region.
+	authDomainPrefix?: string;
+	// Adds a password-auth app client for the self-serve smoke test.
+	smokeClient?: boolean;
 }
 
 export class TracewiseStack extends Stack {
@@ -62,6 +68,16 @@ export class TracewiseStack extends Stack {
 			partitionKey: { name: "window", type: AttributeType.STRING },
 			billing: Billing.onDemand(),
 			timeToLiveAttribute: "expires_at",
+			encryption: TableEncryptionV2.awsManagedKey(),
+			removalPolicy: RemovalPolicy.DESTROY,
+		});
+
+		// Orgs, members, invites and keys, in one table (see the self-serve design, §3.1).
+		const accountsTable = new TableV2(this, "Accounts", {
+			partitionKey: { name: "pk", type: AttributeType.STRING },
+			sortKey: { name: "sk", type: AttributeType.STRING },
+			billing: Billing.onDemand(),
+			timeToLiveAttribute: "expires_at", // invites
 			encryption: TableEncryptionV2.awsManagedKey(),
 			removalPolicy: RemovalPolicy.DESTROY,
 		});
@@ -100,15 +116,31 @@ export class TracewiseStack extends Stack {
 				...extra,
 			});
 
+		// Every function that accepts an API key stamps the key's last_used_at (touchKey). The
+		// condition limits that UpdateItem to the key attributes and last_used_at, so none of
+		// them can change a profile, member or key otherwise.
+		const grantTouchKey = (f: NodejsFunction) =>
+			f.addToRolePolicy(
+				new PolicyStatement({
+					actions: ["dynamodb:UpdateItem"],
+					resources: [accountsTable.tableArn],
+					conditions: { "ForAllValues:StringEquals": { "dynamodb:Attributes": ["pk", "sk", "last_used_at"] } },
+				}),
+			);
+
 		const ingest = fn("Ingest", "ingest/handler.ts", { timeout: Duration.seconds(10) });
 		ingest.addEnvironment("QUEUE_URL", queue.queueUrl);
 		ingest.addEnvironment("TENANTS_TABLE", tenants.tableName);
 		ingest.addEnvironment("QUOTAS_TABLE", quotas.tableName);
+		ingest.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
 		// Least privilege: ingest can enqueue, read tenants and update quota counters. It
-		// cannot read or write traces.
+		// cannot read or write traces. It reads keys and org profiles from Accounts, and
+		// writes there only to stamp a key's last_used_at.
 		queue.grantSendMessages(ingest);
 		tenants.grantReadData(ingest);
 		quotas.grantReadWriteData(ingest);
+		accountsTable.grantReadData(ingest);
+		grantTouchKey(ingest);
 
 		const analytics = new Analytics(this, "Analytics");
 
@@ -132,14 +164,23 @@ export class TracewiseStack extends Stack {
 		const query = fn("Query", "query/handler.ts", { timeout: Duration.seconds(10) });
 		query.addEnvironment("TRACES_TABLE", traces.tableName);
 		query.addEnvironment("TENANTS_TABLE", tenants.tableName);
+		query.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
 		traces.grantReadData(query);
 		tenants.grantReadData(query);
+		accountsTable.grantReadData(query); // membership checks and org profiles
+		grantTouchKey(query);
 
 		const summary = fn("Summary", "analytics/handler.ts", { timeout: Duration.seconds(29) });
 		summary.addEnvironment("TENANTS_TABLE", tenants.tableName);
+		summary.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
+		summary.addEnvironment("QUOTAS_TABLE", quotas.tableName);
 		summary.addEnvironment("WORKGROUP", analytics.workGroup.name);
 		summary.addEnvironment("GLUE_DATABASE", analytics.database);
 		tenants.grantReadData(summary);
+		accountsTable.grantReadData(summary);
+		grantTouchKey(summary);
+		// The only write: the per-org daily query counter (analytics_queries_per_day).
+		quotas.grant(summary, "dynamodb:UpdateItem");
 		analytics.grantQuery(summary);
 
 		// ---- Evaluations ------------------------------------------------------------
@@ -156,8 +197,37 @@ export class TracewiseStack extends Stack {
 		const evalsApi = fn("EvalsApi", "evals/api.ts", { timeout: Duration.seconds(10) });
 		evalsApi.addEnvironment("TENANTS_TABLE", tenants.tableName);
 		evalsApi.addEnvironment("EVALS_TABLE", evals.table.tableName);
+		evalsApi.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
 		tenants.grantReadData(evalsApi);
 		evals.table.grantReadData(evalsApi);
+		accountsTable.grantReadData(evalsApi);
+		grantTouchKey(evalsApi);
+		// The workflow lists orgs from their profiles (legacy key rows too, until migrated),
+		// and the sample step loads each org's rubric and records the night's sample count,
+		// which the console's usage route reads. Sample and record both re-check the org is
+		// still active, since a deletion can start while the run is under way.
+		evals.listFn.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
+		accountsTable.grantReadData(evals.listFn);
+		evals.recordFn.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
+		accountsTable.grantReadData(evals.recordFn);
+		evals.sampleFn.addEnvironment("ACCOUNTS_TABLE", accountsTable.tableName);
+		evals.sampleFn.addEnvironment("QUOTAS_TABLE", quotas.tableName);
+		accountsTable.grantReadData(evals.sampleFn);
+		quotas.grant(evals.sampleFn, "dynamodb:PutItem");
+
+		// ---- Accounts ---------------------------------------------------------------
+		const accounts = new Accounts(this, "SelfServe", {
+			fn,
+			accounts: accountsTable,
+			keyIndex: tenants,
+			quotas,
+			traces,
+			evalRuns: evals.table,
+			lake: analytics.bucket,
+			alerts: alarms,
+			authDomainPrefix: props.authDomainPrefix ?? `tracewise-${Aws.ACCOUNT_ID}`,
+			smokeClient: props.smokeClient ?? false,
+		});
 
 		// ---- API --------------------------------------------------------------------
 		const api = new HttpApi(this, "Api", { description: "Tracewise ingest and query API" });
@@ -171,7 +241,9 @@ export class TracewiseStack extends Stack {
 		api.addRoutes({ path: "/v1/evals", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("EvalsRoute", evalsApi) });
 		api.addRoutes({ path: "/v1/me", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("MeRoute", query) });
 
-		const dashboard = new Dashboard(this, "Dashboard", { api, demoReadKey: props.dashboardKey });
+		const dashboard = new Dashboard(this, "Dashboard", { api, authDomainUrl: accounts.authDomainUrl });
+		const { clientId, smokeClientId } = accounts.connect(api, `https://${dashboard.distribution.distributionDomainName}`, { query, summary, evalsApi });
+		dashboard.deploy({ demoKey: props.dashboardKey ?? "", auth: { domain: accounts.authDomainUrl, clientId } });
 		// Account-wide backstop throttle; per-tenant quotas are enforced in the ingest function.
 		const stage = api.defaultStage!.node.defaultChild as import("aws-cdk-lib/aws-apigatewayv2").CfnStage;
 		stage.defaultRouteSettings = { throttlingRateLimit: 200, throttlingBurstLimit: 400 };
@@ -204,11 +276,27 @@ export class TracewiseStack extends Stack {
 			treatMissingData: TreatMissingData.NOT_BREACHING,
 		}).addAlarmAction(notify);
 
+		// The nightly run is otherwise silent: a failed execution means no org was evaluated.
+		// An hourly period alerts within the hour of the 06:00 UTC run.
+		new Alarm(this, "EvalWorkflowFailed", {
+			alarmDescription: "The nightly evaluation workflow failed: orgs weren't evaluated",
+			metric: evals.stateMachine.metricFailed({ period: Duration.hours(1), statistic: Stats.SUM }),
+			threshold: 1,
+			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+			evaluationPeriods: 1,
+			treatMissingData: TreatMissingData.NOT_BREACHING,
+		}).addAlarmAction(notify);
+
 		new CfnOutput(this, "ApiUrl", { value: api.apiEndpoint });
 		new CfnOutput(this, "TenantsTable", { value: tenants.tableName });
 		new CfnOutput(this, "TracesTable", { value: traces.tableName });
 		new CfnOutput(this, "LakeBucket", { value: analytics.bucket.bucketName });
 		new CfnOutput(this, "EvalWorkflow", { value: evals.stateMachine.stateMachineArn });
 		new CfnOutput(this, "DashboardUrl", { value: `https://${dashboard.distribution.distributionDomainName}` });
+		new CfnOutput(this, "UserPoolId", { value: accounts.userPool.userPoolId });
+		new CfnOutput(this, "ConsoleClientId", { value: clientId });
+		if (smokeClientId) new CfnOutput(this, "SmokeClientId", { value: smokeClientId });
+		new CfnOutput(this, "AccountsTable", { value: accountsTable.tableName });
+		new CfnOutput(this, "DeletionQueue", { value: accounts.deletionQueue.queueUrl });
 	}
 }

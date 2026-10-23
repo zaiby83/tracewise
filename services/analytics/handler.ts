@@ -7,8 +7,8 @@ import {
 } from "@aws-sdk/client-athena";
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
 import { json, log } from "../shared/http";
-import { bearerToken } from "../shared/keys";
-import { tenantForKey } from "../shared/tenants";
+import { jwtClaims, resolveTenant } from "../shared/auth";
+import { consumeCounter, counterIds, secondsUntilUtcMidnight } from "../shared/tenants";
 import { BY_DAY, BY_ROUTE, MAX_DAYS, parameters, sinceDate, toObjects } from "./queries";
 
 const athena = new AthenaClient({});
@@ -17,14 +17,21 @@ const POLL_MS = 300;
 const DEADLINE_MS = 25_000;
 
 // GET /v1/analytics/summary?days=7: cost, latency, errors and security blocks for the
-// authenticated tenant, by route and model and by day, from the S3/Athena data lake.
+// authenticated tenant (API key or console session), by route and model and by day, from
+// the S3/Athena data lake.
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStructuredResultV2> {
-	const key = bearerToken(event.headers.authorization);
-	const tenant = key ? await tenantForKey(key) : null;
-	if (!tenant) return json(401, { error: "invalid API key" });
+	const tenant = await resolveTenant(event);
+	if (!tenant) return jwtClaims(event) ? json(404, { error: "not found" }) : json(401, { error: "invalid API key" });
 
 	const days = Number(event.queryStringParameters?.days ?? 7);
 	if (!Number.isInteger(days) || days < 1 || days > MAX_DAYS) return json(400, { error: `days must be an integer from 1 to ${MAX_DAYS}` });
+
+	// Athena bills by data scanned, so each org gets a daily number of queries. The row is kept
+	// two days so it outlives its UTC day whenever it was created.
+	const now = Date.now();
+	if (!(await consumeCounter(counterIds.athena(tenant.org_id, now), 1, tenant.limits.analytics_queries_per_day, Math.floor(now / 1000) + 2 * 86_400))) {
+		return json(429, { error: "daily analytics query cap reached" }, { "x-tracewise-limit": "analytics", "retry-after": String(secondsUntilUtcMidnight(now)) });
+	}
 
 	const params = parameters(tenant.tenant_id, sinceDate(days));
 	const started = Date.now();

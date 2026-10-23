@@ -10,6 +10,7 @@ import {
 	Choice,
 	Condition,
 	DefinitionBody,
+	JsonPath,
 	LogLevel,
 	Map as MapState,
 	Pass,
@@ -36,6 +37,10 @@ export interface EvalsProps {
 export class Evals extends Construct {
 	readonly table: TableV2;
 	readonly stateMachine: StateMachine;
+	// Exposed so the stack can grant them the accounts and quota tables it owns.
+	readonly listFn: NodejsFunction;
+	readonly sampleFn: NodejsFunction;
+	readonly recordFn: NodejsFunction;
 
 	constructor(scope: Construct, id: string, props: EvalsProps) {
 		super(scope, id);
@@ -55,6 +60,9 @@ export class Evals extends Construct {
 		const sample = props.fn("EvalSample", entry, { handler: "sample", timeout: Duration.seconds(60) });
 		const judge = props.fn("EvalJudge", entry, { handler: "judge", timeout: Duration.seconds(60) });
 		const record = props.fn("EvalRecord", entry, { handler: "record", timeout: Duration.seconds(30) });
+		this.listFn = list;
+		this.sampleFn = sample;
+		this.recordFn = record;
 
 		props.tenants.grantReadData(list);
 		props.traces.grantReadData(sample);
@@ -72,6 +80,14 @@ export class Evals extends Construct {
 				actions: ["cloudwatch:PutMetricData"],
 				resources: ["*"], // PutMetricData has no resource-level permissions...
 				conditions: { StringEquals: { "cloudwatch:namespace": "Tracewise/Evals" } }, // ...so scope by namespace
+			}),
+		);
+		// listTenants reports when the global judge cap shrinks an org's budget.
+		list.addToRolePolicy(
+			new PolicyStatement({
+				actions: ["cloudwatch:PutMetricData"],
+				resources: ["*"],
+				conditions: { StringEquals: { "cloudwatch:namespace": "Tracewise/Limits" } },
 			}),
 		);
 		// Cross-region inference profiles route to the model in several US regions.
@@ -129,6 +145,8 @@ export class Evals extends Construct {
 				"tenant_id.$": "$.tenant_id",
 				"name.$": "$.name",
 				"day.$": "$.day",
+				"sample_budget.$": "$.sample_budget",
+				"sample_limit.$": "$.sample_limit",
 				"results.$": "$.results",
 			}),
 		});
@@ -143,12 +161,18 @@ export class Evals extends Construct {
 		const eachTenant = new MapState(this, "EachTenant", {
 			itemsPath: "$.tenants",
 			maxConcurrency: 2,
+			// Step Functions passes on only the fields named here.
 			itemSelector: {
 				"tenant_id.$": "$$.Map.Item.Value.tenant_id",
 				"name.$": "$$.Map.Item.Value.name",
 				"day.$": "$$.Map.Item.Value.day",
 				"rubric.$": "$$.Map.Item.Value.rubric",
+				"sample_budget.$": "$$.Map.Item.Value.sample_budget",
+				"sample_limit.$": "$$.Map.Item.Value.sample_limit",
 			},
+			// Each org's run is recorded by its own Record step; collecting every org's
+			// output into one state would only push it towards the 256 KB limit.
+			resultPath: JsonPath.DISCARD,
 		});
 		eachTenant.itemProcessor(perTenant);
 
