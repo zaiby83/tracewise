@@ -28,9 +28,15 @@ const S3_BATCH = 1000; // DeleteObjects' maximum
 const S3_CALLS_PER_RUN = 3;
 const MAX_ATTEMPTS = 4;
 const SWEEP_DELAY_SECONDS = 900;
-// Day offsets back from the anchor. Traces expire at most MAX_RETENTION_DAYS (the longest plan)
-// after their event and two more days cover TTL lag. Partitions use the client's own date (ts.slice(0, 10)), so an event
-// stamped with a +14:00 offset already lands on tomorrow (-1), which is checked last.
+// A fresh org's trace pass is 940 sequential queries and empty partitions don't spend
+// BATCHES_PER_RUN, so a run also stops on elapsed time (the Lambda timeout is 60 s).
+const RUN_TIME_BUDGET_MS = 40_000;
+// Day offsets back from the anchor. Traces expire at most MAX_RETENTION_DAYS (the longest
+// plan) after their event. Partitions use the client's own date (ts.slice(0, 10)), and the
+// processor keeps events up to MAX_RETENTION_DAYS + 1 days old, so a -12:00 stamp can sit
+// one more day back. The two extra days cover that margin and the "tomorrow" edge, which
+// leaves about one day for TTL lag. An event stamped with a +14:00 offset already lands on
+// tomorrow (-1), which is checked last.
 const TRACE_DAYS = [...Array.from({ length: MAX_RETENTION_DAYS + 3 }, (_, i) => i), -1];
 // The sweep re-checks the days around the anchor for writes that landed after the first pass.
 const SWEEP_DAYS = [-1, 0, 1];
@@ -154,13 +160,14 @@ async function deleteTraces(msg: DeletionMessage, anchor: string, days: number[]
 	let shard = msg.cursor?.shard ?? 0;
 	let lastKey = msg.cursor?.lastKey;
 	const budget = { batches: BATCHES_PER_RUN };
+	const deadline = Date.now() + RUN_TIME_BUDGET_MS;
 
 	while (dayIndex < days.length) {
 		const day = days[dayIndex]!;
 		const date = new Date(Date.parse(anchor) - day * 86_400_000).toISOString().slice(0, 10);
 		const partitions = partitionsForDay(msg.org_id, date);
 		do {
-			if (budget.batches <= 0) return { org_id: msg.org_id, phase: msg.phase, cursor: { anchor, day, shard, lastKey } };
+			if (budget.batches <= 0 || Date.now() >= deadline) return { org_id: msg.org_id, phase: msg.phase, cursor: { anchor, day, shard, lastKey } };
 			const pk = partitions[shard]!;
 			const page = await ddb.send(
 				new QueryCommand({

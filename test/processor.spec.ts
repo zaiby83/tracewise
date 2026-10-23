@@ -43,9 +43,25 @@ describe("processor", () => {
 		expect(ttl({})).toBe(at + 30 * 86400);
 	});
 
-	it.each([0, -5, 1000, "90", null, Number.NaN])("falls back to the default retention for a bad retention_days (%s)", (bad) => {
+	it.each([0, -5, "90", null, Number.NaN])("falls back to the default retention for a bad retention_days (%s)", (bad) => {
 		const item = toItem({ messageId: "m", body: JSON.stringify(queued({ retention_days: bad })) } as never)!;
-		expect(item.expires_at).toBe(Math.floor(Date.parse("2026-10-21T18:00:00.000Z") / 1000) + (bad === 1000 ? 90 : 30) * 86400);
+		expect(item.expires_at).toBe(Math.floor(Date.parse("2026-10-21T18:00:00.000Z") / 1000) + 30 * 86400);
+	});
+
+	it("clamps a retention above the longest plan to 90 days", () => {
+		const item = toItem({ messageId: "m", body: JSON.stringify(queued({ retention_days: 1000 })) } as never)!;
+		expect(item.expires_at).toBe(Math.floor(Date.parse("2026-10-21T18:00:00.000Z") / 1000) + 90 * 86400);
+	});
+
+	it("keeps retention_days out of the stored item and the Firehose record", async () => {
+		expect(toItem({ messageId: "m", body: JSON.stringify(queued({ retention_days: 90 })) } as never)).not.toHaveProperty("retention_days");
+		await handler(sqsEvent([JSON.stringify(queued({ retention_days: 90 }))]));
+		const stored = ddb.send.mock.calls[0]![0].input.RequestItems.traces[0].PutRequest.Item;
+		expect(stored).not.toHaveProperty("retention_days");
+		expect(stored).toHaveProperty("expires_at");
+		const record = JSON.parse(new TextDecoder().decode((firehose.mock.calls[0]![0] as { input: { Records: { Data: Uint8Array }[] } }).input.Records[0]!.Data));
+		expect(record).not.toHaveProperty("retention_days");
+		expect(record).toMatchObject({ tenant_id: "t1" });
 	});
 
 	it("writes in chunks of 25 and reports no failures on success", async () => {
@@ -128,6 +144,29 @@ describe("processor", () => {
 			await handler(sqsEvent([pro, free, legacy, tooOldForPro].map((e) => JSON.stringify(e))));
 			expect(putItems()).toEqual([pro.event_id]);
 			expect(streamed().sort()).toEqual([pro, free, legacy, tooOldForPro].map((e) => e.event_id).sort());
+		});
+
+		it("clamps an oversized retention_days in the window check too", async () => {
+			const now = Date.now();
+			const old = queued({ retention_days: 1000, ts: new Date(now - 95 * 86_400_000).toISOString() });
+			const ok = queued({ retention_days: 1000, ts: new Date(now - 60 * 86_400_000).toISOString() });
+			await handler(sqsEvent([old, ok].map((e) => JSON.stringify(e))));
+			expect(putItems()).toEqual([ok.event_id]);
+			expect(streamed().sort()).toEqual([old.event_id, ok.event_id].sort());
+		});
+
+		it("keeps a Pro event stamped -12:00 at the 91-day edge, in a partition the deleter visits", async () => {
+			// Early in the UTC day, a -12:00 stamp's own date is the day before the instant's date.
+			vi.setSystemTime(Date.parse("2026-10-22T03:00:00Z"));
+			const instant = Date.now() - 91 * 86_400_000 + 60_000;
+			const edge = queued({ retention_days: 90, ts: new Date(instant - 12 * 3_600_000).toISOString().replace("Z", "-12:00") });
+			await handler(sqsEvent([JSON.stringify(edge)]));
+			expect(putItems()).toEqual([edge.event_id]);
+			const pk: string = ddb.send.mock.calls[0]![0].input.RequestItems.traces[0].PutRequest.Item.pk;
+			const date = pk.split("#")[1]!;
+			// The deleter's anchor is 2026-10-22; offset 92 is its oldest trace day.
+			expect(date >= "2026-07-22").toBe(true);
+			expect(date).toBe("2026-07-22");
 		});
 
 		it("keeps a Pro event at the 91-day edge", async () => {

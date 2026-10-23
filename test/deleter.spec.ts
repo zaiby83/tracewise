@@ -79,6 +79,19 @@ describe("deleter: dynamo phase", () => {
 		expect(pks).toHaveLength(94 * 10);
 	});
 
+	it("stops when the run's time budget is spent and returns the cursor where it left off", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(now);
+		// Every query takes 10 s and finds nothing, so empty partitions never spend the batch budget.
+		ddbImpl(async () => {
+			vi.setSystemTime(Date.now() + 10_000);
+			return { Items: [] };
+		});
+		const next = await runPhase({ org_id: "o1", phase: "dynamo" }, now);
+		expect(sent(QueryCommand)).toHaveLength(4);
+		expect(next).toEqual({ org_id: "o1", phase: "dynamo", cursor: { anchor: "2026-10-22", day: 0, shard: 4, lastKey: undefined } });
+	});
+
 	it("resumes from its cursor and keeps the day anchored across midnight", async () => {
 		ddbImpl(async () => ({ Items: [] }));
 		const later = Date.parse("2026-10-23T00:30:00Z");

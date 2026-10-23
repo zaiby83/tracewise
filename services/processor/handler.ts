@@ -20,16 +20,16 @@ const firehose = new FirehoseClient({});
 // analytics tolerates by counting distinct event ids.
 export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 	const failures = new Set<string>();
-	const items: { messageId: string; item: Record<string, unknown> }[] = [];
+	const items: { messageId: string; item: Record<string, unknown>; retention: number }[] = [];
 
 	for (const record of event.Records) {
-		const item = toItem(record);
-		if (item) items.push({ messageId: record.messageId, item });
+		const parsed = parse(record);
+		if (parsed) items.push({ messageId: record.messageId, ...parsed });
 		else failures.add(record.messageId);
 	}
 
 	const now = Date.now();
-	const hot = items.filter(({ item }) => inHotWindow(String(item.ts), now, retentionOf(item.retention_days)));
+	const hot = items.filter(({ item, retention }) => inHotWindow(String(item.ts), now, retention));
 	// Content stays out of the log: just how many, so a misconfigured client clock shows up.
 	if (hot.length < items.length) log("warn", "events outside the hot store window, streamed only", { skipped: items.length - hot.length, total: items.length });
 
@@ -44,15 +44,25 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 }
 
 export function toItem(record: SQSRecord): Record<string, unknown> | null {
+	return parse(record)?.item ?? null;
+}
+
+// The retention is resolved once per event: it sets the TTL and the window check, and is
+// kept out of the item so it reaches neither the hot store, the query API nor the lake.
+function parse(record: SQSRecord): { item: Record<string, unknown>; retention: number } | null {
 	try {
-		const e = JSON.parse(record.body) as QueuedEvent;
+		const { retention_days, ...e } = JSON.parse(record.body) as QueuedEvent;
+		const retention = retentionOf(retention_days);
 		return {
-			pk: partitionKey(e.tenant_id, e.ts, e.event_id),
-			sk: sortKey(e.ts, e.event_id),
-			expires_at: expiresAt(e.ts, retentionOf(e.retention_days)),
-			...e,
-			// With received_at, this gives the pipeline's own latency (queue + processing).
-			processed_at: new Date().toISOString(),
+			retention,
+			item: {
+				pk: partitionKey(e.tenant_id, e.ts, e.event_id),
+				sk: sortKey(e.ts, e.event_id),
+				expires_at: expiresAt(e.ts, retention),
+				...e,
+				// With received_at, this gives the pipeline's own latency (queue + processing).
+				processed_at: new Date().toISOString(),
+			},
 		};
 	} catch (err) {
 		log("error", "unparseable message", { messageId: record.messageId, error: String(err) });
