@@ -126,6 +126,9 @@ describe("counters and quota", () => {
 		ddb.send.mockReset().mockResolvedValue({});
 		await consumeQuota(tenant, 1);
 		expect(sentUpdates()[1]!.input.ExpressionAttributeValues[":exp"]).toBe(Date.parse("2026-11-01") / 1000 + 40 * 86_400);
+		ddb.send.mockReset().mockResolvedValue({});
+		await consumeQuota({ ...tenant, period_end: "2026-11-01T00:00:00.500Z" }, 1);
+		expect(sentUpdates()[1]!.input.ExpressionAttributeValues[":exp"]).toBe(Date.parse("2026-11-01") / 1000 + 40 * 86_400);
 	});
 	it("always counts paid usage even without a cap, so the meter can read it", async () => {
 		const pro = { ...tenant, plan: "pro", limits: { ...PLANS.pro.limits, monthly_events: null } };

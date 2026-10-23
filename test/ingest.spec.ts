@@ -82,6 +82,24 @@ describe("ingest handler", () => {
 		expect(tenants.releaseQuota).toHaveBeenCalledWith(tenant, 2);
 	});
 
+	it("gives the counted events back when SQS throws", async () => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		send.mockRejectedValue(new Error("throttled"));
+		const res = await handler(request({ events: [event(), event(), event()] }));
+		expect(res.statusCode).toBe(503);
+		expect(res.headers).toMatchObject({ "retry-after": "2" });
+		expect(JSON.parse(res.body!)).toEqual({ error: "temporarily unable to accept events, retry" });
+		expect(tenants.releaseQuota).toHaveBeenCalledWith(tenant, 3);
+	});
+
+	it("tells clients to wait a minute when the period has already ended", async () => {
+		tenants.secondsUntil.mockReturnValueOnce(0);
+		tenants.consumeQuota.mockResolvedValue("month");
+		const res = await handler(request({ events: [event()] }));
+		expect(res.statusCode).toBe(429);
+		expect(res.headers).toMatchObject({ "retry-after": "60" });
+	});
+
 	it("does not release anything when the events were enqueued", async () => {
 		await handler(request({ events: [event()] }));
 		expect(tenants.releaseQuota).not.toHaveBeenCalled();

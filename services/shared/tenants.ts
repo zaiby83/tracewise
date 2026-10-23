@@ -1,6 +1,6 @@
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import { GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import { periodBounds, planFields } from "../billing/plans";
+import { periodBounds, planFields, retentionFor } from "../billing/plans";
 import { getProfile, legacyLimits, type Limits } from "./accounts";
 import { ddb } from "./ddb";
 import { log } from "./http";
@@ -72,7 +72,7 @@ async function resolve(keyHash: string): Promise<Tenant | null> {
 			// Legacy tenants keep their old behaviour: uncapped, 30 days, calendar-month counter.
 			plan: "custom",
 			limits: legacyLimits(Item.events_per_minute),
-			retention_days: 30,
+			retention_days: retentionFor({ plan: "custom" }),
 			period_start: period.start,
 			period_end: period.end,
 			rubric: null,
@@ -147,7 +147,7 @@ export async function consumeQuota(tenant: Tenant, events: number, now = Date.no
 	if (!(await consumeCounter(counterIds.minute(tenant.org_id, now), events, tenant.limits.events_per_minute, (minute + 2) * 60))) return "minute";
 
 	// Kept 40 days past the period end so the meter can still read it after a late webhook.
-	const expiresAt = Date.parse(tenant.period_end) / 1000 + FORTY_DAYS_S;
+	const expiresAt = Math.floor(Date.parse(tenant.period_end) / 1000) + FORTY_DAYS_S;
 	const max = tenant.limits.monthly_events ?? Number.MAX_SAFE_INTEGER;
 	if (!(await consumeCounter(counterIds.period(tenant.org_id, tenant.period_start), events, max, expiresAt))) {
 		// Free orgs hit their allowance; paid orgs hit the spend cap they chose.

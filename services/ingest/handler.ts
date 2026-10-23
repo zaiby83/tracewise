@@ -9,6 +9,10 @@ import { canWrite, consumeQuota, releaseQuota, secondsUntil, tenantForKey } from
 const sqs = new SQSClient({});
 const SQS_BATCH = 10; // SendMessageBatch's maximum
 
+// Seconds until the period ends. A period that has already ended (late renewal webhook, or a
+// cached tenant) would give 0, which invites a tight retry loop, so wait a minute instead.
+const retryAfter = (periodEnd: string): number => secondsUntil(periodEnd) || 60;
+
 // POST /v1/traces. This function only authenticates, validates and enqueues: the
 // request path does no storage writes, so it stays fast under bursts and the queue
 // absorbs whatever downstream can't take yet. 202 means every accepted event is
@@ -38,7 +42,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 		log("warn", "quota exceeded", { tenant_id: tenant.tenant_id, events: valid.length, limit: quota });
 		if (quota === "month" || quota === "spend_cap") {
 			const error = quota === "month" ? "monthly event allowance used" : "spend cap reached";
-			return json(429, { error }, { "retry-after": String(secondsUntil(tenant.period_end)), "x-tracewise-limit": quota });
+			return json(429, { error }, { "retry-after": String(retryAfter(tenant.period_end)), "x-tracewise-limit": quota });
 		}
 		return json(429, { error: "events-per-minute quota exceeded" }, { "retry-after": "60", "x-tracewise-limit": "minute" });
 	}
@@ -49,7 +53,15 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 		MessageBody: JSON.stringify({ ...e, tenant_id: tenant.tenant_id, received_at, retention_days: tenant.retention_days } satisfies QueuedEvent),
 	}));
 
-	const failed = await enqueue(entries);
+	// A thrown SQS error (throttling, timeout, permissions) is the same outcome as refused
+	// entries: nothing is known to be queued, so count the whole batch as failed.
+	let failed: number;
+	try {
+		failed = await enqueue(entries);
+	} catch (err) {
+		log("error", "enqueue threw", { tenant_id: tenant.tenant_id, error: err instanceof Error ? err.message : String(err) });
+		failed = entries.length;
+	}
 	if (failed > 0) {
 		// The client retries the whole batch; event ids make the retry idempotent.
 		log("error", "enqueue failed", { tenant_id: tenant.tenant_id, failed, total: entries.length });
