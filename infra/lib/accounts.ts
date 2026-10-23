@@ -100,8 +100,9 @@ export class Accounts extends Construct {
 		});
 
 		// ---- Console --------------------------------------------------------------
-		// The billing routes call Stripe (10 s per attempt, with retries), so the console gets just
-		// under API Gateway's 30 s integration limit rather than failing a slow Checkout or plan change.
+		// The billing routes call Stripe, so the console gets just under API Gateway's 30 s integration
+		// limit. That covers the common slow call, not every retry chain: the SDK's worst case (10 s x 3
+		// attempts plus backoff) can still exceed 30 s, and the caller then sees a 503.
 		this.consoleFn = props.fn("ConsoleFn", "console/handler.ts", { timeout: Duration.seconds(29) });
 		this.consoleFn.addEnvironment("ACCOUNTS_TABLE", props.accounts.tableName);
 		this.consoleFn.addEnvironment("TENANTS_TABLE", props.keyIndex.tableName);

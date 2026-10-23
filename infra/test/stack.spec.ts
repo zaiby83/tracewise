@@ -426,11 +426,13 @@ describe("TracewiseStack", () => {
 				expect.objectContaining({ MetricNamespace: "Tracewise/Billing", MetricName: "WebhookFailures", MetricValue: "1" }),
 			]);
 			const pattern = filter!.Properties.FilterPattern as string;
-			expect(pattern).toContain('$.level = "error"');
+			// Lambda's default Text format prefixes each line (timestamp, request id, level), so a JSON
+			// selector never matches; quoted phrases match anywhere in the line.
+			expect(pattern).not.toContain("$.");
 			// Each message must be one the handler really logs on its 500 path, or the alarm can never fire.
 			const handler = readFileSync(new URL("../../services/billing/webhook.ts", import.meta.url), "utf8");
 			for (const msg of WEBHOOK_FAILURE_MESSAGES) {
-				expect(pattern).toContain(`$.msg = "${msg}"`);
+				expect(pattern).toContain(`"${msg}"`);
 				expect(handler).toContain(`log("error", "${msg}"`);
 			}
 			template.hasResourceProperties("AWS::CloudWatch::Alarm", {

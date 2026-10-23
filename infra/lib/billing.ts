@@ -58,6 +58,7 @@ export class Billing extends Construct {
 		// Each Stripe call can take ~30 s with the SDK's retries. The webhook's event lease
 		// (LEASE_SECONDS, 90 s, in services/billing/subscriptions.ts) must outlast the whole
 		// invocation, or a Stripe retry could run the same event concurrently.
+		// Outliving API Gateway's 30 s response cap is deliberate: Stripe may see a 503 and retry, and the 90 s lease plus idempotent handling make that safe.
 		this.webhookFn = props.fn("BillingWebhook", "billing/webhook.ts", { timeout: Duration.seconds(60) });
 		// One run reports every paid org, five at a time.
 		this.meterFn = props.fn("BillingMeter", "billing/meter-handler.ts", { timeout: Duration.minutes(5) });
@@ -106,7 +107,9 @@ export class Billing extends Construct {
 		// sees them. Its error log lines do.
 		const webhookFailures = new MetricFilter(this, "WebhookFailureFilter", {
 			logGroup: this.webhookFn.logGroup,
-			filterPattern: FilterPattern.any(...WEBHOOK_FAILURE_MESSAGES.map((m) => FilterPattern.all(FilterPattern.stringValue("$.level", "=", "error"), FilterPattern.stringValue("$.msg", "=", m)))),
+			// Lambda's default Text log format prefixes each line with the timestamp, request id and
+			// level, so JSON selectors never match. Quoted phrases (CDK adds the quotes) match anywhere.
+			filterPattern: FilterPattern.anyTerm(...WEBHOOK_FAILURE_MESSAGES),
 			metricNamespace: "Tracewise/Billing",
 			metricName: "WebhookFailures",
 			metricValue: "1",
