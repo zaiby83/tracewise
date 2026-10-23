@@ -387,19 +387,34 @@ describe("clearFlushDue", () => {
 });
 
 describe("webhook event records", () => {
-	it("claims each Stripe event with a lease, and treats a finished or live one as a duplicate", async () => {
-		ddb.send.mockReset().mockResolvedValueOnce({}).mockRejectedValueOnce(Object.assign(new Error("dup"), { name: "ConditionalCheckFailedException" }));
-		expect(await recordEventOnce("evt_1", "invoice.paid", NOW)).toBe(true);
+	const refused = (item?: object) => Object.assign(new Error("cond"), { name: "ConditionalCheckFailedException", ...(item ? { Item: item } : {}) });
+
+	it("claims each Stripe event with a lease and reads the existing item back when refused", async () => {
+		ddb.send.mockReset().mockResolvedValueOnce({});
+		expect(await recordEventOnce("evt_1", "invoice.paid", NOW)).toBe("claimed");
 		const input = ddb.send.mock.calls[0]![0].input;
 		expect(input).toMatchObject({
-			// A lapsed lease is taken over; anything else already recorded is a duplicate.
+			// A lapsed lease is taken over; anything else already recorded is not ours.
 			ConditionExpression: "attribute_not_exists(pk) OR (#st = :processing AND lease_until < :now)",
 			ExpressionAttributeNames: { "#st": "status" },
 			ExpressionAttributeValues: { ":processing": "processing", ":now": NOW / 1000 },
-			Item: { pk: "STRIPE_EVENT#evt_1", sk: "EVENT", type: "invoice.paid", status: "processing", lease_until: NOW / 1000 + 300, received_at: "2026-10-23T00:00:00.000Z" },
+			ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+			Item: { pk: "STRIPE_EVENT#evt_1", sk: "EVENT", type: "invoice.paid", status: "processing", lease_until: NOW / 1000 + 90, received_at: "2026-10-23T00:00:00.000Z" },
 		});
 		expect(input.Item.expires_at - NOW / 1000).toBe(30 * 86_400);
-		expect(await recordEventOnce("evt_1", "invoice.paid", NOW)).toBe(false);
+	});
+	it.each([
+		["a finished event", { status: { S: "done" } }, "done"],
+		["a live lease", { status: { S: "processing" }, lease_until: { N: "1792756890" } }, "in_progress"],
+		["unmarshalled attributes, as a mock or newer SDK may give", { status: "processing" }, "in_progress"],
+		["a record from before leases, with no status", { type: { S: "invoice.paid" } }, "done"],
+	])("tells %s apart when refused", async (_n, item, want) => {
+		ddb.send.mockReset().mockRejectedValueOnce(refused(item));
+		expect(await recordEventOnce("evt_1", "invoice.paid", NOW)).toBe(want);
+	});
+	it("assumes in progress when the refusal carries no item, so Stripe retries rather than loses the event", async () => {
+		ddb.send.mockReset().mockRejectedValueOnce(refused());
+		expect(await recordEventOnce("evt_1", "invoice.paid", NOW)).toBe("in_progress");
 	});
 	it("takes over a stale processing record: the lease time it compares against is the current time", async () => {
 		// The condition is DynamoDB's to evaluate; what matters here is that a later delivery asks with a later `now`.
@@ -408,7 +423,7 @@ describe("webhook event records", () => {
 		await recordEventOnce("evt_1", "invoice.paid", NOW + 600_000);
 		const nows = ddb.send.mock.calls.map(([c]) => c.input.ExpressionAttributeValues[":now"]);
 		expect(nows[1] - nows[0]).toBe(600);
-		expect(ddb.send.mock.calls[1]![0].input.Item.lease_until).toBe(NOW / 1000 + 600 + 300);
+		expect(ddb.send.mock.calls[1]![0].input.Item.lease_until).toBe(NOW / 1000 + 600 + 90);
 	});
 	it("marks an event done once it has been handled, ending its lease", async () => {
 		ddb.send.mockReset().mockResolvedValueOnce({});

@@ -48,7 +48,7 @@ beforeEach(() => {
 	vi.useFakeTimers({ toFake: ["Date"] });
 	vi.setSystemTime(NOW);
 	for (const m of [retrieve, meter.reportOrgUsage, ...Object.values(subs)]) m.mockReset();
-	subs.recordEventOnce.mockResolvedValue(true);
+	subs.recordEventOnce.mockResolvedValue("claimed");
 	subs.orgForCustomer.mockResolvedValue("o1");
 	subs.applySubscription.mockResolvedValue(apply());
 	subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team" });
@@ -88,8 +88,30 @@ describe("signature", () => {
 });
 
 describe("idempotency and errors", () => {
+	it("answers 409 for an event another delivery is still processing, touching nothing", async () => {
+		subs.recordEventOnce.mockResolvedValue("in_progress");
+		const res = await call(evt("customer.subscription.updated", sub()));
+		expect(res.statusCode).toBe(409);
+		expect(JSON.parse(res.body as string)).toEqual({ error: "event in progress, retry later" });
+		expect(subs.forgetEvent).not.toHaveBeenCalled();
+		expect(subs.completeEvent).not.toHaveBeenCalled();
+		expect(retrieve).not.toHaveBeenCalled();
+		expect(subs.applySubscription).not.toHaveBeenCalled();
+	});
+
+	it("still answers 200 when marking the event done fails after the work succeeded", async () => {
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		retrieve.mockResolvedValue(sub());
+		subs.completeEvent.mockRejectedValue(new Error("ddb blip"));
+		const res = await call(evt("customer.subscription.updated", sub({ metadata: { org_id: "o1" } })));
+		expect(res.statusCode).toBe(200);
+		expect(subs.applySubscription).toHaveBeenCalledOnce();
+		expect(subs.forgetEvent).not.toHaveBeenCalled();
+		expect(JSON.parse(String(error.mock.calls[0]![0]))).toMatchObject({ event_id: "evt_1", type: "customer.subscription.updated", org_id: "o1", error: "ddb blip" });
+	});
+
 	it("ignores a replayed event", async () => {
-		subs.recordEventOnce.mockResolvedValue(false);
+		subs.recordEventOnce.mockResolvedValue("done");
 		const res = await call(evt("customer.subscription.updated", sub()));
 		expect(res.statusCode).toBe(200);
 		expect(JSON.parse(res.body as string)).toEqual({ ok: true, duplicate: true });
@@ -122,7 +144,7 @@ describe("idempotency and errors", () => {
 
 	it("claims the event with the current time, and marks it done only after handling succeeds", async () => {
 		const order: string[] = [];
-		subs.recordEventOnce.mockImplementation(async () => (order.push("record"), true));
+		subs.recordEventOnce.mockImplementation(async () => (order.push("record"), "claimed" as const));
 		subs.applySubscription.mockImplementation(async () => (order.push("apply"), apply()));
 		subs.completeEvent.mockImplementation(async () => void order.push("done"));
 		retrieve.mockResolvedValue(sub());
@@ -288,7 +310,7 @@ describe("invoice events", () => {
 			expect(res.statusCode).toBe(200);
 			expect(retrieve).toHaveBeenLastCalledWith("sub_1");
 			expect(subs.applySubscription).toHaveBeenCalledWith("o1", fresh, NOW, undefined);
-			subs.recordEventOnce.mockResolvedValue(true);
+			subs.recordEventOnce.mockResolvedValue("claimed");
 		}
 	});
 
@@ -340,7 +362,7 @@ describe("flushing the previous period", () => {
 	it("does nothing when nothing is due or the apply wrote nothing", async () => {
 		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team" });
 		await run();
-		subs.recordEventOnce.mockResolvedValue(true);
+		subs.recordEventOnce.mockResolvedValue("claimed");
 		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team", flush_due: due() });
 		subs.applySubscription.mockResolvedValue(apply({ applied: false }));
 		await run();
@@ -369,7 +391,7 @@ describe("flushing the previous period", () => {
 		subs.getBilling.mockResolvedValue({ org_id: "o1", plan: "team", flush_due: due() });
 		meter.reportOrgUsage.mockRejectedValueOnce(new Error("stripe down")).mockResolvedValueOnce({ sent: 1 });
 		expect((await run()).statusCode).toBe(500);
-		subs.recordEventOnce.mockResolvedValue(true);
+		subs.recordEventOnce.mockResolvedValue("claimed");
 		expect((await run()).statusCode).toBe(200);
 		expect(subs.clearFlushDue).toHaveBeenCalledOnce();
 	});

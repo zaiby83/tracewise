@@ -297,11 +297,17 @@ export async function clearFlushDue(orgId: string, period: string): Promise<void
 }
 
 // A claim on an event expires, so a Lambda killed mid-processing doesn't lose the event: once the lease
-// has lapsed the next delivery takes it over. Must outlast the webhook Lambda's timeout.
-const LEASE_SECONDS = 300;
+// has lapsed the next delivery takes it over. Must outlast the webhook Lambda's timeout (60 s).
+const LEASE_SECONDS = 90;
 
-// First delivery wins: false means Stripe already sent this event and it is done or being handled right now.
-export async function recordEventOnce(eventId: string, type: string, now = Date.now()): Promise<boolean> {
+export type EventClaim = "claimed" | "done" | "in_progress";
+
+// DynamoDB hands back the failed item as raw attribute values ({ S: "done" }); read either shape.
+const scalar = (v: unknown): unknown => (v && typeof v === "object" ? ((v as { S?: string; N?: string }).S ?? (v as { N?: string }).N) : v);
+
+// "claimed": this delivery owns the event. "done": already handled, so a duplicate. "in_progress": another
+// delivery holds a live lease; the caller must not answer 200, because if that one dies nobody else would run it.
+export async function recordEventOnce(eventId: string, type: string, now = Date.now()): Promise<EventClaim> {
 	const nowSeconds = Math.floor(now / 1000);
 	try {
 		await ddb.send(
@@ -315,16 +321,21 @@ export async function recordEventOnce(eventId: string, type: string, now = Date.
 					received_at: new Date(now).toISOString(),
 					expires_at: nowSeconds + EVENT_TTL_SECONDS,
 				},
-				// A finished event, or one whose lease is still live, is a duplicate; an expired lease is taken over.
+				// A finished event, or one whose lease is still live, is not ours; an expired lease is taken over.
 				ConditionExpression: "attribute_not_exists(pk) OR (#st = :processing AND lease_until < :now)",
 				ExpressionAttributeNames: { "#st": "status" },
 				ExpressionAttributeValues: { ":processing": "processing", ":now": nowSeconds },
+				ReturnValuesOnConditionCheckFailure: "ALL_OLD",
 			}),
 		);
-		return true;
+		return "claimed";
 	} catch (e) {
-		if ((e as { name?: string }).name === "ConditionalCheckFailedException") return false;
-		throw e;
+		const err = e as { name?: string; Item?: Record<string, unknown> };
+		if (err.name !== "ConditionalCheckFailedException") throw e;
+		// The condition only fails for a live lease or a finished record. A record from before leases has no
+		// status and is finished. With no item to read, assume the worse case (in progress): Stripe just retries.
+		if (!err.Item) return "in_progress";
+		return scalar(err.Item.status) === "processing" ? "in_progress" : "done";
 	}
 }
 

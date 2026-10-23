@@ -139,16 +139,27 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	if (!HANDLED.has(type)) return json(200, { ok: true });
 	let recorded = false;
 	try {
-		if (!(await recordEventOnce(id, type, Date.now()))) {
+		const claim = await recordEventOnce(id, type, Date.now());
+		if (claim === "done") {
 			log("info", "stripe event already processed", { event_id: id, type });
 			return json(200, { ok: true, duplicate: true });
+		}
+		if (claim === "in_progress") {
+			// Not ours to un-record. A 200 here would lose the event if the delivery holding the lease dies.
+			log("info", "stripe event is being processed elsewhere", { event_id: id, type });
+			return json(409, { error: "event in progress, retry later" });
 		}
 		recorded = true;
 		const orgId = await dispatch(stripe, stripeEvent, Date.now());
 		if (orgId) log("info", "stripe event handled", { event_id: id, type, org_id: orgId });
 		// Answering 200 stops Stripe retrying an event that can never find its org.
 		else log("warn", "stripe event not applied: no known org or no subscription", { event_id: id, type });
-		await completeEvent(id);
+		try {
+			await completeEvent(id);
+		} catch (e) {
+			// The work is done and every step is idempotent: the lease just lapses, which is harmless.
+			log("error", "could not mark stripe event done", { event_id: id, type, org_id: orgId ?? undefined, error: message(e) });
+		}
 		return json(200, { ok: true });
 	} catch (e) {
 		log("error", "stripe event failed", { event_id: id, type, error: message(e) });
