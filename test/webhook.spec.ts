@@ -16,6 +16,7 @@ const subs = vi.hoisted(() => ({
 	forgetEvent: vi.fn(),
 	getBilling: vi.fn(),
 	clearFlushDue: vi.fn(),
+	completeEvent: vi.fn(),
 }));
 vi.mock("../services/billing/subscriptions", () => subs);
 const meter = vi.hoisted(() => ({ reportOrgUsage: vi.fn() }));
@@ -92,6 +93,7 @@ describe("idempotency and errors", () => {
 		const res = await call(evt("customer.subscription.updated", sub()));
 		expect(res.statusCode).toBe(200);
 		expect(JSON.parse(res.body as string)).toEqual({ ok: true, duplicate: true });
+		expect(subs.completeEvent).not.toHaveBeenCalled();
 		expect(retrieve).not.toHaveBeenCalled();
 		expect(subs.applySubscription).not.toHaveBeenCalled();
 	});
@@ -118,6 +120,25 @@ describe("idempotency and errors", () => {
 		expect(subs.forgetEvent).not.toHaveBeenCalled();
 	});
 
+	it("claims the event with the current time, and marks it done only after handling succeeds", async () => {
+		const order: string[] = [];
+		subs.recordEventOnce.mockImplementation(async () => (order.push("record"), true));
+		subs.applySubscription.mockImplementation(async () => (order.push("apply"), apply()));
+		subs.completeEvent.mockImplementation(async () => void order.push("done"));
+		retrieve.mockResolvedValue(sub());
+		expect((await call(evt("customer.subscription.updated", sub({ metadata: { org_id: "o1" } })))).statusCode).toBe(200);
+		expect(order).toEqual(["record", "apply", "done"]);
+		expect(subs.recordEventOnce).toHaveBeenCalledWith("evt_1", "customer.subscription.updated", NOW);
+		expect(subs.completeEvent).toHaveBeenCalledWith("evt_1");
+	});
+
+	it("does not mark an event done when handling fails", async () => {
+		retrieve.mockResolvedValue(sub());
+		subs.applySubscription.mockRejectedValue(new Error("ddb down"));
+		await call(evt("customer.subscription.updated", sub()));
+		expect(subs.completeEvent).not.toHaveBeenCalled();
+	});
+
 	it("treats an unknown customer as handled", async () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		subs.orgForCustomer.mockResolvedValue(null);
@@ -125,6 +146,8 @@ describe("idempotency and errors", () => {
 		expect(res.statusCode).toBe(200);
 		expect(subs.applySubscription).not.toHaveBeenCalled();
 		expect(subs.forgetEvent).not.toHaveBeenCalled();
+		// Nothing more will ever come of it, so it is finished, not left to a retry.
+		expect(subs.completeEvent).toHaveBeenCalledWith("evt_1");
 		expect(warn).toHaveBeenCalledOnce();
 		expect(String(warn.mock.calls[0]![0])).toContain("evt_1");
 	});
@@ -132,6 +155,8 @@ describe("idempotency and errors", () => {
 	it("answers 200 for event types it does not handle, without calling Stripe", async () => {
 		const res = await call(evt("customer.created", { id: "cus_1" }));
 		expect(res.statusCode).toBe(200);
+		// Not even an event record is written for it.
+		expect(subs.recordEventOnce).not.toHaveBeenCalled();
 		expect(retrieve).not.toHaveBeenCalled();
 		expect(subs.applySubscription).not.toHaveBeenCalled();
 	});
@@ -153,7 +178,35 @@ describe("checkout.session.completed", () => {
 		expect(res.statusCode).toBe(200);
 		expect(subs.linkCustomer).toHaveBeenCalledWith("o1", "cus_1");
 		expect(retrieve).toHaveBeenCalledWith("sub_1");
-		expect(subs.applySubscription).toHaveBeenCalledWith("o1", fresh, NOW);
+		expect(subs.applySubscription).toHaveBeenCalledWith("o1", fresh, NOW, undefined);
+	});
+
+	it("prefers the org on the re-fetched subscription when the session names none", async () => {
+		retrieve.mockResolvedValue(sub({ metadata: { org_id: "o5" } }));
+		await call(evt("checkout.session.completed", { client_reference_id: null, customer: "cus_1", subscription: "sub_1" }));
+		expect(subs.linkCustomer).toHaveBeenCalledWith("o5", "cus_1");
+		expect(subs.applySubscription).toHaveBeenCalledWith("o5", expect.anything(), NOW, undefined);
+	});
+
+	it("refuses, with a warning, when the session and its subscription name different orgs", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		retrieve.mockResolvedValue(sub({ metadata: { org_id: "o2" } }));
+		const res = await call(evt("checkout.session.completed", { client_reference_id: "o1", customer: "cus_1", subscription: "sub_1" }));
+		expect(res.statusCode).toBe(500);
+		expect(warn).toHaveBeenCalledOnce();
+		expect(subs.linkCustomer).not.toHaveBeenCalled();
+		expect(subs.applySubscription).not.toHaveBeenCalled();
+		expect(subs.forgetEvent).toHaveBeenCalledWith("evt_1");
+	});
+
+	it("fails without applying when the customer is already linked to another org", async () => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		retrieve.mockResolvedValue(sub());
+		subs.linkCustomer.mockRejectedValue(new Error("Stripe customer is already linked to a different org"));
+		const res = await call(evt("checkout.session.completed", { client_reference_id: "o1", customer: "cus_1", subscription: "sub_1" }));
+		expect(res.statusCode).toBe(500);
+		expect(subs.applySubscription).not.toHaveBeenCalled();
 	});
 
 	it("accepts expanded customer and subscription objects", async () => {
@@ -184,24 +237,33 @@ describe("subscription events", () => {
 		const canceled = sub({ status: "canceled" });
 		retrieve.mockResolvedValue(canceled);
 		await call(evt("customer.subscription.updated", sub({ status: "active", metadata: { org_id: "o1" } })));
-		expect(subs.applySubscription).toHaveBeenCalledWith("o1", canceled, NOW);
+		expect(subs.applySubscription).toHaveBeenCalledWith("o1", canceled, NOW, undefined);
 	});
 
 	it("takes the org from metadata without a customer lookup, else from the customer", async () => {
 		retrieve.mockResolvedValue(sub());
 		await call(evt("customer.subscription.created", sub({ metadata: { org_id: "o9" } })));
 		expect(subs.orgForCustomer).not.toHaveBeenCalled();
-		expect(subs.applySubscription).toHaveBeenLastCalledWith("o9", expect.anything(), NOW);
+		expect(subs.applySubscription).toHaveBeenLastCalledWith("o9", expect.anything(), NOW, undefined);
 		await call(evt("customer.subscription.updated", sub(), "evt_2"));
 		expect(subs.orgForCustomer).toHaveBeenCalledWith("cus_1");
-		expect(subs.applySubscription).toHaveBeenLastCalledWith("o1", expect.anything(), NOW);
+		expect(subs.applySubscription).toHaveBeenLastCalledWith("o1", expect.anything(), NOW, undefined);
 	});
 
-	it("applies a deleted subscription Stripe no longer has as null", async () => {
+	it("applies a deleted subscription Stripe no longer has as null, naming the one that was deleted", async () => {
 		retrieve.mockRejectedValue(Object.assign(new Error("No such subscription"), { statusCode: 404 }));
 		const res = await call(evt("customer.subscription.deleted", sub()));
 		expect(res.statusCode).toBe(200);
-		expect(subs.applySubscription).toHaveBeenCalledWith("o1", null, NOW);
+		expect(subs.applySubscription).toHaveBeenCalledWith("o1", null, NOW, "sub_1");
+	});
+
+	it.each(["created", "updated"])("never reads a 404 on customer.subscription.%s as a deletion", async (kind) => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		retrieve.mockRejectedValue(Object.assign(new Error("No such subscription"), { statusCode: 404 }));
+		const res = await call(evt(`customer.subscription.${kind}`, sub()));
+		expect(res.statusCode).toBe(500);
+		expect(subs.applySubscription).not.toHaveBeenCalled();
+		expect(subs.forgetEvent).toHaveBeenCalledWith("evt_1");
 	});
 
 	it("retries on any other Stripe error", async () => {
@@ -225,7 +287,7 @@ describe("invoice events", () => {
 			const res = await call(evt(type, invoice));
 			expect(res.statusCode).toBe(200);
 			expect(retrieve).toHaveBeenLastCalledWith("sub_1");
-			expect(subs.applySubscription).toHaveBeenCalledWith("o1", fresh, NOW);
+			expect(subs.applySubscription).toHaveBeenCalledWith("o1", fresh, NOW, undefined);
 			subs.recordEventOnce.mockResolvedValue(true);
 		}
 	});
@@ -233,7 +295,7 @@ describe("invoice events", () => {
 	it("prefers the org in the invoice's subscription metadata", async () => {
 		retrieve.mockResolvedValue(sub());
 		await call(evt("invoice.paid", { customer: "cus_1", parent: { subscription_details: { subscription: "sub_1", metadata: { org_id: "o7" } } } }));
-		expect(subs.applySubscription).toHaveBeenCalledWith("o7", expect.anything(), NOW);
+		expect(subs.applySubscription).toHaveBeenCalledWith("o7", expect.anything(), NOW, undefined);
 	});
 
 	it("ignores an invoice with no subscription", async () => {
@@ -313,29 +375,20 @@ describe("flushing the previous period", () => {
 	});
 });
 
-describe("customer.subscription.deleted for a subscription Stripe no longer has", () => {
-	const missing = () => retrieve.mockRejectedValue(Object.assign(new Error("No such subscription"), { statusCode: 404 }));
-
-	it("applies null when the org's known subscription is the deleted one", async () => {
-		missing();
-		subs.getBilling.mockResolvedValue({ org_id: "o1", subscription_id: "sub_1" });
-		expect((await call(evt("customer.subscription.deleted", sub()))).statusCode).toBe(200);
-		expect(subs.applySubscription).toHaveBeenCalledWith("o1", null, NOW);
-	});
-
-	it("skips it when the org has moved on to a different subscription", async () => {
-		missing();
-		subs.getBilling.mockResolvedValue({ org_id: "o1", subscription_id: "sub_2" });
+describe("customer.subscription.deleted for a superseded subscription", () => {
+	it("is a handled 200 with no flush when applySubscription refuses it", async () => {
+		retrieve.mockRejectedValue(Object.assign(new Error("No such subscription"), { statusCode: 404 }));
+		subs.applySubscription.mockResolvedValue(apply({ applied: false }));
+		subs.getBilling.mockResolvedValue({ org_id: "o1", flush_due: due() });
 		const res = await call(evt("customer.subscription.deleted", sub()));
 		expect(res.statusCode).toBe(200);
-		expect(subs.applySubscription).not.toHaveBeenCalled();
-		expect(subs.forgetEvent).not.toHaveBeenCalled();
+		expect(subs.completeEvent).toHaveBeenCalledWith("evt_1");
+		expect(meter.reportOrgUsage).not.toHaveBeenCalled();
 	});
 
-	it("still applies null when BILLING knows no subscription", async () => {
-		missing();
-		subs.getBilling.mockResolvedValue({ org_id: "o1", subscription_id: null });
+	it("does not name an expected subscription when Stripe still has it", async () => {
+		retrieve.mockResolvedValue(sub({ status: "canceled" }));
 		await call(evt("customer.subscription.deleted", sub()));
-		expect(subs.applySubscription).toHaveBeenCalledWith("o1", null, NOW);
+		expect(subs.applySubscription).toHaveBeenCalledWith("o1", expect.anything(), NOW, undefined);
 	});
 });

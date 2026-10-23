@@ -12,6 +12,13 @@ export const METER_EVENT_NAME = "tracewise_events";
 // period comparison goes through this so both sides are always dates.
 export const periodKey = (iso: string) => iso.slice(0, 10);
 
+// The timestamp for an event that belongs to a period: inside it (end - 1 s), but never in the future, because
+// Stripe rejects meter events dated ahead and a period can end later than now. Epoch seconds in and out.
+export function clampTimestamp(nowSec: number, periodEndIso?: string | null): number {
+	const end = periodEndIso ? Date.parse(periodEndIso) / 1000 : NaN;
+	return Math.floor(Number.isFinite(end) ? Math.min(nowSec, end - 1) : nowSec);
+}
+
 const isConditionFailure = (e: unknown) => (e as { name?: string }).name === "ConditionalCheckFailedException";
 
 // Stripe refuses a meter event whose identifier it has already accepted. That means an earlier

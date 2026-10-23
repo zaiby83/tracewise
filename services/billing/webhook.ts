@@ -1,9 +1,9 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
 import type Stripe from "stripe";
 import { json, log } from "../shared/http";
-import { periodKey, reportOrgUsage } from "./meter";
+import { clampTimestamp, reportOrgUsage } from "./meter";
 import { getStripe, getWebhookSecret } from "./stripe";
-import { applySubscription, clearFlushDue, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } from "./subscriptions";
+import { applySubscription, clearFlushDue, completeEvent, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } from "./subscriptions";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const idOf = (x: string | { id: string } | null | undefined) => (typeof x === "string" ? x : (x?.id ?? null));
@@ -33,9 +33,7 @@ async function settleFlushDue(orgId: string, now: number): Promise<void> {
 	const current = await getBilling(orgId);
 	const due = current?.flush_due;
 	if (!current || !due) return;
-	// Inside the old period (end - 1 s), but never in the future: Stripe rejects meter events dated ahead,
-	// and a cancellation mid-period leaves the period end ahead of us.
-	const timestamp = Math.floor(Math.min(now, Date.parse(due.period_end) - 1000) / 1000);
+	const timestamp = clampTimestamp(now / 1000, due.period_end);
 	const { sent } = await reportOrgUsage(current, { periodStart: due.period, timestamp });
 	// sent: 0 also covers a refused claim or a pending left to the hourly meter; either way this period is
 	// no longer ours to report, so it is not an error and the marker can go.
@@ -43,8 +41,8 @@ async function settleFlushDue(orgId: string, now: number): Promise<void> {
 	log("info", "flushed previous period", { org_id: orgId, period: due.period, sent });
 }
 
-async function applyAndFlush(orgId: string, sub: Stripe.Subscription | null, now: number): Promise<void> {
-	const result = await applySubscription(orgId, sub, now);
+async function applyAndFlush(orgId: string, sub: Stripe.Subscription | null, now: number, deletedId?: string): Promise<void> {
+	const result = await applySubscription(orgId, sub, now, deletedId);
 	if (result.applied) await settleFlushDue(orgId, now);
 }
 
@@ -57,13 +55,20 @@ async function dispatch(stripe: Stripe, event: Stripe.Event, now: number): Promi
 	switch (event.type) {
 		case "checkout.session.completed": {
 			const session = event.data.object;
-			const orgId = session.client_reference_id;
 			const customerId = idOf(session.customer);
+			const subId = idOf(session.subscription);
+			// A one-off payment session carries no subscription; the link below is all there is to do.
+			const fresh = subId ? await fetchSubscription(stripe, subId, false) : null;
+			// Stripe's own copy of the subscription is authoritative over the session's reference, which the client supplies.
+			const subOrg = fresh?.metadata?.org_id || null;
+			if (subOrg && session.client_reference_id && subOrg !== session.client_reference_id) {
+				log("warn", "checkout org does not match its subscription's org", { event_id: event.id, type: event.type, org_id: subOrg });
+				throw new Error("checkout session and subscription name different orgs");
+			}
+			const orgId = subOrg || session.client_reference_id;
 			if (!orgId || !customerId) return null;
 			await linkCustomer(orgId, customerId);
-			const subId = idOf(session.subscription);
-			// A one-off payment session carries no subscription; the link above is all there is to do.
-			if (subId) await applyAndFlush(orgId, await fetchSubscription(stripe, subId, false), now);
+			if (fresh) await applyAndFlush(orgId, fresh, now);
 			return orgId;
 		}
 		case "customer.subscription.created":
@@ -73,16 +78,12 @@ async function dispatch(stripe: Stripe, event: Stripe.Event, now: number): Promi
 			const orgId = await resolveOrg(evSub.metadata?.org_id, idOf(evSub.customer));
 			if (!orgId) return null;
 			// The event body may be stale or out of order; Stripe's current state is what counts.
-			const fresh = await fetchSubscription(stripe, evSub.id, true);
-			if (!fresh && event.type === "customer.subscription.deleted") {
-				// Applying "no subscription" would drop the plan of a newer subscription this one was replaced by.
-				const known = (await getBilling(orgId))?.subscription_id;
-				if (known && known !== evSub.id) {
-					log("info", "ignoring deletion of a superseded subscription", { event_id: event.id, org_id: orgId });
-					return orgId;
-				}
-			}
-			await applyAndFlush(orgId, fresh, now);
+			// Only a deletion may read "Stripe has no such subscription" as "none": for any other event it is an error,
+			// or a delayed or odd answer would downgrade a plan that is still paid for.
+			const deleted = event.type === "customer.subscription.deleted";
+			const fresh = await fetchSubscription(stripe, evSub.id, deleted);
+			// A deletion is refused if the org has moved to a newer subscription (checked inside the write).
+			await applyAndFlush(orgId, fresh, now, deleted && !fresh ? evSub.id : undefined);
 			return orgId;
 		}
 		case "invoice.paid":
@@ -134,18 +135,20 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	}
 
 	const { id, type } = stripeEvent;
+	// Nothing to do for these, so they cost no write.
+	if (!HANDLED.has(type)) return json(200, { ok: true });
 	let recorded = false;
 	try {
-		if (!(await recordEventOnce(id, type))) {
+		if (!(await recordEventOnce(id, type, Date.now()))) {
 			log("info", "stripe event already processed", { event_id: id, type });
 			return json(200, { ok: true, duplicate: true });
 		}
 		recorded = true;
-		if (!HANDLED.has(type)) return json(200, { ok: true });
 		const orgId = await dispatch(stripe, stripeEvent, Date.now());
 		if (orgId) log("info", "stripe event handled", { event_id: id, type, org_id: orgId });
 		// Answering 200 stops Stripe retrying an event that can never find its org.
 		else log("warn", "stripe event not applied: no known org or no subscription", { event_id: id, type });
+		await completeEvent(id);
 		return json(200, { ok: true });
 	} catch (e) {
 		log("error", "stripe event failed", { event_id: id, type, error: message(e) });

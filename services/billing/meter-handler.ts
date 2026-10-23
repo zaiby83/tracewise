@@ -4,7 +4,7 @@ import type Stripe from "stripe";
 import { ddb } from "../shared/ddb";
 import { log } from "../shared/http";
 import { periodBounds } from "./plans";
-import { periodKey, reportOrgUsage } from "./meter";
+import { clampTimestamp, periodKey, reportOrgUsage } from "./meter";
 import { getStripe } from "./stripe";
 import { applySubscription, clearFlushDue, getBilling, type BillingRecord } from "./subscriptions";
 
@@ -101,8 +101,7 @@ async function meterOrg(b: BillingRecord, periodStart: string, now: number): Pro
 	let sentTotal = 0;
 	// A period the webhook left owing (rollover, or a paid plan that ended) goes before anything else.
 	if (b.flush_due) {
-		const end = Date.parse(b.flush_due.period_end) / 1000;
-		const timestamp = Math.floor(Number.isFinite(end) ? Math.min(now / 1000, end - 1) : now / 1000);
+		const timestamp = clampTimestamp(now / 1000, b.flush_due.period_end);
 		sentTotal += (await reportOrgUsage(b, { periodStart: b.flush_due.period, timestamp })).sent;
 		await clearFlushDue(b.org_id, b.flush_due.period);
 		view = (await getBilling(b.org_id)) ?? b;
@@ -120,8 +119,7 @@ async function meterOrg(b: BillingRecord, periodStart: string, now: number): Pro
 		view = (await getBilling(b.org_id)) ?? view;
 	}
 	// Late events still belong to the Stripe period their counter is for, so never stamp them after its end.
-	const end = view.current_period_end ? Date.parse(view.current_period_end) / 1000 : NaN;
-	const timestamp = Math.floor(Number.isFinite(end) ? Math.min(now / 1000, end - 1) : now / 1000);
+	const timestamp = clampTimestamp(now / 1000, view.current_period_end);
 	return sentTotal + (await reportOrgUsage(view, { periodStart, timestamp })).sent;
 }
 

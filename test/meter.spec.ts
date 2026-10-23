@@ -22,7 +22,7 @@ vi.mock("../services/billing/subscriptions", () => subs);
 process.env.ACCOUNTS_TABLE = "accounts";
 process.env.QUOTAS_TABLE = "quotas";
 
-const { isDuplicateIdentifier, reportOrgUsage } = await import("../services/billing/meter");
+const { clampTimestamp, isDuplicateIdentifier, reportOrgUsage } = await import("../services/billing/meter");
 const { handler } = await import("../services/billing/meter-handler");
 
 type Billing = Parameters<typeof reportOrgUsage>[0];
@@ -261,6 +261,14 @@ describe("reportOrgUsage", () => {
 		expect(isDuplicateIdentifier(Object.assign(new Error("identifier already used"), { type: "StripeAPIError", statusCode: 500 }))).toBe(false);
 		expect(isDuplicateIdentifier(new Error("boom"))).toBe(false);
 	});
+});
+
+describe("clampTimestamp", () => {
+	const end = "2026-10-15T00:00:00Z";
+	const endSec = Date.parse(end) / 1000;
+	it("stamps just inside a period that has ended", () => expect(clampTimestamp(endSec + 5000.7, end)).toBe(endSec - 1));
+	it("never stamps ahead of now, whole seconds", () => expect(clampTimestamp(endSec - 5000.7, end)).toBe(endSec - 5001));
+	it.each([[undefined], [null], ["not a date"]])("falls back to now for an unusable end (%s)", (bad) => expect(clampTimestamp(1234.9, bad as string)).toBe(1234));
 });
 
 describe("meter handler", () => {

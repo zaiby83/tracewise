@@ -63,8 +63,22 @@ export async function orgForCustomer(customerId: string): Promise<string | null>
 	return (Item?.org_id as string | undefined) ?? null;
 }
 
+// A customer belongs to one org for good: relinking it to another would send that customer's billing events to the wrong org.
 export async function linkCustomer(orgId: string, customerId: string): Promise<void> {
-	await ddb.send(new PutCommand({ TableName: table(), Item: { ...customerKey(customerId), org_id: orgId } }));
+	try {
+		await ddb.send(
+			new PutCommand({
+				TableName: table(),
+				Item: { ...customerKey(customerId), org_id: orgId },
+				ConditionExpression: "attribute_not_exists(pk) OR org_id = :org",
+				ExpressionAttributeValues: { ":org": orgId },
+			}),
+		);
+	} catch (e) {
+		// Names no ids: this text lands in CloudWatch.
+		if ((e as { name?: string }).name === "ConditionalCheckFailedException") throw new Error("Stripe customer is already linked to a different org");
+		throw e;
+	}
 }
 
 // The base (flat monthly) item decides the plan; the metered item only carries usage.
@@ -134,21 +148,34 @@ export interface ApplyResult {
 	applied: boolean;
 }
 
-export async function applySubscription(orgId: string, sub: Stripe.Subscription | null, now = Date.now()): Promise<ApplyResult> {
-	// One retry: the only expected conflict is a spend-cap change landing between our read and write.
+// `expectedSubscriptionId` is for a deletion (sub null): it names the subscription that was deleted, so the
+// write is refused if the org has since moved to a different one.
+export async function applySubscription(
+	orgId: string,
+	sub: Stripe.Subscription | null,
+	now = Date.now(),
+	expectedSubscriptionId?: string,
+): Promise<ApplyResult> {
+	// One retry: the expected conflicts are a spend-cap change, or a newer subscription, landing between our read and write.
 	for (let attempt = 0; ; attempt++) {
-		const result = await tryApply(orgId, sub, now, attempt === 0);
+		const result = await tryApply(orgId, sub, now, attempt === 0, expectedSubscriptionId);
 		if (result) return result;
 	}
 }
 
 // Returns null when the spend cap changed under us and a fresh read may still succeed.
-async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: number, mayRetry: boolean): Promise<ApplyResult | null> {
+async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: number, mayRetry: boolean, expectedSubscriptionId?: string): Promise<ApplyResult | null> {
 	const [previous, profile] = await Promise.all([getBilling(orgId), getProfile(orgId)]);
 	// A late event for an old subscription (say its final invoice after a cancel and resubscribe) is
 	// re-fetched as canceled; applying it would downgrade the org's newer live subscription.
 	if (previous?.subscription_id && sub && sub.id !== previous.subscription_id && LIVE.has(previous.status) && TERMINAL.has(sub.status)) {
 		console.warn(`ignoring stale subscription for org ${orgId}: ${sub.id} (${sub.status}) while ${previous.subscription_id} is ${previous.status}`);
+		return { plan: previous.plan, periodChanged: false, previous, applied: false };
+	}
+	// The same for a deletion event whose subscription is gone: applying "none" would drop the newer one's plan.
+	const guardDeletion = !sub && !!expectedSubscriptionId;
+	if (guardDeletion && previous?.subscription_id && previous.subscription_id !== expectedSubscriptionId) {
+		console.warn(`ignoring deletion of superseded subscription for org ${orgId}: ${expectedSubscriptionId} while ${previous.subscription_id} is ${previous.status}`);
 		return { plan: previous.plan, periodChanged: false, previous, applied: false };
 	}
 	const pastDueSince = sub?.status === "past_due" ? (previous?.past_due_since ?? new Date(now).toISOString()) : null;
@@ -204,7 +231,12 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 				TableName: table(),
 				Key: billingKey(orgId),
 				// limits above were derived from the cap we read; if the console changed it since, redo the read.
-				ConditionExpression: "attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap",
+				// A deletion also needs the org to still be on the subscription that was deleted.
+				ConditionExpression:
+					"(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)" +
+					(guardDeletion
+						? " AND (attribute_not_exists(subscription_id) OR attribute_type(subscription_id, :nullType) OR subscription_id = :expected)"
+						: ""),
 				// The cap and the meter's counters belong to other writers, so they are only initialised here.
 				UpdateExpression:
 					"SET customer_id = :cus, subscription_id = :sub, #s = :status, #p = :plan, current_period_start = :cps, current_period_end = :cpe, " +
@@ -227,6 +259,7 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 					":readCap": readCap,
 					":zero": 0,
 					":none": null,
+					...(guardDeletion ? { ":nullType": "NULL", ":expected": expectedSubscriptionId } : {}),
 					...(flushDue ? { ":fd": flushDue } : {}),
 				},
 			},
@@ -263,15 +296,29 @@ export async function clearFlushDue(orgId: string, period: string): Promise<void
 	}
 }
 
-// First delivery wins: false means Stripe already sent this event and it was recorded.
-export async function recordEventOnce(eventId: string, type: string): Promise<boolean> {
-	const now = Date.now();
+// A claim on an event expires, so a Lambda killed mid-processing doesn't lose the event: once the lease
+// has lapsed the next delivery takes it over. Must outlast the webhook Lambda's timeout.
+const LEASE_SECONDS = 300;
+
+// First delivery wins: false means Stripe already sent this event and it is done or being handled right now.
+export async function recordEventOnce(eventId: string, type: string, now = Date.now()): Promise<boolean> {
+	const nowSeconds = Math.floor(now / 1000);
 	try {
 		await ddb.send(
 			new PutCommand({
 				TableName: table(),
-				Item: { ...eventKey(eventId), type, received_at: new Date(now).toISOString(), expires_at: Math.floor(now / 1000) + EVENT_TTL_SECONDS },
-				ConditionExpression: "attribute_not_exists(pk)",
+				Item: {
+					...eventKey(eventId),
+					type,
+					status: "processing",
+					lease_until: nowSeconds + LEASE_SECONDS,
+					received_at: new Date(now).toISOString(),
+					expires_at: nowSeconds + EVENT_TTL_SECONDS,
+				},
+				// A finished event, or one whose lease is still live, is a duplicate; an expired lease is taken over.
+				ConditionExpression: "attribute_not_exists(pk) OR (#st = :processing AND lease_until < :now)",
+				ExpressionAttributeNames: { "#st": "status" },
+				ExpressionAttributeValues: { ":processing": "processing", ":now": nowSeconds },
 			}),
 		);
 		return true;
@@ -279,6 +326,20 @@ export async function recordEventOnce(eventId: string, type: string): Promise<bo
 		if ((e as { name?: string }).name === "ConditionalCheckFailedException") return false;
 		throw e;
 	}
+}
+
+// After the event's effects are written, so any later delivery of it is a duplicate for good.
+export async function completeEvent(eventId: string): Promise<void> {
+	await ddb.send(
+		new UpdateCommand({
+			TableName: table(),
+			Key: eventKey(eventId),
+			UpdateExpression: "SET #st = :done REMOVE lease_until",
+			ConditionExpression: "attribute_exists(pk)",
+			ExpressionAttributeNames: { "#st": "status" },
+			ExpressionAttributeValues: { ":done": "done" },
+		}),
+	);
 }
 
 // Lets Stripe's retry reprocess an event whose handling failed after it was recorded.

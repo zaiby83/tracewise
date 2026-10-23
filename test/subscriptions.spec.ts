@@ -7,7 +7,7 @@ vi.mock("../services/shared/ddb", () => ({ ddb }));
 process.env.ACCOUNTS_TABLE = "accounts";
 
 const { PLANS } = await import("../services/billing/plans");
-const { applySubscription, clearFlushDue, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } = await import(
+const { applySubscription, clearFlushDue, completeEvent, effectivePlan, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } = await import(
 	"../services/billing/subscriptions"
 );
 
@@ -247,7 +247,7 @@ describe("applySubscription", () => {
 	it("conditions the BILLING write on the spend cap it read, matching a null or absent cap", async () => {
 		setup({ profile: profile(), billing: billing({ spend_cap_usd: 20 }) });
 		await applySubscription("o1", sub("active", "team_monthly"), NOW);
-		expect(tx().billing!.ConditionExpression).toBe("attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap");
+		expect(tx().billing!.ConditionExpression).toBe("(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)");
 		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":readCap": 20 });
 		setup({ profile: profile(), billing: billing({ spend_cap_usd: null }) });
 		await applySubscription("o1", sub("active", "team_monthly"), NOW);
@@ -283,6 +283,56 @@ describe("applySubscription", () => {
 	});
 });
 
+describe("deleting a subscription that may have been superseded", () => {
+	const stripeGone = (e = "sub_1") => applySubscription("o1", null, NOW, e);
+
+	it("leaves a newer subscription alone when BILLING already moved on", async () => {
+		setup({ profile: profile({ plan: "pro" }), billing: billing({ plan: "pro", subscription_id: "sub_2" }) });
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const res = await stripeGone();
+		expect(res).toMatchObject({ applied: false, plan: "pro" });
+		expect(ddb.send.mock.calls.some(([c]) => c instanceof TransactWriteCommand)).toBe(false);
+		expect(warn).toHaveBeenCalledOnce();
+	});
+
+	it("guards the BILLING write on the subscription id it expects", async () => {
+		setup({ profile: profile({ plan: "team" }), billing: billing() });
+		expect(await stripeGone()).toMatchObject({ applied: true, plan: "free" });
+		const b = tx().billing!;
+		expect(b.ConditionExpression).toBe(
+			"(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap) AND (attribute_not_exists(subscription_id) OR attribute_type(subscription_id, :nullType) OR subscription_id = :expected)",
+		);
+		expect(b.ExpressionAttributeValues).toMatchObject({ ":expected": "sub_1", ":nullType": "NULL" });
+	});
+
+	it("skips when a newer subscription lands between the read and the write", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		let reads = 0;
+		let writes = 0;
+		ddb.send.mockReset();
+		ddb.send.mockImplementation(async (cmd: { input: { Key?: { sk: string } }; constructor: { name: string } }) => {
+			if (cmd.constructor.name === "GetCommand") {
+				if (cmd.input.Key!.sk === "PROFILE") return { Item: profile({ plan: "team" }) };
+				// The first read still shows the deleted subscription; by the second the org has a new one.
+				return { Item: billing(++reads > 1 ? { subscription_id: "sub_2" } : {}) };
+			}
+			writes++;
+			throw cancelled("None", "ConditionalCheckFailed");
+		});
+		expect(await stripeGone()).toMatchObject({ applied: false });
+		expect(writes).toBe(1);
+	});
+
+	it("does not add the guard to an ordinary update or to a deletion with no expected id", async () => {
+		setup({ profile: profile({ plan: "team" }), billing: billing() });
+		await applySubscription("o1", sub("active", "team_monthly"), NOW);
+		expect(tx().billing!.ConditionExpression).not.toContain("subscription_id");
+		setup({ profile: profile({ plan: "team" }), billing: billing() });
+		await applySubscription("o1", null, NOW);
+		expect(tx().billing!.ConditionExpression).not.toContain("subscription_id");
+	});
+});
+
 describe("billing records", () => {
 	it("getBilling reads ORG#id / BILLING and returns null when missing", async () => {
 		setup({ billing: null });
@@ -296,9 +346,24 @@ describe("billing records", () => {
 		expect(await orgForCustomer("cus_1")).toBe("o1");
 		expect(ddb.send.mock.calls[0]![0].input).toMatchObject({ Key: { pk: "STRIPE#cus_1", sk: "CUSTOMER" } });
 		await linkCustomer("o1", "cus_1");
-		expect(ddb.send.mock.calls[1]![0].input).toMatchObject({ TableName: "accounts", Item: { pk: "STRIPE#cus_1", sk: "CUSTOMER", org_id: "o1" } });
+		expect(ddb.send.mock.calls[1]![0].input).toMatchObject({
+			TableName: "accounts",
+			Item: { pk: "STRIPE#cus_1", sk: "CUSTOMER", org_id: "o1" },
+			ConditionExpression: "attribute_not_exists(pk) OR org_id = :org",
+			ExpressionAttributeValues: { ":org": "o1" },
+		});
 		ddb.send.mockReset().mockResolvedValueOnce({});
 		expect(await orgForCustomer("cus_unknown")).toBeNull();
+	});
+});
+
+describe("linkCustomer", () => {
+	it("refuses to move a customer to a different org, without naming ids", async () => {
+		ddb.send.mockReset().mockRejectedValueOnce(Object.assign(new Error("cond"), { name: "ConditionalCheckFailedException" }));
+		const err = await linkCustomer("o2", "cus_1").catch((e) => e);
+		expect(err.message).toBe("Stripe customer is already linked to a different org");
+		ddb.send.mockReset().mockRejectedValueOnce(new Error("throttled"));
+		await expect(linkCustomer("o2", "cus_1")).rejects.toThrow("throttled");
 	});
 });
 
@@ -322,13 +387,38 @@ describe("clearFlushDue", () => {
 });
 
 describe("webhook event records", () => {
-	it("records each Stripe event once", async () => {
+	it("claims each Stripe event with a lease, and treats a finished or live one as a duplicate", async () => {
 		ddb.send.mockReset().mockResolvedValueOnce({}).mockRejectedValueOnce(Object.assign(new Error("dup"), { name: "ConditionalCheckFailedException" }));
-		expect(await recordEventOnce("evt_1", "invoice.paid")).toBe(true);
+		expect(await recordEventOnce("evt_1", "invoice.paid", NOW)).toBe(true);
 		const input = ddb.send.mock.calls[0]![0].input;
-		expect(input).toMatchObject({ ConditionExpression: "attribute_not_exists(pk)", Item: { pk: "STRIPE_EVENT#evt_1", sk: "EVENT", type: "invoice.paid" } });
-		expect(input.Item.expires_at - Math.floor(Date.parse(input.Item.received_at) / 1000)).toBe(30 * 86_400);
-		expect(await recordEventOnce("evt_1", "invoice.paid")).toBe(false);
+		expect(input).toMatchObject({
+			// A lapsed lease is taken over; anything else already recorded is a duplicate.
+			ConditionExpression: "attribute_not_exists(pk) OR (#st = :processing AND lease_until < :now)",
+			ExpressionAttributeNames: { "#st": "status" },
+			ExpressionAttributeValues: { ":processing": "processing", ":now": NOW / 1000 },
+			Item: { pk: "STRIPE_EVENT#evt_1", sk: "EVENT", type: "invoice.paid", status: "processing", lease_until: NOW / 1000 + 300, received_at: "2026-10-23T00:00:00.000Z" },
+		});
+		expect(input.Item.expires_at - NOW / 1000).toBe(30 * 86_400);
+		expect(await recordEventOnce("evt_1", "invoice.paid", NOW)).toBe(false);
+	});
+	it("takes over a stale processing record: the lease time it compares against is the current time", async () => {
+		// The condition is DynamoDB's to evaluate; what matters here is that a later delivery asks with a later `now`.
+		ddb.send.mockReset().mockResolvedValue({});
+		await recordEventOnce("evt_1", "invoice.paid", NOW);
+		await recordEventOnce("evt_1", "invoice.paid", NOW + 600_000);
+		const nows = ddb.send.mock.calls.map(([c]) => c.input.ExpressionAttributeValues[":now"]);
+		expect(nows[1] - nows[0]).toBe(600);
+		expect(ddb.send.mock.calls[1]![0].input.Item.lease_until).toBe(NOW / 1000 + 600 + 300);
+	});
+	it("marks an event done once it has been handled, ending its lease", async () => {
+		ddb.send.mockReset().mockResolvedValueOnce({});
+		await completeEvent("evt_1");
+		expect(ddb.send.mock.calls[0]![0].input).toMatchObject({
+			Key: { pk: "STRIPE_EVENT#evt_1", sk: "EVENT" },
+			UpdateExpression: "SET #st = :done REMOVE lease_until",
+			ConditionExpression: "attribute_exists(pk)",
+			ExpressionAttributeValues: { ":done": "done" },
+		});
 	});
 	it("does not hide other failures as duplicates", async () => {
 		ddb.send.mockReset().mockRejectedValueOnce(new Error("throttled"));
