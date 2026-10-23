@@ -16,31 +16,96 @@ LLM observability and evaluation on serverless AWS. Apps send every model call t
 ## Architecture (Milestones 1–4, plus self-serve accounts)
 
 ```mermaid
-flowchart LR
-    U[Browser] --> CF[CloudFront<br/>security headers, 60 s API cache]
-    CF --> SITE[(S3: dashboard<br/>private, OAC)]
+flowchart TB
+    subgraph callers["1 · Who calls Tracewise"]
+        direction LR
+        SDK[SDK in your app<br/>batching, retries, redaction]
+        U[Browser<br/>dashboard and console]
+    end
+
+    subgraph front["2 · Front door"]
+        direction LR
+        CF[CloudFront<br/>security headers, 60 s API cache]
+        SITE[(S3: dashboard<br/>private, OAC)]
+        CONSOLE[(S3: console)]
+        APIGW[API Gateway<br/>HTTP API]
+        COG[Cognito user pool]
+    end
+
+    subgraph handlers["3 · Request handlers"]
+        direction LR
+        ING[Lambda: ingest<br/>auth, validate, quota]
+        Q[Lambda: query]
+        AN[Lambda: analytics]
+        ORGS[Lambda: console API]
+    end
+
+    subgraph pipeline["4 · Write pipeline"]
+        direction LR
+        SQS[(SQS)]
+        DLQ[(DLQ)]
+        PROC[Lambda: processor]
+    end
+
+    subgraph storage["5 · Storage"]
+        direction LR
+        DDB[(DynamoDB: traces<br/>sharded, TTL)]
+        FH[Data Firehose<br/>JSON → Parquet]
+        S3[(S3 data lake<br/>tenant_id/dt partitions)]
+        GLUE[Glue table<br/>partition projection]
+        ATH[Athena workgroup<br/>1 GB scan cap]
+        ACC[(DynamoDB: accounts)]
+        DEL[SQS + Lambda: org deleter]
+    end
+
+    subgraph evals["6 · Nightly evaluations"]
+        direction LR
+        SCHED[EventBridge Scheduler<br/>nightly]
+        SFN[Step Functions<br/>sample → grade → record]
+        BR[Bedrock: Nova Pro judge]
+        EV[(DynamoDB: eval runs)]
+    end
+
+    subgraph monitoring["7 · Monitoring and alerts"]
+        direction LR
+        CWM[CloudWatch metrics]
+        CW[CloudWatch alarms<br/>on ingest, SQS and DLQ]
+        SNS[SNS alerts]
+    end
+
+    SDK -->|HTTPS + API key| APIGW
+    U --> CF
+    CF --> SITE
+    CF -->|/console/*| CONSOLE
     CF -->|/v1/*| APIGW
-    CF -->|/console/*| CONSOLE[(S3: console)]
-    COG[Cognito user pool] -.JWT authorizer.-> APIGW
-    APIGW -->|/v1/orgs/*| ORGS[Lambda: console API] --> ACC[(DynamoDB: accounts)]
-    ORGS --> DEL[SQS + Lambda: org deleter]
-    SDK[SDK<br/>batching, retries, redaction] -->|HTTPS + API key| APIGW[API Gateway<br/>HTTP API]
-    APIGW --> ING[Lambda: ingest<br/>auth, validate, quota]
-    ING --> SQS[(SQS)]
-    SQS --> PROC[Lambda: processor]
-    SQS -.5 failures.-> DLQ[(DLQ)]
-    PROC --> DDB[(DynamoDB<br/>sharded, TTL)]
-    PROC --> FH[Data Firehose<br/>JSON → Parquet]
-    FH --> S3[(S3 data lake<br/>tenant_id/dt partitions)]
-    S3 --- GLUE[Glue table<br/>partition projection]
-    APIGW --> Q[Lambda: query] --> DDB
-    APIGW --> AN[Lambda: analytics] --> ATH[Athena workgroup<br/>1 GB scan cap] --> GLUE
-    SCHED[EventBridge Scheduler<br/>nightly] --> SFN[Step Functions<br/>sample → grade → record]
-    SFN --> DDB
-    SFN --> BR[Bedrock: Nova Pro judge]
-    SFN --> EV[(DynamoDB: eval runs)]
-    SFN --> CWM[CloudWatch metrics] & SNS[SNS regression alert]
-    DLQ & SQS & ING -.-> CW[CloudWatch alarms → SNS]
+    COG -.JWT authorizer.-> APIGW
+
+    APIGW --> ING
+    APIGW --> Q
+    APIGW --> AN
+    APIGW -->|/v1/orgs/*| ORGS
+
+    ING --> SQS
+    SQS --> PROC
+    SQS -.5 failures.-> DLQ
+    PROC --> DDB
+    PROC --> FH
+    FH --> S3
+    S3 --- GLUE
+
+    Q --> DDB
+    AN --> ATH --> GLUE
+    ORGS --> ACC
+    ORGS --> DEL
+
+    SCHED --> SFN
+    SFN -->|reads samples| DDB
+    SFN --> BR
+    SFN --> EV
+    SFN --> CWM
+    SFN -->|regression| SNS
+
+    CW --> SNS
 ```
 
 **Highlights:**
