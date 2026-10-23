@@ -32,28 +32,66 @@
 ## 3. Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Customer app
-        SDK[Tracewise SDK<br/>batching, retries, redaction]
+flowchart TB
+    subgraph callers["1 · Who calls Tracewise"]
+        direction LR
+        SDK[Tracewise SDK in the customer app<br/>batching, retries, redaction]
+        DASH[Dashboard: S3 + CloudFront]
     end
-    SDK -->|HTTPS, API key| APIGW[API Gateway<br/>HTTP API]
-    APIGW --> ING[Lambda: ingest<br/>auth, validate, quota]
-    ING --> SQS[(SQS queue)]
-    SQS --> PROC[Lambda: processor<br/>batches of 10]
-    SQS -.after 5 failures.-> DLQ[(Dead-letter queue)]
-    PROC --> DDB[(DynamoDB<br/>hot traces, 30-day TTL)]
-    PROC --> FH[Data Firehose]
-    FH --> S3[(S3, Parquet<br/>tenant/date partitions)]
-    S3 --- GLUE[Glue catalog] --- ATH[Athena]
-    EB[EventBridge<br/>nightly schedule] --> SFN[Step Functions:<br/>eval workflow]
-    SFN --> ATH
-    SFN --> BR[Bedrock: judge model]
-    SFN --> DDB
-    SFN --> CW[CloudWatch metrics<br/>and alarms]
-    DASH[Dashboard: S3 + CloudFront] --> QAPI[API Gateway + Lambda: query]
+
+    subgraph api["2 · API"]
+        direction LR
+        APIGW[API Gateway<br/>HTTP API]
+        COG[Cognito]
+        ING[Lambda: ingest<br/>auth, validate, quota]
+        QAPI[API Gateway + Lambda: query]
+    end
+
+    subgraph pipeline["3 · Write pipeline"]
+        direction LR
+        SQS[(SQS queue)]
+        DLQ[(Dead-letter queue)]
+        PROC[Lambda: processor<br/>batches of 10]
+    end
+
+    subgraph storage["4 · Storage"]
+        direction LR
+        DDB[(DynamoDB<br/>hot traces, 30-day TTL)]
+        FH[Data Firehose]
+        S3[(S3, Parquet<br/>tenant/date partitions)]
+        GLUE[Glue catalog]
+        ATH[Athena]
+    end
+
+    subgraph evals["5 · Nightly evaluations"]
+        direction LR
+        EB[EventBridge<br/>nightly schedule]
+        SFN[Step Functions:<br/>eval workflow]
+        BR[Bedrock: judge model]
+        CW[CloudWatch metrics<br/>and alarms]
+    end
+
+    SDK -->|HTTPS, API key| APIGW
+    APIGW --> ING
+    DASH -.sign-in.-> COG
+    DASH --> QAPI
+
+    ING --> SQS
+    SQS --> PROC
+    SQS -.after 5 failures.-> DLQ
+    PROC --> DDB
+    PROC --> FH
+    FH --> S3
+    S3 --- GLUE --- ATH
+
     QAPI --> DDB
     QAPI --> ATH
-    COG[Cognito] -.sign-in.-> DASH
+
+    EB --> SFN
+    SFN --> ATH
+    SFN --> BR
+    SFN --> DDB
+    SFN --> CW
 ```
 
 ### Request path: ingest
