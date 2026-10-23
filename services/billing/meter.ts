@@ -18,6 +18,9 @@ export async function reportOrgUsage(
 	opts: { periodStart: string; timestamp: number },
 ): Promise<{ sent: number }> {
 	const periodStart = periodKey(opts.periodStart);
+	// reported_period only moves forward (through the rollover path, after it flushed the old period),
+	// so an older period is already final: resending it under a new identifier would bill it twice.
+	if (billing.reported_period && periodStart < periodKey(billing.reported_period)) return { sent: 0 };
 	const counter = await readCounter(counterIds.period(billing.org_id, periodStart));
 	// reported_events belongs to whichever period was reported last; another period starts over.
 	const base = billing.reported_period === periodStart ? billing.reported_events : 0;

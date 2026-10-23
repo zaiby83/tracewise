@@ -17,7 +17,7 @@ vi.mock("@aws-sdk/client-cloudwatch", () => ({
 		constructor(public input: unknown) {}
 	},
 }));
-const subs = vi.hoisted(() => ({ applySubscription: vi.fn() }));
+const subs = vi.hoisted(() => ({ applySubscription: vi.fn(), getBilling: vi.fn() }));
 vi.mock("../services/billing/subscriptions", () => subs);
 process.env.ACCOUNTS_TABLE = "accounts";
 process.env.QUOTAS_TABLE = "quotas";
@@ -235,6 +235,18 @@ describe("meter handler", () => {
 			});
 			await expect(handler()).resolves.toBeUndefined();
 			expect(subs.applySubscription).toHaveBeenCalledExactlyOnceWith("b", { id: "sub_b" }, expect.any(Number));
+			// Counted as a failure so the stale-meter alarm covers it: no healthy datapoint.
+			expect(metrics()).toEqual({ MeterOrgsReported: 0, MeterFailures: 1 });
+		});
+
+		it("counts an apply failure as a meter failure", async () => {
+			setup({}, { items: [pastDue("a", daysAgo(8))] });
+			subs.applySubscription.mockReset();
+			subs.applySubscription.mockRejectedValue(new Error("ddb down"));
+			stripe.subscriptions.retrieve.mockReset();
+			stripe.subscriptions.retrieve.mockResolvedValue({ id: "sub_1" });
+			await expect(handler()).resolves.toBeUndefined();
+			expect(metrics()).toEqual({ MeterOrgsReported: 0, MeterFailures: 1 });
 		});
 
 		it("makes no Stripe call when nobody is past grace", async () => {
@@ -243,5 +255,79 @@ describe("meter handler", () => {
 			await handler();
 			expect(stripe.subscriptions.retrieve).not.toHaveBeenCalled();
 		});
+	});
+});
+
+// BILLING is kept in memory here so the order of reads and writes across runs is what's tested.
+describe("period rollover", () => {
+	const newStart = Date.parse("2026-10-15T00:00:00Z") / 1000;
+
+	function world(counters: Record<string, number>, initial: Billing) {
+		const state = { ...initial } as Billing;
+		ddb.send.mockReset();
+		ddb.send.mockImplementation(async (cmd: { input: Record<string, any> }) => {
+			if (cmd instanceof ScanCommand) return { Items: [{ ...state }] };
+			if (cmd instanceof UpdateCommand) {
+				const v = cmd.input.ExpressionAttributeValues!;
+				const ok = (state.reported_period === v[":p"] && state.reported_events === v[":old"]) || state.reported_period == null || state.reported_period !== v[":p"];
+				if (!ok) throw Object.assign(new Error("lost"), { name: "ConditionalCheckFailedException" });
+				state.reported_events = v[":counter"];
+				state.reported_period = v[":p"];
+				return {};
+			}
+			return { Item: { used: counters[cmd.input.Key!.window] ?? 0 } };
+		});
+		subs.getBilling.mockReset();
+		subs.getBilling.mockImplementation(async () => ({ ...state }));
+		stripe.billing.meterEvents.create.mockReset();
+		stripe.billing.meterEvents.create.mockResolvedValue({});
+		cw.send.mockReset();
+		cw.send.mockResolvedValue({});
+		return state;
+	}
+	const sent = () => stripe.billing.meterEvents.create.mock.calls.map(([p]) => p);
+	const old = () => billing({ reported_period: "2026-09-15", reported_events: 600_000 });
+	const counters = { "o1#month#2026-09-15": 620_000, "o1#month#2026-10-15": 3_000 };
+
+	it("flushes the old period's remainder, then reports the new one, and ends on the new period", async () => {
+		const state = world(counters, old());
+		await handler();
+		expect(sent()).toEqual([
+			{ event_name: "tracewise_events", payload: { stripe_customer_id: "cus_1", value: "20000" }, identifier: "o1:2026-09-15:620000", timestamp: newStart - 1 },
+			expect.objectContaining({ payload: { stripe_customer_id: "cus_1", value: "3000" }, identifier: "o1:2026-10-15:3000" }),
+		]);
+		expect(state).toMatchObject({ reported_period: "2026-10-15", reported_events: 3_000 });
+	});
+
+	it("still advances when the old period has nothing left to flush", async () => {
+		const state = world(counters, billing({ reported_period: "2026-09-15", reported_events: 620_000 }));
+		await handler();
+		expect(sent()).toHaveLength(1);
+		expect(state).toMatchObject({ reported_period: "2026-10-15", reported_events: 3_000 });
+	});
+
+	it("does not resend a finished period when reported_period is already newer", async () => {
+		world(counters, billing({ reported_period: "2026-10-15", reported_events: 1_000 }));
+		expect(await reportOrgUsage(billing({ reported_period: "2026-10-15", reported_events: 1_000 }), { periodStart: "2026-09-15", timestamp: newStart - 1 })).toEqual({ sent: 0 });
+		expect(stripe.billing.meterEvents.create).not.toHaveBeenCalled();
+		expect(ddb.send).not.toHaveBeenCalled();
+	});
+
+	it("a webhook-style flush after the meter has advanced sends nothing for the old period", async () => {
+		const state = world(counters, old());
+		await handler();
+		expect(sent()).toHaveLength(2);
+		// The webhook flushes the old period from a fresh view of BILLING.
+		const res = await reportOrgUsage({ ...state }, { periodStart: "2026-09-15", timestamp: newStart - 1 });
+		expect(res).toEqual({ sent: 0 });
+		expect(sent()).toHaveLength(2);
+	});
+
+	it("flushing first and then moving on is safe in the other order too", async () => {
+		const state = world(counters, old());
+		await reportOrgUsage({ ...state }, { periodStart: "2026-09-15", timestamp: newStart - 1 });
+		await handler();
+		// One old-period event (the webhook's), one for the new period; nothing resent.
+		expect(sent().map((p) => p.identifier)).toEqual(["o1:2026-09-15:620000", "o1:2026-10-15:3000"]);
 	});
 });

@@ -4,9 +4,9 @@ import type Stripe from "stripe";
 import { ddb } from "../shared/ddb";
 import { log } from "../shared/http";
 import { periodBounds } from "./plans";
-import { reportOrgUsage } from "./meter";
+import { periodKey, reportOrgUsage } from "./meter";
 import { getStripe } from "./stripe";
-import { applySubscription, type BillingRecord } from "./subscriptions";
+import { applySubscription, getBilling, type BillingRecord } from "./subscriptions";
 
 const cloudwatch = new CloudWatchClient({});
 const CONCURRENCY = 5;
@@ -54,12 +54,20 @@ function periodOf(billing: BillingRecord): string {
 }
 
 // Past-due grace expiry would otherwise wait for Stripe's next event for the subscription.
-async function expireGrace(billings: BillingRecord[], now: number): Promise<void> {
+// Returns how many orgs could not be re-applied, so the caller can count them as failures.
+async function expireGrace(billings: BillingRecord[], now: number): Promise<number> {
 	const due = billings.filter(
 		(b) => b.status === "past_due" && b.plan !== "free" && !!b.past_due_since && now - Date.parse(b.past_due_since) > GRACE_MS,
 	);
-	if (due.length === 0) return;
-	const stripe = await getStripe();
+	if (due.length === 0) return 0;
+	let failed = 0;
+	let stripe: Stripe;
+	try {
+		stripe = await getStripe();
+	} catch (e) {
+		log("error", "could not re-apply past-due subscriptions", { orgs: due.length, error: message(e) });
+		return due.length;
+	}
 	await forEachBounded(due, CONCURRENCY, async (b) => {
 		try {
 			let sub: Stripe.Subscription | null = null;
@@ -73,28 +81,56 @@ async function expireGrace(billings: BillingRecord[], now: number): Promise<void
 			const result = await applySubscription(b.org_id, sub, now);
 			log("info", "re-applied past-due subscription", { org_id: b.org_id, plan: result.plan, applied: result.applied });
 		} catch (e) {
+			failed++;
 			log("error", "could not re-apply past-due subscription", { org_id: b.org_id, error: message(e) });
 		}
 	});
+	return failed;
+}
+
+const startSeconds = (b: BillingRecord, period: string) =>
+	// Stripe's real instant when BILLING has one for this period; midnight UTC of the date otherwise.
+	Math.floor(Date.parse(b.current_period_start && periodKey(b.current_period_start) === period ? b.current_period_start : `${period}T00:00:00Z`) / 1000);
+
+// Moving to a new period first flushes what is left of the old one, because the counters
+// (reported_events, reported_period) only describe one period and would otherwise forget it.
+async function meterOrg(b: BillingRecord, periodStart: string, now: number): Promise<number> {
+	let view = b;
+	const reportedPeriod = b.reported_period ? periodKey(b.reported_period) : null;
+	if (reportedPeriod && reportedPeriod < periodStart) {
+		await reportOrgUsage(b, { periodStart: reportedPeriod, timestamp: startSeconds(b, periodStart) - 1 });
+		// Pick up whatever the flush (or a concurrent run) recorded rather than trusting the scan's copy.
+		view = (await getBilling(b.org_id)) ?? b;
+	}
+	return (await reportOrgUsage(view, { periodStart, timestamp: Math.floor(now / 1000) })).sent;
 }
 
 export async function handler(): Promise<void> {
 	const now = Date.now();
 	const billings = await liveBilling();
 	let reported = 0;
-	let failures = 0;
+	let meterFailures = 0;
 
 	await forEachBounded(billings, CONCURRENCY, async (b) => {
 		const periodStart = periodOf(b);
 		try {
-			const { sent } = await reportOrgUsage(b, { periodStart, timestamp: Math.floor(now / 1000) });
+			const sent = await meterOrg(b, periodStart, now);
 			if (sent > 0) reported++;
 			log("info", "metered org", { org_id: b.org_id, period: periodStart, delta: sent });
 		} catch (e) {
-			failures++;
+			meterFailures++;
 			log("error", "metering failed", { org_id: b.org_id, period: periodStart, error: message(e) });
 		}
 	});
+
+	// Grace re-apply failures count too, so the one alarm covers them.
+	let failures = meterFailures;
+	try {
+		failures += await expireGrace(billings, now);
+	} catch (e) {
+		failures++;
+		log("error", "past-due re-apply failed", { error: message(e) });
+	}
 
 	// A gauge that counted up would need its own timer, so the alarm watches for this datapoint going missing instead.
 	const metrics = [
@@ -109,11 +145,5 @@ export async function handler(): Promise<void> {
 		log("warn", "could not publish meter metrics", { error: message(e) });
 	}
 
-	try {
-		await expireGrace(billings, now);
-	} catch (e) {
-		log("error", "past-due re-apply failed", { error: message(e) });
-	}
-
-	if (billings.length > 0 && failures === billings.length) throw new Error(`metering failed for all ${failures} orgs`);
+	if (billings.length > 0 && meterFailures === billings.length) throw new Error(`metering failed for all ${meterFailures} orgs`);
 }
