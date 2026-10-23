@@ -51,10 +51,11 @@ describe("effectivePlan", () => {
 		["active", "team_monthly", null, "team"], ["trialing", "pro_monthly", null, "pro"], ["canceled", "team_monthly", null, "free"],
 		["unpaid", "pro_monthly", null, "free"], ["incomplete_expired", "team_monthly", null, "free"],
 		["past_due", "team_monthly", "2026-10-20T00:00:00Z", "team"], ["past_due", "team_monthly", "2026-10-10T00:00:00Z", "free"],
-		["past_due", "pro_monthly", null, "pro"],
+		["past_due", "pro_monthly", null, "pro"], ["paused", "team_monthly", null, "free"],
 	])("status %s on %s (past due since %s) → %s", (status, key, since, want) => {
 		expect(effectivePlan(sub(status, key), since, Date.parse("2026-10-23T00:00:00Z"))).toBe(want);
 	});
+	it("makes no change for a status it does not know", () => expect(effectivePlan(sub("something_new", "team_monthly"), null)).toBeNull());
 	it("treats no subscription as free", () => expect(effectivePlan(null, null)).toBe("free"));
 	it("leaves an incomplete subscription alone", () => expect(effectivePlan(sub("incomplete", "team_monthly"), null)).toBeNull());
 	it("grants a full seven days of grace, then ends it", () => {
@@ -175,6 +176,61 @@ describe("applySubscription", () => {
 	it("does not report a period change for a first subscription", async () => {
 		setup({ profile: profile(), billing: null });
 		expect(await applySubscription("o1", sub("active", "team_monthly"), NOW)).toMatchObject({ periodChanged: false, previous: null });
+	});
+	it("ignores a stale canceled subscription while a newer one is live", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		setup({ profile: profile({ plan: "pro" }), billing: billing({ plan: "pro", subscription_id: "sub_new" }) });
+		const res = await applySubscription("o1", sub("canceled", "team_monthly"), NOW);
+		expect(res).toMatchObject({ applied: false, plan: "pro", periodChanged: false });
+		expect(tx().call).toBeUndefined();
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining("o1"));
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining("sub_new"));
+		warn.mockRestore();
+	});
+	it("applies a new live subscription replacing an old canceled one", async () => {
+		setup({ profile: profile({ plan: "free" }), billing: billing({ plan: "free", status: "canceled", subscription_id: "sub_old" }) });
+		expect(await applySubscription("o1", sub("active", "pro_monthly"), NOW)).toMatchObject({ applied: true, plan: "pro" });
+		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":sub": "sub_1", ":plan": "pro" });
+	});
+	it("applies a new live subscription over another live one", async () => {
+		setup({ profile: profile({ plan: "team" }), billing: billing({ subscription_id: "sub_old" }) });
+		expect((await applySubscription("o1", sub("active", "pro_monthly"), NOW)).applied).toBe(true);
+	});
+	it("still applies a deleted (null) subscription over a live record", async () => {
+		setup({ profile: profile({ plan: "team" }), billing: billing() });
+		expect((await applySubscription("o1", null, NOW)).applied).toBe(true);
+	});
+	it("conditions the BILLING write on the spend cap it read, matching a null or absent cap", async () => {
+		setup({ profile: profile(), billing: billing({ spend_cap_usd: 20 }) });
+		await applySubscription("o1", sub("active", "team_monthly"), NOW);
+		expect(tx().billing!.ConditionExpression).toBe("attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap");
+		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":readCap": 20 });
+		setup({ profile: profile(), billing: billing({ spend_cap_usd: null }) });
+		await applySubscription("o1", sub("active", "team_monthly"), NOW);
+		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":readCap": null });
+	});
+	it("re-reads and retries once when the spend cap changed mid-update", async () => {
+		const caps = [billing({ spend_cap_usd: null }), billing({ spend_cap_usd: 20 })];
+		let reads = 0;
+		let writes = 0;
+		const written: Record<string, unknown>[] = [];
+		ddb.send.mockReset();
+		ddb.send.mockImplementation(async (cmd: { input: { Key?: { sk: string }; TransactItems?: { Update: { ExpressionAttributeValues: Record<string, unknown> } }[] }; constructor: { name: string } }) => {
+			if (cmd.constructor.name === "GetCommand") return { Item: cmd.input.Key!.sk === "PROFILE" ? profile() : caps[reads++] };
+			written.push(cmd.input.TransactItems![0]!.Update.ExpressionAttributeValues);
+			if (writes++ === 0) throw cancelled("None", "ConditionalCheckFailed");
+			return {};
+		});
+		const res = await applySubscription("o1", sub("active", "team_monthly"), NOW);
+		expect(res.applied).toBe(true);
+		expect(written).toHaveLength(2);
+		expect((written[0]![":limits"] as { monthly_events: number | null }).monthly_events).toBeNull();
+		expect((written[1]![":limits"] as { monthly_events: number | null }).monthly_events).toBe(900_000);
+	});
+	it("throws when the spend cap changes again on the retry", async () => {
+		setup({ profile: profile(), billing: billing(), txError: cancelled("None", "ConditionalCheckFailed") });
+		await expect(applySubscription("o1", sub("active", "team_monthly"), NOW)).rejects.toThrow("tx");
+		expect(ddb.send.mock.calls.filter(([c]) => c instanceof TransactWriteCommand)).toHaveLength(2);
 	});
 	it("reads the customer id from an expanded customer object", async () => {
 		setup({ profile: profile(), billing: null });

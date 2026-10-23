@@ -70,6 +70,8 @@ export function effectivePlan(sub: Stripe.Subscription | null, pastDueSince: str
 		case "canceled":
 		case "unpaid":
 		case "incomplete_expired":
+		// Collection is paused, so nothing is being paid for.
+		case "paused":
 			return "free";
 		case "active":
 		case "trialing": {
@@ -82,7 +84,7 @@ export function effectivePlan(sub: Stripe.Subscription | null, pastDueSince: str
 			const key = baseItem(sub)?.price.lookup_key;
 			return key ? planForLookupKey(key) : null;
 		}
-		// incomplete, paused and anything Stripe adds later.
+		// incomplete and anything Stripe adds later.
 		default:
 			return null;
 	}
@@ -91,23 +93,42 @@ export function effectivePlan(sub: Stripe.Subscription | null, pastDueSince: str
 const iso = (seconds: number | null) => (seconds === null ? null : new Date(seconds * 1000).toISOString());
 const customerIdOf = (sub: Stripe.Subscription) => (typeof sub.customer === "string" ? sub.customer : sub.customer.id);
 
-// A DynamoDB transaction cancellation lists a reason per item, in order; the PROFILE item is first.
-const profileConditionFailed = (e: unknown) => {
+// A DynamoDB transaction cancellation lists a reason per item, in order: PROFILE first, then BILLING.
+const conditionFailedAt = (e: unknown, index: number) => {
 	const err = e as { name?: string; CancellationReasons?: { Code?: string }[] };
-	return err.name === "TransactionCanceledException" && err.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed";
+	return err.name === "TransactionCanceledException" && err.CancellationReasons?.[index]?.Code === "ConditionalCheckFailed";
 };
 
+const LIVE = new Set(["active", "trialing", "past_due"]);
+const TERMINAL = new Set(["canceled", "unpaid", "incomplete_expired"]);
+
 export interface ApplyResult {
+	// Callers must branch on `applied`: when false this is only the best-known plan, not what was written.
 	plan: PlanId;
 	// The Stripe billing period moved since the BILLING item was written, so the meter owes the old one a flush.
 	periodChanged: boolean;
 	previous: BillingRecord | null;
-	// False when nothing was written: incomplete subscription, or a custom, missing or non-active org.
+	// False when nothing was written: incomplete or stale subscription, or a custom, missing or non-active org.
 	applied: boolean;
 }
 
 export async function applySubscription(orgId: string, sub: Stripe.Subscription | null, now = Date.now()): Promise<ApplyResult> {
+	// One retry: the only expected conflict is a spend-cap change landing between our read and write.
+	for (let attempt = 0; ; attempt++) {
+		const result = await tryApply(orgId, sub, now, attempt === 0);
+		if (result) return result;
+	}
+}
+
+// Returns null when the spend cap changed under us and a fresh read may still succeed.
+async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: number, mayRetry: boolean): Promise<ApplyResult | null> {
 	const [previous, profile] = await Promise.all([getBilling(orgId), getProfile(orgId)]);
+	// A late event for an old subscription (say its final invoice after a cancel and resubscribe) is
+	// re-fetched as canceled; applying it would downgrade the org's newer live subscription.
+	if (previous?.subscription_id && sub && sub.id !== previous.subscription_id && LIVE.has(previous.status) && TERMINAL.has(sub.status)) {
+		console.warn(`ignoring stale subscription for org ${orgId}: ${sub.id} (${sub.status}) while ${previous.subscription_id} is ${previous.status}`);
+		return { plan: previous.plan, periodChanged: false, previous, applied: false };
+	}
 	const pastDueSince = sub?.status === "past_due" ? (previous?.past_due_since ?? new Date(now).toISOString()) : null;
 	const plan = effectivePlan(sub, pastDueSince, now);
 	const skipped = (): ApplyResult => ({ plan: plan ?? previous?.plan ?? "free", periodChanged: false, previous, applied: false });
@@ -117,7 +138,8 @@ export async function applySubscription(orgId: string, sub: Stripe.Subscription 
 	const periodStart = iso(period.start);
 	const periodEnd = iso(period.end);
 	const planDef = PLANS[plan];
-	const limits = { ...planDef.limits, monthly_events: deriveMonthlyEvents(planDef, previous?.spend_cap_usd ?? null) };
+	const readCap = previous?.spend_cap_usd ?? null;
+	const limits = { ...planDef.limits, monthly_events: deriveMonthlyEvents(planDef, readCap) };
 	// Free has no Stripe period; a paid one without dates (never seen in practice) falls back to the calendar month.
 	const withPeriod = plan !== "free" && !!periodStart && !!periodEnd;
 	const customerId = sub ? customerIdOf(sub) : (previous?.customer_id ?? null);
@@ -150,6 +172,8 @@ export async function applySubscription(orgId: string, sub: Stripe.Subscription 
 			Update: {
 				TableName: table(),
 				Key: billingKey(orgId),
+				// limits above were derived from the cap we read; if the console changed it since, redo the read.
+				ConditionExpression: "attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap",
 				// The cap and the meter's counters belong to other writers, so they are only initialised here.
 				UpdateExpression:
 					"SET customer_id = :cus, subscription_id = :sub, #s = :status, #p = :plan, current_period_start = :cps, current_period_end = :cpe, " +
@@ -167,6 +191,7 @@ export async function applySubscription(orgId: string, sub: Stripe.Subscription 
 					":cancel": sub?.cancel_at_period_end ?? false,
 					":pd": pastDueSince,
 					":cap": null,
+					":readCap": readCap,
 					":zero": 0,
 					":none": null,
 				},
@@ -178,7 +203,8 @@ export async function applySubscription(orgId: string, sub: Stripe.Subscription 
 		await ddb.send(new TransactWriteCommand({ TransactItems: items }));
 	} catch (e) {
 		// The org was suspended, deleted or made custom after we read it: skipped, not an error.
-		if (profileConditionFailed(e)) return skipped();
+		if (conditionFailedAt(e, 0)) return skipped();
+		if (customerId && conditionFailedAt(e, 1) && mayRetry) return null;
 		throw e;
 	}
 	const periodChanged = !!previous?.current_period_start && previous.current_period_start !== periodStart;
