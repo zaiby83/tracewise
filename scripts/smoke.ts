@@ -16,10 +16,10 @@ const check = (name: string, ok: boolean, detail = "") => {
 	if (!ok) failures++;
 };
 
-async function countRun(): Promise<number> {
+async function countRoute(route: string): Promise<number> {
 	const res = await fetch(`${url}/v1/traces?day=${today}&limit=200`, { headers: { authorization: `Bearer ${key}` } });
 	const body = (await res.json()) as { traces: { route?: string }[] };
-	return body.traces.filter((t) => t.route === `smoke-${runId}`).length;
+	return body.traces.filter((t) => t.route === route).length;
 }
 
 // 1. Send N events through the SDK, as an app would.
@@ -38,7 +38,7 @@ let seen = 0;
 const waitStart = Date.now();
 while (Date.now() < deadline && seen < Math.min(N, 200)) {
 	await new Promise((r) => setTimeout(r, 1000));
-	seen = await countRun();
+	seen = await countRoute(`smoke-${runId}`);
 }
 check("events queryable", seen >= Math.min(N, 200), `${seen} visible after ${((Date.now() - waitStart) / 1000).toFixed(1)} s`);
 
@@ -51,9 +51,19 @@ check("garbage rejected", (await post({ events: [{ nope: 1 }] })).status === 400
 // 4. Idempotency: the same event sent three times is stored once.
 const dupe = { event_id: crypto.randomUUID(), ts: new Date().toISOString(), model: "m", route: `dupe-${runId}`, input: "i", output: "o", latency_ms: 1 };
 for (let i = 0; i < 3; i++) await post({ events: [dupe] });
-await new Promise((r) => setTimeout(r, 3000));
-const res = await fetch(`${url}/v1/traces?day=${today}&limit=200`, { headers: { authorization: `Bearer ${key}` } });
-const copies = ((await res.json()) as { traces: { route?: string }[] }).traces.filter((t) => t.route === `dupe-${runId}`).length;
+// Low-traffic freshness is several seconds with the default batching window
+// (docs/experiments.md, experiment 4), so poll until the event lands. Then give any
+// stray copy a few more seconds to show up before counting.
+const dupeDeadline = Date.now() + 30_000;
+let copies = 0;
+while (Date.now() < dupeDeadline && copies === 0) {
+	await new Promise((r) => setTimeout(r, 1000));
+	copies = await countRoute(`dupe-${runId}`);
+}
+if (copies > 0) {
+	await new Promise((r) => setTimeout(r, 3000));
+	copies = await countRoute(`dupe-${runId}`);
+}
 check("duplicate deliveries stored once", copies === 1, `${copies} stored`);
 
 process.exit(failures ? 1 : 0);
