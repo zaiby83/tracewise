@@ -20,7 +20,7 @@ describe("planMigration", () => {
 	it("creates one profile per tenant that keeps the demo and load test working", () => {
 		const p = planMigration([demo, write], new Set());
 		expect(p.profiles).toHaveLength(1);
-		expect(p.profiles[0]).toMatchObject({ org_id: "t1", plan: "custom", owner_count: 0, limits: { events_per_minute: 6000, monthly_events: null, analytics_queries_per_day: 10_000 } });
+		expect(p.profiles[0]).toMatchObject({ org_id: "t1", plan: "custom", owner_count: 0, limits: { events_per_minute: 6000, monthly_events: null, analytics_queries_per_day: 10_000, max_keys: 10, max_members: 5, max_pending_invites: 10 } });
 		expect(p.index).toEqual([
 			{ key_hash: demo.key_hash, org_id: "t1", key_id: "aaaaaaaaaaaaaaaa", scope: "read", status: "active" },
 			{ key_hash: write.key_hash, org_id: "t1", key_id: "bbbbbbbbbbbbbbbb", scope: "write", status: "active" },

@@ -149,12 +149,12 @@ pnpm exec tsx scripts/run-evals.ts [YYYY-MM-DD]                  # run the evalu
 TRACEWISE_ALARM_EMAIL=you@example.com TRACEWISE_DASHBOARD_KEY=<read-only key> pnpm run deploy --context smokeClient=true   # also adds the password-auth app client the smoke test needs
 pnpm exec tsx scripts/migrate-accounts.ts [--owner you@example.com]   # turn existing tenants into orgs
 pnpm exec tsx scripts/smoke-selfserve.ts                  # sign-up to deletion, end to end (about 20 minutes, up to 30, mostly waiting for the delayed sweep)
-pnpm exec tsx scripts/set-limits.ts "<org name or id>" events_per_day=200000 max_members=10   # custom limits for one org
+pnpm exec tsx scripts/set-limits.ts "<org name or id>" monthly_events=200000 max_members=10   # custom limits for one org
 ```
 
-- **`migrate-accounts`** creates an org for each existing tenant, with its current rate as the per-minute limit and a daily cap of that rate sustained all day, so the public demo and load tests keep working. Running it again changes nothing already migrated. With `--owner`, the Cognito user with that email (they must have signed up first) becomes owner of every active org that has no owner yet, not only the ones this run creates. Keys of orgs that are deleting, deleted or suspended are retired as revoked, so unsuspending an org later doesn't restore them. Create new keys instead.
+- **`migrate-accounts`** creates an org for each existing tenant, with its current rate as the per-minute limit and no monthly cap, so the public demo and load tests keep working. Running it again changes nothing already migrated. With `--owner`, the Cognito user with that email (they must have signed up first) becomes owner of every active org that has no owner yet, not only the ones this run creates. Keys of orgs that are deleting, deleted or suspended are retired as revoked, so unsuspending an org later doesn't restore them. Create new keys instead.
 - **`smoke-selfserve`** creates two throwaway Cognito users and an org, ingests, checks that the key's `last_used_at` was stamped, queries, invites, checks permissions, revokes the key, then deletes the org. It waits (up to 25 minutes) for the deleter to tombstone the org's profile, then checks that the org's lake prefix and today's trace partitions are empty. It deletes the users afterwards, even on failure. It needs your operator credentials, including `s3:ListBucket` on the lake and read access to the Accounts and Traces tables. It creates one real org, so it counts toward the daily sign-up cap.
-- **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`. Unnamed limits keep their value.
+- **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`. Unnamed limits keep their value. `monthly_events=null` removes the monthly cap.
 
 ```sh
 curl -X POST "$API_URL/v1/traces" -H "authorization: Bearer $KEY" -H 'content-type: application/json' \

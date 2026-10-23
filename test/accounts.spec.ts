@@ -15,7 +15,7 @@ describe("accounts", () => {
 		expect(FREE_LIMITS).toEqual({ events_per_minute: 600, monthly_events: 50_000, eval_samples_per_night: 20, analytics_queries_per_day: 200, max_keys: 3, max_members: 2, max_pending_invites: 2 });
 	});
 	it("legacy limits keep a migrated tenant's current behaviour", () => {
-		expect(legacyLimits(6000)).toMatchObject({ events_per_minute: 6000, monthly_events: null, analytics_queries_per_day: 10_000, eval_samples_per_night: 20 });
+		expect(legacyLimits(6000)).toMatchObject({ events_per_minute: 6000, monthly_events: null, analytics_queries_per_day: 10_000, eval_samples_per_night: 20, max_keys: 10, max_members: 5, max_pending_invites: 10 });
 	});
 	it("getProfile reads ORG#id / PROFILE and returns null when missing", async () => {
 		ddb.send.mockReset().mockResolvedValueOnce({ Item: undefined });

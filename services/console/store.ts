@@ -101,7 +101,8 @@ export async function createOrg(input: {
 		owner_count: input.owner ? 1 : 0,
 		created_at: now.toISOString(),
 		created_by: input.owner?.sub ?? "operator",
-		retention_days: PLANS.free.retention_days,
+		// Operator-created (custom) orgs keep the 30 days legacy tenants always had.
+		retention_days: input.plan === "custom" ? 30 : PLANS.free.retention_days,
 	};
 	const key = buildKey(org.org_id, { name: "Default", scope: "write", created_by: org.created_by }, now);
 	const items: TransactItem[] = [

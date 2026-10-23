@@ -48,6 +48,14 @@ describe("createOrg", () => {
 		expect(tx[0]!.Put!.Item).toMatchObject({ pk: `ORG#${org.org_id}`, owner_count: 0, plan: "custom", limits: { events_per_minute: 6000 } });
 		expect(JSON.stringify(tx)).not.toContain("MEMBER#");
 	});
+	it("stamps 30-day retention on custom orgs and 7 on free ones", async () => {
+		fresh();
+		await createOrg({ name: "Demo", plan: "custom", limits: { ...FREE_LIMITS, events_per_minute: 6000 } });
+		expect(txItems()[0]!.Put!.Item).toMatchObject({ retention_days: 30 });
+		fresh();
+		await createOrg({ name: "Acme", owner: { sub: "u1", email: "a@x.io" } });
+		expect(txItems()[0]!.Put!.Item).toMatchObject({ retention_days: 7 });
+	});
 });
 
 describe("updateProfile", () => {

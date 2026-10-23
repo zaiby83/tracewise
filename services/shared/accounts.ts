@@ -30,6 +30,10 @@ export const legacyLimits = (eventsPerMinute: number): Limits => ({
 	events_per_minute: eventsPerMinute,
 	monthly_events: null,
 	analytics_queries_per_day: 10_000,
+	// Pinned so the tighter free caps don't shrink what migrated tenants already had.
+	max_keys: 10,
+	max_members: 5,
+	max_pending_invites: 10,
 });
 
 export interface OrgProfile {
@@ -45,7 +49,8 @@ export interface OrgProfile {
 	created_at: string;
 	created_by: string;
 	deleted_at?: string;
-	// Hot-retention days for this org's data; absent means the free default.
+	// Hot-retention days for this org's data. Absent (migrated rows) means resolve by plan,
+	// with custom and legacy orgs at 30; it never defaults to the free plan's 7.
 	retention_days?: number;
 	// ISO dates of the paid billing period, written by the billing webhook.
 	period_start?: string;

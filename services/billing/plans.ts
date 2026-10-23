@@ -16,7 +16,7 @@ export interface Plan {
 
 // `monthly_events` is the plan's own cap: the included allowance on free (a hard cap), and
 // null on paid plans, where overage is billed unless the org sets a spend cap.
-export const PLANS: Record<PlanId, Plan> = {
+const PLAN_TABLE: Record<PlanId, Plan> = {
 	free: {
 		id: "free",
 		name: "Free",
@@ -49,13 +49,22 @@ export const PLANS: Record<PlanId, Plan> = {
 	},
 };
 
+// Frozen, including each limits and stripe object: FREE_LIMITS shares a reference with
+// PLANS.free.limits, so a stray mutation would silently change every free org's cap.
+export const PLANS: Record<PlanId, Plan> = Object.freeze(
+	Object.fromEntries(
+		Object.entries(PLAN_TABLE).map(([id, plan]) => [id, Object.freeze({ ...plan, limits: Object.freeze(plan.limits), stripe: plan.stripe && Object.freeze(plan.stripe) })]),
+	) as Record<PlanId, Plan>,
+);
+
 // The per-period event ceiling ingest enforces. A paid org's spend cap becomes extra events
 // at the plan's overage rate; custom orgs are never capped here.
 export function deriveMonthlyEvents(plan: Plan | "custom", spendCapUsd: number | null): number | null {
 	if (plan === "custom") return null;
 	if (plan.overage_per_100k_usd === null) return plan.included_events;
 	if (spendCapUsd === null) return null;
-	return plan.included_events + Math.floor((spendCapUsd * 100_000) / plan.overage_per_100k_usd);
+	// Whole cents keep fractional caps (0.29 USD) free of float error.
+	return plan.included_events + Math.floor((Math.round(spendCapUsd * 100) * 100_000) / Math.round(plan.overage_per_100k_usd * 100));
 }
 
 export function planForLookupKey(key: string): PlanId | null {

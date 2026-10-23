@@ -12,9 +12,15 @@ describe("plans", () => {
 		expect(PLANS.pro.limits).toMatchObject({ events_per_minute: 30_000, eval_samples_per_night: 500, max_members: 50, max_keys: 100, max_pending_invites: 50, analytics_queries_per_day: 10_000, monthly_events: null });
 	});
 	it.each([
-		["free", null, 50_000], ["team", null, null], ["team", 20, 900_000], ["team", 0, 500_000], ["pro", 30, 6_000_000], ["custom", 50, null],
+		["free", null, 50_000], ["team", null, null], ["team", 20, 900_000], ["team", 0, 500_000], ["team", 0.29, 505_800], ["pro", 30, 6_000_000], ["custom", 50, null],
 	])("deriveMonthlyEvents(%s, %s) = %s", (plan, cap, want) => {
 		expect(deriveMonthlyEvents(plan === "custom" ? "custom" : PLANS[plan as PlanId], cap as number | null)).toBe(want);
+	});
+	it("freezes the plan table, including the shared FREE_LIMITS reference", () => {
+		expect(Object.isFrozen(PLANS)).toBe(true);
+		expect(Object.isFrozen(PLANS.free.limits)).toBe(true);
+		expect(Object.isFrozen(PLANS.team.stripe)).toBe(true);
+		expect(() => { (PLANS.free.limits as { max_keys: number }).max_keys = 99; }).toThrow(TypeError);
 	});
 	it("never estimates negative overage", () => {
 		expect(estimatedOverageUsd(PLANS.team, 100_000)).toBe(0);
