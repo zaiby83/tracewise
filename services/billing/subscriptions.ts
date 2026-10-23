@@ -20,6 +20,17 @@ export interface BillingRecord {
 	// The meter's counters: what it last reported to Stripe, and for which period.
 	reported_events: number;
 	reported_period: string | null;
+	// A meter event claimed (counters already advanced) but not yet confirmed sent. Written and
+	// cleared only by the meter; the next run re-sends exactly this before anything new.
+	pending?: PendingMeterEvent;
+}
+
+export interface PendingMeterEvent {
+	identifier: string;
+	value: string;
+	// Epoch seconds, as Stripe takes it.
+	timestamp: number;
+	period: string;
 }
 
 const GRACE_MS = 7 * 86_400_000;

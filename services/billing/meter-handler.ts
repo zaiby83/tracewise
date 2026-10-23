@@ -43,14 +43,12 @@ async function forEachBounded<T>(items: T[], limit: number, fn: (item: T) => Pro
 	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
-// The same period ingest counts into: the profile's dates come from these, and a paid org without
-// them (or one already downgraded to Free) uses the calendar month.
+// The subscription's own period decides what is billed, so BILLING's dates win whatever plan the
+// org is on now: a past-due org already downgraded to Free still owes its open paid subscription
+// the events of that period. Only an org with no dates (a paid one before its first webhook) falls
+// back to the calendar month, which is what ingest counts into then.
 function periodOf(billing: BillingRecord): string {
-	return periodBounds({
-		plan: billing.plan,
-		period_start: billing.current_period_start?.slice(0, 10),
-		period_end: billing.current_period_end?.slice(0, 10),
-	}).start;
+	return billing.current_period_start ? periodKey(billing.current_period_start) : periodBounds({ plan: "free" }).start;
 }
 
 // Past-due grace expiry would otherwise wait for Stripe's next event for the subscription.
@@ -102,7 +100,10 @@ async function meterOrg(b: BillingRecord, periodStart: string, now: number): Pro
 		// Pick up whatever the flush (or a concurrent run) recorded rather than trusting the scan's copy.
 		view = (await getBilling(b.org_id)) ?? b;
 	}
-	return (await reportOrgUsage(view, { periodStart, timestamp: Math.floor(now / 1000) })).sent;
+	// Late events still belong to the Stripe period their counter is for, so never stamp them after its end.
+	const end = view.current_period_end ? Date.parse(view.current_period_end) / 1000 : NaN;
+	const timestamp = Math.floor(Number.isFinite(end) ? Math.min(now / 1000, end - 1) : now / 1000);
+	return (await reportOrgUsage(view, { periodStart, timestamp })).sent;
 }
 
 export async function handler(): Promise<void> {
