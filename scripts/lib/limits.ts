@@ -11,7 +11,12 @@ export function parseLimitOverrides(pairs: string[], current: Limits): Limits {
 		const key = pair.slice(0, at);
 		const raw = pair.slice(at + 1);
 		if (!Object.hasOwn(FREE_LIMITS, key)) throw new Error(`unknown limit "${key}" (known: ${Object.keys(FREE_LIMITS).join(", ")})`);
-		if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error(`${key} must be a non-negative integer, got "${raw}"`);
+		// monthly_events is the one nullable limit: the literal `null` removes the cap.
+		if (key === "monthly_events" && raw === "null") {
+			next.monthly_events = null;
+			continue;
+		}
+		if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error(`${key} must be a non-negative integer${key === "monthly_events" ? " or null" : ""}, got "${raw}"`);
 		next[key as keyof Limits] = Number(raw);
 	}
 	return next;

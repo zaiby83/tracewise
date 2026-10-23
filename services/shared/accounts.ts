@@ -1,4 +1,5 @@
 import { GetCommand, QueryCommand, ScanCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { PLANS } from "../billing/plans";
 import { ddb } from "./ddb";
 
 export type Role = "owner" | "member";
@@ -6,7 +7,8 @@ export type OrgStatus = "active" | "suspended" | "deleting" | "deleted";
 
 export interface Limits {
 	events_per_minute: number;
-	events_per_day: number;
+	// Per billing period; null means no cap (paid plans without a spend cap, custom orgs).
+	monthly_events: number | null;
 	eval_samples_per_night: number;
 	analytics_queries_per_day: number;
 	max_keys: number;
@@ -14,15 +16,7 @@ export interface Limits {
 	max_pending_invites: number;
 }
 
-export const FREE_LIMITS: Limits = {
-	events_per_minute: 600,
-	events_per_day: 50_000,
-	eval_samples_per_night: 20,
-	analytics_queries_per_day: 200,
-	max_keys: 10,
-	max_members: 5,
-	max_pending_invites: 10,
-};
+export const FREE_LIMITS: Limits = PLANS.free.limits;
 
 export const MAX_OWNED_ORGS = 3;
 export const GLOBAL_ORGS_PER_DAY = 100;
@@ -30,12 +24,11 @@ export const GLOBAL_JUDGE_CALLS_PER_NIGHT = 2000;
 export const INVITE_TTL_DAYS = 7;
 
 // Tenants that existed before self-serve keep today's behaviour: the free defaults would
-// cap the public demo (polled every minute) and the load test, so the daily cap is simply
-// the per-minute rate sustained all day.
+// cap the public demo (polled every minute) and the load test, so they get no monthly cap.
 export const legacyLimits = (eventsPerMinute: number): Limits => ({
 	...FREE_LIMITS,
 	events_per_minute: eventsPerMinute,
-	events_per_day: eventsPerMinute * 1440,
+	monthly_events: null,
 	analytics_queries_per_day: 10_000,
 });
 
@@ -43,7 +36,7 @@ export interface OrgProfile {
 	org_id: string;
 	name: string;
 	status: OrgStatus;
-	plan: "free" | "custom";
+	plan: "free" | "team" | "pro" | "custom";
 	limits: Limits;
 	rubric: string | null;
 	evals_enabled: boolean;
@@ -52,6 +45,11 @@ export interface OrgProfile {
 	created_at: string;
 	created_by: string;
 	deleted_at?: string;
+	// Hot-retention days for this org's data; absent means the free default.
+	retention_days?: number;
+	// ISO dates of the paid billing period, written by the billing webhook.
+	period_start?: string;
+	period_end?: string;
 }
 
 export interface Member {

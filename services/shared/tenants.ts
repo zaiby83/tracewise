@@ -122,13 +122,12 @@ export const counterIds = {
 
 export type QuotaResult = "ok" | "minute" | "day";
 
-// Checks the per-minute rate first, then the daily cap, and says which one refused so the
-// caller can tell the client when to retry.
+// Checks the per-minute rate and says which window refused so the caller can tell the client
+// when to retry. The daily cap is gone with `events_per_day`; Task 2 adds the per-period check,
+// and "day" stays in the type until it replaces the ingest branch.
 export async function consumeQuota(tenant: Tenant, events: number, now = Date.now()): Promise<QuotaResult> {
 	const minute = Math.floor(now / 60_000);
 	if (!(await consumeCounter(counterIds.minute(tenant.org_id, now), events, tenant.limits.events_per_minute, (minute + 2) * 60))) return "minute";
-	// Two days keeps the row past the end of its UTC day, whenever in the day it was created.
-	if (!(await consumeCounter(counterIds.day(tenant.org_id, now), events, tenant.limits.events_per_day, Math.floor(now / 1000) + 2 * 86_400))) return "day";
 	return "ok";
 }
 

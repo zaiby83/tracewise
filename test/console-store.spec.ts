@@ -30,7 +30,7 @@ describe("createOrg", () => {
 		const { org, key } = await createOrg({ name: "Acme", owner: { sub: "u1", email: "a@x.io" } });
 		const tx = txItems();
 		expect(tx.map((i) => Object.keys(i)[0])).toEqual(["Put", "Put", "Put", "Put", "Put"]); // PROFILE, MEMBER, USER, KEY, key index
-		expect(tx[0]!.Put!.Item).toMatchObject({ pk: `ORG#${org.org_id}`, sk: "PROFILE", plan: "free", limits: FREE_LIMITS, owner_count: 1, evals_enabled: true, rubric: null, status: "active" });
+		expect(tx[0]!.Put!.Item).toMatchObject({ pk: `ORG#${org.org_id}`, sk: "PROFILE", plan: "free", limits: FREE_LIMITS, retention_days: 7, owner_count: 1, evals_enabled: true, rubric: null, status: "active" });
 		expect(tx[1]!.Put!.Item).toMatchObject({ pk: `ORG#${org.org_id}`, sk: "MEMBER#u1", role: "owner", email: "a@x.io" });
 		expect(tx[2]!.Put!.Item).toMatchObject({ pk: "USER#u1", sk: `ORG#${org.org_id}`, role: "owner", org_name: "Acme" });
 		expect(tx[3]!.Put!.Item).toMatchObject({ pk: `ORG#${org.org_id}`, sk: `KEY#${key.record.key_id}`, scope: "write" });

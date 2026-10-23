@@ -11,9 +11,8 @@ export const usageRoutes: RouteTable = {
 			const now = Date.now();
 			// The nightly job samples at night for the day that just ended, so the number to show is yesterday's.
 			const yesterday = new Date(now - 86_400_000).toISOString().slice(0, 10);
-			const [minute, day, athena, evals, keys, members, invites] = await Promise.all([
+			const [minute, athena, evals, keys, members, invites] = await Promise.all([
 				readCounter(counterIds.minute(org_id, now)),
-				readCounter(counterIds.day(org_id, now)),
 				readCounter(counterIds.athena(org_id, now)),
 				readCounter(counterIds.evals(org_id, yesterday)),
 				listKeys(org_id),
@@ -24,7 +23,8 @@ export const usageRoutes: RouteTable = {
 				limits,
 				used: {
 					events_this_minute: minute,
-					events_today: day,
+					// Temporary: Task 2 replaces the daily counter with the period usage.
+					events_today: 0,
 					analytics_queries_today: athena,
 					eval_samples_last_night: evals,
 					keys: keys.length,

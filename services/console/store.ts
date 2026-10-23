@@ -2,9 +2,10 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { ConditionalCheckFailedException, TransactionCanceledException } from "@aws-sdk/client-dynamodb";
 import { GetCommand, QueryCommand, ScanCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import {
-	FREE_LIMITS, INVITE_TTL_DAYS, k, getMember, getProfile, normalizeEmail,
+	INVITE_TTL_DAYS, k, getMember, getProfile, normalizeEmail,
 	type Invite, type KeyRecord, type Limits, type Member, type OrgProfile, type Role,
 } from "../shared/accounts";
+import { PLANS } from "../billing/plans";
 import { ddb } from "../shared/ddb";
 import { hashApiKey, newApiKey } from "../shared/keys";
 
@@ -94,12 +95,13 @@ export async function createOrg(input: {
 		name: input.name,
 		status: "active",
 		plan: input.plan ?? "free",
-		limits: input.limits ?? { ...FREE_LIMITS },
+		limits: input.limits ?? { ...PLANS.free.limits },
 		rubric: null,
 		evals_enabled: true,
 		owner_count: input.owner ? 1 : 0,
 		created_at: now.toISOString(),
 		created_by: input.owner?.sub ?? "operator",
+		retention_days: PLANS.free.retention_days,
 	};
 	const key = buildKey(org.org_id, { name: "Default", scope: "write", created_by: org.created_by }, now);
 	const items: TransactItem[] = [

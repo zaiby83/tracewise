@@ -72,13 +72,12 @@ describe("tenantForKey", () => {
 });
 
 describe("counters and quota", () => {
-	it("consumeQuota reports which window refused", async () => {
-		const t = { ...tenant, limits: { ...FREE_LIMITS, events_per_minute: 10, events_per_day: 15 } };
-		ddb.send.mockResolvedValueOnce({}).mockRejectedValueOnce(refused());
-		expect(await consumeQuota(t, 5)).toBe("day");
+	// The monthly check returns with Task 2; until then only the minute window can refuse.
+	it("consumeQuota reports when the minute window refused", async () => {
+		const t = { ...tenant, limits: { ...FREE_LIMITS, events_per_minute: 10 } };
 		ddb.send.mockRejectedValueOnce(refused());
 		expect(await consumeQuota(t, 5)).toBe("minute");
-		ddb.send.mockResolvedValueOnce({}).mockResolvedValueOnce({});
+		ddb.send.mockResolvedValueOnce({});
 		expect(await consumeQuota(t, 5)).toBe("ok");
 	});
 	it("consumeCounter propagates errors that are not a refusal", async () => {

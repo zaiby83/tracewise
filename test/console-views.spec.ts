@@ -19,7 +19,9 @@ describe("console view helpers", () => {
 	});
 
 	it("lists usage against every limit, with what happens at the cap", () => {
-		const rows = usageRows({ limits: FREE_LIMITS, used: { events_this_minute: 1, events_today: 2, analytics_queries_today: 3, eval_samples_last_night: 4, keys: 1, members: 1, pending_invites: 0 } });
+		// Explicit fixture: the view still reads events_per_day until Task 11 updates it.
+		const limits = { ...FREE_LIMITS, events_per_day: 50_000, max_keys: 10, max_members: 5, max_pending_invites: 10 };
+		const rows = usageRows({ limits, used: { events_this_minute: 1, events_today: 2, analytics_queries_today: 3, eval_samples_last_night: 4, keys: 1, members: 1, pending_invites: 0 } });
 		expect(rows.map((r) => r.label)).toEqual(["Events this minute", "Events today", "Analytics queries today", "Eval samples last night", "Keys", "Members", "Pending invites"]);
 		expect(rows[1]).toMatchObject({ used: 2, limit: 50_000 });
 		expect(rows[1]!.note).toBe("Ingest returns 429 until UTC midnight");

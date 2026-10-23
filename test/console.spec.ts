@@ -303,7 +303,7 @@ describe("keys", () => {
 		expect((await call("DELETE /v1/orgs/{orgId}/keys/{keyId}", { params: { orgId: "o1", keyId: "zz" } })).statusCode).toBe(404);
 	});
 	it("refuses a key past the limit with 409 max_keys", async () => {
-		store.listKeys.mockResolvedValue(Array.from({ length: 10 }, (_, i) => ({ ...keyRecord, key_id: `k${i}` })));
+		store.listKeys.mockResolvedValue(Array.from({ length: FREE_LIMITS.max_keys }, (_, i) => ({ ...keyRecord, key_id: `k${i}` })));
 		const res = await call("POST /v1/orgs/{orgId}/keys", { params: { orgId: "o1" }, body: { name: "CI", scope: "read" } });
 		expect(res.statusCode).toBe(409);
 		expect(parse(res)).toEqual({ error: "limit reached", limit: "max_keys" });
@@ -363,8 +363,8 @@ describe("team", () => {
 		expect(parse(res).invites).toEqual([{ invite_id: "i1", email: "n@x.io", role: "member", expires_at: 1234 }]);
 		expect(res.body).not.toContain("TOKEN-HASH");
 	});
-	it("refuses a fifth member via invites when members + pending reach the limit", async () => {
-		store.listMembers.mockResolvedValue([{}, {}, {}, {}]);
+	it("refuses an invite when members + pending reach the member limit", async () => {
+		store.listMembers.mockResolvedValue([{}]);
 		store.listInvites.mockResolvedValue([{}]);
 		const res = await call("POST /v1/orgs/{orgId}/invites", { params: { orgId: "o1" }, body: { email: "n@x.io", role: "member" } });
 		expect(res.statusCode).toBe(409);
@@ -374,7 +374,7 @@ describe("team", () => {
 	it("refuses an invite past the pending limit", async () => {
 		accounts.getProfile.mockResolvedValue({ ...profile, limits: { ...FREE_LIMITS, max_members: 50 } });
 		store.listMembers.mockResolvedValue([{}]);
-		store.listInvites.mockResolvedValue(Array.from({ length: 10 }, () => ({})));
+		store.listInvites.mockResolvedValue(Array.from({ length: FREE_LIMITS.max_pending_invites }, () => ({})));
 		const res = await call("POST /v1/orgs/{orgId}/invites", { params: { orgId: "o1" }, body: { email: "n@x.io", role: "member" } });
 		expect(parse(res)).toEqual({ error: "limit reached", limit: "max_pending_invites" });
 	});
@@ -409,7 +409,6 @@ describe("usage", () => {
 		tenants.readCounter.mockImplementation(async (id: string) => {
 			if (id.includes("#evals#")) return id.endsWith("2026-10-21") ? 17 : 99;
 			if (id.includes("#athena#")) return 4;
-			if (id.includes("#day#")) return 1200;
 			return 33;
 		});
 		store.listKeys.mockResolvedValue([{}, {}]);
@@ -419,7 +418,7 @@ describe("usage", () => {
 		vi.useRealTimers();
 		expect(parse(res)).toEqual({
 			limits: FREE_LIMITS,
-			used: { events_this_minute: 33, events_today: 1200, analytics_queries_today: 4, eval_samples_last_night: 17, keys: 2, members: 3, pending_invites: 1 },
+			used: { events_this_minute: 33, events_today: 0, analytics_queries_today: 4, eval_samples_last_night: 17, keys: 2, members: 3, pending_invites: 1 },
 		});
 	});
 	it("is open to plain members", async () => {

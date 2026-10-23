@@ -20,7 +20,7 @@ describe("planMigration", () => {
 	it("creates one profile per tenant that keeps the demo and load test working", () => {
 		const p = planMigration([demo, write], new Set());
 		expect(p.profiles).toHaveLength(1);
-		expect(p.profiles[0]).toMatchObject({ org_id: "t1", plan: "custom", owner_count: 0, limits: { events_per_minute: 6000, events_per_day: 8_640_000, analytics_queries_per_day: 10_000 } });
+		expect(p.profiles[0]).toMatchObject({ org_id: "t1", plan: "custom", owner_count: 0, limits: { events_per_minute: 6000, monthly_events: null, analytics_queries_per_day: 10_000 } });
 		expect(p.index).toEqual([
 			{ key_hash: demo.key_hash, org_id: "t1", key_id: "aaaaaaaaaaaaaaaa", scope: "read", status: "active" },
 			{ key_hash: write.key_hash, org_id: "t1", key_id: "bbbbbbbbbbbbbbbb", scope: "write", status: "active" },
@@ -334,7 +334,7 @@ describe("scans", () => {
 });
 
 describe("parseLimitOverrides", () => {
-	const current = { events_per_minute: 600, events_per_day: 50_000, eval_samples_per_night: 20, analytics_queries_per_day: 200, max_keys: 10, max_members: 5, max_pending_invites: 10 };
+	const current = { events_per_minute: 600, monthly_events: 50_000 as number | null, eval_samples_per_night: 20, analytics_queries_per_day: 200, max_keys: 10, max_members: 5, max_pending_invites: 10 };
 
 	it("overrides the named limits and keeps the rest", () => {
 		expect(parseLimitOverrides(["events_per_minute=1200", "max_keys=25"], current)).toEqual({ ...current, events_per_minute: 1200, max_keys: 25 });
@@ -348,6 +348,13 @@ describe("parseLimitOverrides", () => {
 		expect(() => parseLimitOverrides(["max_keys=abc"], current)).toThrow(/non-negative integer/);
 		expect(() => parseLimitOverrides(["max_keys="], current)).toThrow(/non-negative integer/);
 		expect(() => parseLimitOverrides([], current)).toThrow(/at least one/);
+	});
+
+	it("accepts the literal null (and a number) for monthly_events only", () => {
+		expect(parseLimitOverrides(["monthly_events=null"], current).monthly_events).toBeNull();
+		expect(parseLimitOverrides(["monthly_events=1000"], current).monthly_events).toBe(1000);
+		expect(() => parseLimitOverrides(["monthly_events=abc"], current)).toThrow(/non-negative integer or null/);
+		expect(() => parseLimitOverrides(["max_keys=null"], current)).toThrow(/non-negative integer/);
 	});
 
 	it("does not inherit prototype keys", () => {
