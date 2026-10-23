@@ -487,7 +487,7 @@ describe("TracewiseStack", () => {
 
 		it("outputs the secret's ARN and the URL to register with Stripe", () => {
 			const outputs = template.findOutputs("*");
-			expect(Object.keys(outputs)).toEqual(expect.arrayContaining(["StripeSecretArn", "StripeWebhookUrl"]));
+			expect(Object.keys(outputs)).toEqual(expect.arrayContaining(["StripeSecretArn", "StripeWebhookUrl", "QuotasTable"]));
 			expect(JSON.stringify(outputs.StripeWebhookUrl!.Value)).toContain("/v1/stripe/webhook");
 		});
 

@@ -13,7 +13,7 @@ vi.mock("stripe", () => ({
 }));
 
 const SECRET = { secret_key: "sk_test_from_secrets_manager", webhook_secret: "whsec_from_secrets_manager" };
-const ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:tracewise/stripe-AbCdEf";
+const ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:Tracewise-StripeSecret-AbCdEf";
 
 // The module caches per instance, so each test imports a fresh copy.
 const load = async () => {

@@ -309,6 +309,8 @@ export class TracewiseStack extends Stack {
 		new CfnOutput(this, "ConsoleClientId", { value: clientId });
 		if (smokeClientId) new CfnOutput(this, "SmokeClientId", { value: smokeClientId });
 		new CfnOutput(this, "AccountsTable", { value: accountsTable.tableName });
+		// smoke-billing reads the period counter the meter reports from.
+		new CfnOutput(this, "QuotasTable", { value: quotas.tableName });
 		new CfnOutput(this, "DeletionQueue", { value: accounts.deletionQueue.queueUrl });
 		new CfnOutput(this, "StripeSecretArn", { value: billing.secret.secretArn });
 		// Register this endpoint with Stripe (the API Gateway URL, not CloudFront).

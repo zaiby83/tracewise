@@ -110,7 +110,7 @@ Plan {
 - **Stripe Tax** enabled. Checkout uses `automatic_tax`.
 
 Secrets go in Secrets Manager:
-- `tracewise/stripe` holds `{ secret_key, webhook_secret }`.
+- A Secrets Manager secret, named by CDK and found through the `StripeSecretArn` stack output, holds `{ secret_key, webhook_secret }`.
 - Billing functions read it once per cold start.
 - Only those functions get `secretsmanager:GetSecretValue` on it.
 
@@ -213,7 +213,7 @@ New runtime dependency: the official `stripe` npm package, pinned to an exact ve
 
 New resources:
 - the `billing-webhook` and `billing-meter` Lambdas
-- the `tracewise/stripe` secret
+- the Stripe secret (CDK-named; the `StripeSecretArn` output)
 - the hourly schedule
 - the meter alarms
 - the public webhook route
@@ -272,3 +272,30 @@ Checkout and the Portal are clicked through once by hand.
 - Annual plans (a yearly meter or prepaid event credits).
 - Enterprise: invoicing, contracts, SSO.
 - Tracking where an org's DynamoDB writes go when its items are smaller than 3 KB, to tighten cost estimates.
+
+## Changes during planning and implementation
+
+What changed from the sections above, one line each.
+
+- **`PROFILE` also carries `period_end`**, which ingest needs for `retry-after`; §6's table lists only `period_start`.
+- **The stale-meter alarm** works from a `MeterLastSuccessAgeMinutes = 0` datapoint the meter publishes after each fully successful run, and fires when none arrives for 3 hours (missing data breaching), instead of a gauge that counts up.
+- **`smoke-billing` doesn't override plans**: its overage check is an opt-in `--overage` flag that really ingests 500,001 events, replacing §13's `--included`.
+- **New free orgs get the new Free allowances right away** (2 members, 3 keys, 2 pending invites); existing free orgs move only when `apply-plan-limits` runs.
+- **Monthly-only:** there are no annual prices or plans anywhere.
+- **Custom orgs keep their legacy limits and 30-day retention**, including orgs an operator marks custom with `set-limits`, which now also sets `retention_days` to 30.
+- **The period counter is released on any enqueue failure**, not only some, so a client's retry isn't charged twice.
+- **`retention_days` is kept out of stored traces:** ingest stamps it on the queued event and the processor strips it before the hot store, query API and lake see it.
+- **Deleter time budget and window** now reach `MAX_RETENTION_DAYS` + 2 days back, so 90-day Pro data is covered.
+- **Plan switching moved from the Customer Portal to a console route** (`POST /v1/orgs/{id}/billing/change`); the Portal handles payment methods, invoices and cancellation.
+- **The portal configuration is tagged and converged by `stripe-setup`**, which finds it by its metadata tag and adopts an older plan-switching one.
+- **Stale and superseded subscription guards:** a late event for an old, terminal subscription, or a deletion of a superseded one, is ignored while the org holds a newer live subscription.
+- **`paused` maps to Free**, since collection is paused and nothing is being paid for.
+- **A spend-cap race guard:** BILLING's cap and PROFILE's derived `monthly_events` are written together, and the webhook re-reads if the cap changed under it.
+- **The meter claims, then sends:** it records a `pending` event on BILLING before calling Stripe and re-sends exactly that event first on the next run; `reported_period` only moves forward; metering follows the Stripe period; event timestamps are clamped to the period end.
+- **A durable `flush_due` marker** is written with the move off a period (or off a paid plan), so the final usage of a period can't be forgotten after a failed flush.
+- **The webhook event record is a lease** (a retry gets 409 while one is in progress), and a missing subscription (404) is read as "deleted" only for deletion events.
+- **One Stripe customer per org, and open Checkout sessions expire:** the first Checkout creates the customer (idempotent), and each new Checkout expires the org's other open sessions.
+- **Timeouts:** the webhook Lambda runs for 60 s and the console's billing routes for 29 s.
+- **The webhook-failure alarm uses a text log filter**, because Lambda's default log format isn't JSON.
+- **The Stripe secret's name is CDK-generated** (a fixed name would collide with the retained secret on redeploy); operators use the `StripeSecretArn` output.
+- **Open:** the Enterprise "Contact us" has no contact address yet; it stays plain text until one is decided.

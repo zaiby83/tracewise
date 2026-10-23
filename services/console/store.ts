@@ -121,7 +121,7 @@ export async function createOrg(input: {
 
 export async function updateProfile(
 	orgId: string,
-	patch: { name?: string; rubric?: string | null; evals_enabled?: boolean; limits?: Limits; plan?: "free" | "custom" },
+	patch: { name?: string; rubric?: string | null; evals_enabled?: boolean; limits?: Limits; plan?: "free" | "custom"; retention_days?: number },
 ): Promise<OrgProfile> {
 	const names: Record<string, string> = {};
 	const values: Record<string, unknown> = {};

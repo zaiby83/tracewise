@@ -21,3 +21,9 @@ export function parseLimitOverrides(pairs: string[], current: Limits): Limits {
 	}
 	return next;
 }
+
+// Orgs an operator marks custom keep the 30 days of hot retention legacy tenants always had, whatever
+// their plan was before: the Free plan's 7 days would silently shorten what they were promised.
+export function customPatch(limits: Limits) {
+	return { limits, plan: "custom" as const, retention_days: 30 };
+}
