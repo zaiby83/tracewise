@@ -1,6 +1,6 @@
 import type Stripe from "stripe";
 import { z } from "zod";
-import { PLANS, estimatedOverageUsd, periodBounds, type PlanId } from "../../billing/plans";
+import { PLANS, estimatedOverageUsd, isPaidPlan, periodBounds, type PlanId } from "../../billing/plans";
 import { findPortalConfigId, getStripe } from "../../billing/stripe";
 import { currentBilling } from "../../billing/current";
 import { HOLDS_SUBSCRIPTION, linkCustomer, rememberCustomer, setSpendCap, type BillingRecord } from "../../billing/subscriptions";
@@ -53,7 +53,7 @@ const paid = (profile: OrgProfile): profile is OrgProfile & { plan: "team" | "pr
 // so an org downgraded to Free can still reach Manage billing and see a payment problem. Customer,
 // subscription and price ids never appear: nothing here needs them.
 async function billingView(profile: OrgProfile, billing: BillingRecord | null) {
-	const used = await readCounter(counterIds.period(profile.org_id, periodBounds(profile).start));
+	const used = await readCounter(counterIds.period(profile.org_id, periodBounds(profile).start, isPaidPlan(profile.plan)));
 	const plan = paid(profile) ? PLANS[profile.plan] : null;
 	const sub = plan ? billing : null;
 	return {

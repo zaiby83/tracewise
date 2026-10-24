@@ -250,7 +250,8 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 				// other-mode record only needs it to still be one.
 				ConditionExpression: otherMode
 					? otherModeCondition(livemode!)
-					: "(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)" +
+					: // A stored NULL never equals :readCap, so "no cap" is matched by type, not value.
+						(readCap === null ? "(attribute_not_exists(spend_cap_usd) OR attribute_type(spend_cap_usd, :nullType))" : "(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)") +
 						(guardDeletion
 							? " AND (attribute_not_exists(subscription_id) OR attribute_type(subscription_id, :nullType) OR subscription_id = :expected)"
 							: ""),
@@ -278,11 +279,11 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 					":cancel": sub?.cancel_at_period_end ?? false,
 					":pd": pastDueSince,
 					":cap": null,
-					...(otherMode ? {} : { ":readCap": readCap }),
+					...(otherMode ? {} : readCap === null ? { ":nullType": "NULL" } : { ":readCap": readCap }),
 					":zero": 0,
 					":none": null,
 					...(livemode !== undefined ? { ":lm": livemode } : {}),
-					...(guardDeletion ? { ":nullType": "NULL", ":expected": expectedSubscriptionId } : {}),
+					...(guardDeletion && !otherMode ? { ":nullType": "NULL", ":expected": expectedSubscriptionId } : {}),
 					...(flushDue ? { ":fd": flushDue } : {}),
 				},
 			},

@@ -249,9 +249,28 @@ describe("applySubscription", () => {
 		await applySubscription("o1", sub("active", "team_monthly"), NOW);
 		expect(tx().billing!.ConditionExpression).toBe("(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)");
 		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":readCap": 20 });
-		setup({ profile: profile(), billing: billing({ spend_cap_usd: null }) });
+		// DynamoDB never finds `= :readCap` true for a stored NULL, so a null read matches the NULL type instead.
+		for (const read of [billing({ spend_cap_usd: null }), billing({ spend_cap_usd: undefined }), null]) {
+			setup({ profile: profile(), billing: read });
+			await applySubscription("o1", sub("active", "team_monthly"), NOW);
+			expect(tx().billing!.ConditionExpression).toBe("(attribute_not_exists(spend_cap_usd) OR attribute_type(spend_cap_usd, :nullType))");
+			expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":nullType": "NULL" });
+			expect(tx().billing!.ExpressionAttributeValues).not.toHaveProperty(":readCap");
+		}
+	});
+	it("matches a cap of zero by value, not as no cap", async () => {
+		setup({ profile: profile(), billing: billing({ spend_cap_usd: 0 }) });
 		await applySubscription("o1", sub("active", "team_monthly"), NOW);
-		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":readCap": null });
+		expect(tx().billing!.ConditionExpression).toBe("(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)");
+		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":readCap": 0 });
+	});
+	it("keeps the deletion guard alongside a null-cap condition", async () => {
+		setup({ profile: profile({ plan: "team" }), billing: billing() });
+		await applySubscription("o1", null, NOW, "sub_1");
+		expect(tx().billing!.ConditionExpression).toBe(
+			"(attribute_not_exists(spend_cap_usd) OR attribute_type(spend_cap_usd, :nullType)) AND (attribute_not_exists(subscription_id) OR attribute_type(subscription_id, :nullType) OR subscription_id = :expected)",
+		);
+		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":nullType": "NULL", ":expected": "sub_1" });
 	});
 	it("re-reads and retries once when the spend cap changed mid-update", async () => {
 		const caps = [billing({ spend_cap_usd: null }), billing({ spend_cap_usd: 20 })];
@@ -338,7 +357,7 @@ describe("deleting a subscription that may have been superseded", () => {
 	});
 
 	it("guards the BILLING write on the subscription id it expects", async () => {
-		setup({ profile: profile({ plan: "team" }), billing: billing() });
+		setup({ profile: profile({ plan: "team" }), billing: billing({ spend_cap_usd: 15 }) });
 		expect(await stripeGone()).toMatchObject({ applied: true, plan: "free" });
 		const b = tx().billing!;
 		expect(b.ConditionExpression).toBe(

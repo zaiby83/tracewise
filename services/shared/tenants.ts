@@ -1,6 +1,6 @@
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import { GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import { periodBounds, planFields, retentionFor } from "../billing/plans";
+import { isPaidPlan, periodBounds, planFields, retentionFor } from "../billing/plans";
 import { getProfile, legacyLimits, type Limits } from "./accounts";
 import { ddb } from "./ddb";
 import { log } from "./http";
@@ -127,8 +127,10 @@ const utcDay = (now: number) => new Date(now).toISOString().slice(0, 10);
 export const counterIds = {
 	// Fixed one-minute windows.
 	minute: (org: string, now: number) => `${org}#${Math.floor(now / 60_000)}`,
-	// Keyed by the period start so a new billing period starts a fresh counter.
-	period: (org: string, periodStart: string) => `${org}#month#${periodStart}`,
+	// Keyed by the period start so a new billing period starts a fresh counter. Paid (Team, Pro) usage has
+	// its own namespace: a free calendar month and a Stripe period can start on the same date, and the
+	// meter bills whatever the paid counter holds.
+	period: (org: string, periodStart: string, paid: boolean) => `${org}#${paid ? "paid" : "month"}#${periodStart}`,
 	athena: (org: string, now: number) => `${org}#athena#${utcDay(now)}`,
 	// Takes the day itself because the nightly job counts the night it started on.
 	evals: (org: string, day: string) => `${org}#evals#${day}`,
@@ -136,6 +138,8 @@ export const counterIds = {
 };
 
 export type QuotaResult = "ok" | "minute" | "month" | "spend_cap";
+
+const periodCounter = (tenant: Tenant) => counterIds.period(tenant.org_id, tenant.period_start, isPaidPlan(tenant.plan));
 
 const FORTY_DAYS_S = 40 * 86_400;
 
@@ -149,7 +153,7 @@ export async function consumeQuota(tenant: Tenant, events: number, now = Date.no
 	// Kept 40 days past the period end so the meter can still read it after a late webhook.
 	const expiresAt = Math.floor(Date.parse(tenant.period_end) / 1000) + FORTY_DAYS_S;
 	const max = tenant.limits.monthly_events ?? Number.MAX_SAFE_INTEGER;
-	if (!(await consumeCounter(counterIds.period(tenant.org_id, tenant.period_start), events, max, expiresAt))) {
+	if (!(await consumeCounter(periodCounter(tenant), events, max, expiresAt))) {
 		// Free orgs hit their allowance; paid orgs hit the spend cap they chose.
 		return tenant.plan === "free" ? "month" : "spend_cap";
 	}
@@ -163,7 +167,8 @@ export async function releaseQuota(tenant: Tenant, events: number): Promise<void
 		await ddb.send(
 			new UpdateCommand({
 				TableName: process.env.QUOTAS_TABLE,
-				Key: { window: counterIds.period(tenant.org_id, tenant.period_start) },
+				// The counter consumeQuota charged: same plan, same period.
+				Key: { window: periodCounter(tenant) },
 				UpdateExpression: "ADD used :neg",
 				ExpressionAttributeValues: { ":neg": -events },
 			}),

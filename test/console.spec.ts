@@ -482,7 +482,7 @@ describe("usage", () => {
 		store.listMembers.mockResolvedValue([]);
 		store.listInvites.mockResolvedValue([]);
 		const res = await call("GET /v1/orgs/{orgId}/usage", { params: { orgId: "o1" } });
-		expect(tenants.readCounter).toHaveBeenCalledWith("o1#month#2026-10-15");
+		expect(tenants.readCounter).toHaveBeenCalledWith("o1#paid#2026-10-15");
 		expect(parse(res)).toMatchObject({ period: { start: "2026-10-15", end: "2026-11-15" }, limits: { monthly_events: null } });
 	});
 	it("is open to plain members", async () => {
@@ -537,7 +537,7 @@ describe("billing", () => {
 			vi.useFakeTimers({ now: new Date("2026-10-22T10:30:00Z"), toFake: ["Date"] });
 			accounts.getProfile.mockResolvedValue(paidProfile("team"));
 			billingStore.getBilling.mockResolvedValue(billingRecord({ cancel_at_period_end: true, spend_cap_usd: 10 }));
-			tenants.readCounter.mockImplementation(async (id: string) => (id === "o1#month#2026-10-10" ? 800_000 : 1));
+			tenants.readCounter.mockImplementation(async (id: string) => (id === "o1#paid#2026-10-10" ? 800_000 : 1));
 			const res = await call(GET_BILLING, o1);
 			vi.useRealTimers();
 			expect(res.statusCode).toBe(200);
@@ -592,6 +592,14 @@ describe("billing", () => {
 			billingStore.getBilling.mockResolvedValue(billingRecord({ spend_cap_usd: 5 }));
 			tenants.readCounter.mockResolvedValue(9_000_000);
 			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "custom", status: "none", current_period_end: null, included_events: null, estimated_overage_usd: 0, spend_cap_usd: null });
+		});
+		it("reads a free org's usage from the month counter, even when it has a billing account", async () => {
+			vi.useFakeTimers({ now: new Date("2026-10-22T10:30:00Z"), toFake: ["Date"] });
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "canceled", plan: "free" }));
+			tenants.readCounter.mockImplementation(async (id: string) => (id === "o1#month#2026-10-01" ? 42 : 99));
+			const res = await call(GET_BILLING, o1);
+			vi.useRealTimers();
+			expect(parse(res)).toMatchObject({ events_this_period: 42 });
 		});
 		it("tells a free org it still has a billing account, and what its subscription is doing, after a downgrade", async () => {
 			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "unpaid", plan: "free" }));
@@ -940,7 +948,7 @@ describe("billing", () => {
 			accounts.getProfile.mockResolvedValue(paidProfile("team"));
 			billingStore.getBilling.mockResolvedValue(billingRecord({ spend_cap_usd: 10 }));
 			billingStore.setSpendCap.mockResolvedValue(true);
-			tenants.readCounter.mockImplementation(async (id: string) => (id === "o1#month#2026-10-10" ? 800_000 : 0));
+			tenants.readCounter.mockImplementation(async (id: string) => (id === "o1#paid#2026-10-10" ? 800_000 : 0));
 			const res = await call(PATCH_BILLING, { ...o1, body: { spend_cap_usd: 10 } });
 			expect(res.statusCode).toBe(200);
 			expect(billingStore.setSpendCap).toHaveBeenCalledWith("o1", "team", 10);

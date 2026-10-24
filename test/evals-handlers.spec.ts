@@ -161,9 +161,55 @@ describe("listTenants", () => {
 	});
 
 	it("reports the judge cap only for free-pool shortfalls", async () => {
-		scans([...Array.from({ length: 50 }, (_, i) => profile(`o${i}`)), ...Array.from({ length: 10 }, (_, i) => profile(`p${i}`, { plan: "pro", limits: PLANS.pro.limits }))]);
+		scans([...Array.from({ length: 50 }, (_, i) => profile(`o${i}`)), ...Array.from({ length: 2 }, (_, i) => profile(`p${i}`, { plan: "pro", limits: PLANS.pro.limits }))]);
 		await listTenants({ day: "2026-10-21" });
 		expect(metric()).toBeUndefined();
+	});
+
+	describe("the paid judge ceiling", () => {
+		const paidMetric = { MetricName: "GlobalCapHit", Dimensions: [{ Name: "Cap", Value: "judge_paid" }], Value: 1, Unit: "Count" };
+
+		it("leaves paid, custom and legacy allowances alone while their total is within 1,000", async () => {
+			scans(
+				[profile("pro", { plan: "pro", limits: PLANS.pro.limits }), profile("team", { plan: "team", limits: PLANS.team.limits }), profile("cust", { plan: "custom", limits: { ...FREE_LIMITS, eval_samples_per_night: 380 } })],
+				[{ tenant_id: "t", name: "Old", status: "active", events_per_minute: 600 }],
+			);
+			const { tenants } = await listTenants({ day: "2026-10-21" });
+			// 500 + 100 + 380 + 20 = 1,000 exactly.
+			expect(tenants.map((t) => t.sample_budget)).toEqual([500, 100, 380, 20]);
+			expect(metric()).toBeUndefined();
+		});
+
+		it("scales every paid org down in proportion when the total is over 1,000, and reports it", async () => {
+			scans([...Array.from({ length: 3 }, (_, i) => profile(`p${i}`, { plan: "pro", limits: PLANS.pro.limits })), profile("team", { plan: "team", limits: PLANS.team.limits })]);
+			const { tenants } = await listTenants({ day: "2026-10-21" });
+			// 1,600 asked for: each gets floor(budget * 1000 / 1600), and keeps its own limit on the ref.
+			expect(tenants.map((t) => [t.sample_budget, t.sample_limit])).toEqual([
+				[312, 500],
+				[312, 500],
+				[312, 500],
+				[62, 100],
+			]);
+			expect(tenants.reduce((n, t) => n + t.sample_budget, 0)).toBeLessThanOrEqual(1_000);
+			expect(metric()).toMatchObject({ Namespace: "Tracewise/Limits", MetricData: [paidMetric] });
+		});
+
+		it("scales what SAMPLE_SIZE left, not the raw limit", async () => {
+			vi.stubEnv("SAMPLE_SIZE", "50");
+			scans(Array.from({ length: 25 }, (_, i) => profile(`p${i}`, { plan: "pro", limits: PLANS.pro.limits })));
+			const { tenants } = await listTenants({ day: "2026-10-21" });
+			// 25 x 50 = 1,250 asked for.
+			expect(tenants.every((t) => t.sample_budget === 40 && t.sample_limit === 500)).toBe(true);
+			vi.unstubAllEnvs();
+		});
+
+		it("never touches the free pool, and reports both caps when both bind", async () => {
+			scans([...Array.from({ length: 150 }, (_, i) => profile(`o${i}`)), ...Array.from({ length: 4 }, (_, i) => profile(`p${i}`, { plan: "pro", limits: PLANS.pro.limits }))]);
+			const { tenants } = await listTenants({ day: "2026-10-21" });
+			expect(tenants.filter((t) => t.tenant_id.startsWith("o")).every((t) => t.sample_budget === 13)).toBe(true);
+			expect(tenants.filter((t) => t.tenant_id.startsWith("p")).every((t) => t.sample_budget === 250)).toBe(true);
+			expect(metric()!.MetricData).toEqual([expect.objectContaining({ Dimensions: [{ Name: "Cap", Value: "judge" }] }), paidMetric]);
+		});
 	});
 
 	it("does not report the cap when only a paid org is trimmed by SAMPLE_SIZE", async () => {

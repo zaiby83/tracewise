@@ -97,8 +97,8 @@ describe("TracewiseStack", () => {
 	});
 
 	it("alarms on dead letters, backlog, ingest errors, failed deletions, global caps, failed eval runs and billing, and emails them", () => {
-		template.resourceCountIs("AWS::CloudWatch::Alarm", 12);
-		for (const cap of ["orgs", "judge"])
+		template.resourceCountIs("AWS::CloudWatch::Alarm", 13);
+		for (const cap of ["orgs", "judge", "judge_paid"])
 			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
 				Namespace: "Tracewise/Limits",
 				MetricName: "GlobalCapHit",
