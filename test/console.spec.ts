@@ -30,7 +30,7 @@ const stripe = vi.hoisted(() => ({
 	prices: { list: vi.fn() },
 	checkout: { sessions: { create: vi.fn(), list: vi.fn(), expire: vi.fn() } },
 	billingPortal: { sessions: { create: vi.fn() } },
-	subscriptions: { retrieve: vi.fn(), update: vi.fn() },
+	subscriptions: { retrieve: vi.fn(), update: vi.fn(), list: vi.fn() },
 }));
 vi.mock("../services/console/store", () => store);
 vi.mock("../services/billing/subscriptions", async (orig) => ({ ...(await orig<object>()), ...billingStore }));
@@ -68,12 +68,14 @@ const orgParams = { orgId: "o1", keyId: "k", sub: "s", inviteId: "i" };
 const keyRecord = { org_id: "o1", key_id: "k1", name: "Default", scope: "write", prefix: "tw_ab12cd", key_hash: "SECRET-HASH", created_by: "u1", created_at: "t" };
 
 beforeEach(() => {
-	const stripeFns = [stripe.customers.create, stripe.prices.list, stripe.checkout.sessions.create, stripe.checkout.sessions.list, stripe.checkout.sessions.expire, stripe.billingPortal.sessions.create, stripe.subscriptions.retrieve, stripe.subscriptions.update];
+	const stripeFns = [stripe.customers.create, stripe.prices.list, stripe.checkout.sessions.create, stripe.checkout.sessions.list, stripe.checkout.sessions.expire, stripe.billingPortal.sessions.create, stripe.subscriptions.retrieve, stripe.subscriptions.update, stripe.subscriptions.list];
 	for (const fn of [...Object.values(store), ...Object.values(accounts), ...Object.values(tenants), ...Object.values(billingStore), ...Object.values(stripeModule), ...stripeFns, sqsSend, cwSend]) fn.mockReset();
 	resetPriceCache();
 	stripeModule.getStripe.mockResolvedValue(stripe);
 	stripeModule.stripeMode.mockResolvedValue("test");
 	stripe.checkout.sessions.list.mockResolvedValue({ data: [] });
+	stripe.subscriptions.list.mockResolvedValue({ data: [] });
+	process.env.BILLING_CHECKOUT_ENABLED = "true";
 	accounts.getProfile.mockResolvedValue({ ...profile });
 	sqsSend.mockResolvedValue({} as never);
 	cwSend.mockResolvedValue({} as never);
@@ -549,8 +551,11 @@ describe("billing", () => {
 				estimated_overage_usd: 15,
 				spend_cap_usd: 10,
 				past_due: false,
+				billing_account: true,
+				subscription_status: "active",
+				checkout_enabled: true,
 			});
-			expect(res.body).not.toMatch(/cus_1|sub_1|price_|customer_id|subscription_id/);
+			expect(res.body).not.toMatch(/cus_1|sub_1|price_|customer_id|subscription_id"/);
 		});
 		it("flags a past-due subscription", async () => {
 			accounts.getProfile.mockResolvedValue(paidProfile("pro"));
@@ -577,6 +582,9 @@ describe("billing", () => {
 				estimated_overage_usd: 0,
 				spend_cap_usd: null,
 				past_due: false,
+				billing_account: false,
+				subscription_status: "none",
+				checkout_enabled: true,
 			});
 		});
 		it("shows a custom org with status none and no included allowance, ignoring any stale billing record", async () => {
@@ -585,12 +593,25 @@ describe("billing", () => {
 			tenants.readCounter.mockResolvedValue(9_000_000);
 			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "custom", status: "none", current_period_end: null, included_events: null, estimated_overage_usd: 0, spend_cap_usd: null });
 		});
+		it("tells a free org it still has a billing account, and what its subscription is doing, after a downgrade", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "unpaid", plan: "free" }));
+			tenants.readCounter.mockResolvedValue(0);
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "free", status: "none", past_due: false, billing_account: true, subscription_status: "unpaid" });
+		});
+		it("says whether paid plans can be bought", async () => {
+			billingStore.getBilling.mockResolvedValue(null);
+			tenants.readCounter.mockResolvedValue(0);
+			delete process.env.BILLING_CHECKOUT_ENABLED;
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ checkout_enabled: false });
+			process.env.BILLING_CHECKOUT_ENABLED = "false";
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ checkout_enabled: false });
+		});
 		it("shows no subscription when the record is from the other Stripe mode", async () => {
 			stripeModule.stripeMode.mockResolvedValue("live");
 			accounts.getProfile.mockResolvedValue(paidProfile("team"));
 			billingStore.getBilling.mockResolvedValue(billingRecord({ spend_cap_usd: 10, livemode: false }));
 			tenants.readCounter.mockResolvedValue(0);
-			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "team", status: "none", current_period_end: null, cancel_at_period_end: null, spend_cap_usd: null, past_due: false });
+			expect(parse(await call(GET_BILLING, o1))).toMatchObject({ plan: "team", status: "none", current_period_end: null, cancel_at_period_end: null, spend_cap_usd: null, past_due: false, billing_account: false, subscription_status: "none" });
 		});
 		it("falls back to none for a paid org the webhook has not written a record for yet", async () => {
 			accounts.getProfile.mockResolvedValue(paidProfile("team"));
@@ -653,12 +674,48 @@ describe("billing", () => {
 			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
 			vi.mocked(console.error).mockRestore();
 		});
-		it.each(["active", "trialing", "past_due", "unpaid", "incomplete"])("refuses checkout when already subscribed (%s)", async (status) => {
+		it.each(["active", "trialing"])("refuses checkout when already subscribed (%s)", async (status) => {
 			billingStore.getBilling.mockResolvedValue(billingRecord({ status }));
 			const res = await call(CHECKOUT, { ...o1, body: { plan: "pro" } });
 			expect(res.statusCode).toBe(409);
 			expect(parse(res)).toEqual({ error: "already subscribed, use Manage billing" });
 			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+		});
+		it.each(["past_due", "unpaid", "incomplete"])("points at Manage billing when the subscription has a payment problem (%s)", async (status) => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status, plan: "free" }));
+			const res = await call(CHECKOUT, { ...o1, body: { plan: "pro" } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "there's a payment problem on your subscription — use Manage billing" });
+			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+		});
+		it.each(["active", "trialing", "past_due", "incomplete", "unpaid"])("refuses checkout when Stripe already has a %s subscription the webhook hasn't recorded", async (status) => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "none", subscription_id: null, plan: "free" }));
+			priceIdsByKey();
+			stripe.subscriptions.list.mockResolvedValue({ data: [{ id: "sub_9", status: "canceled" }, { id: "sub_2", status }] });
+			const res = await call(CHECKOUT, { ...o1, body: { plan: "team" } });
+			expect(res.statusCode).toBe(409);
+			expect(parse(res)).toEqual({ error: "already subscribed, use Manage billing" });
+			expect(stripe.subscriptions.list).toHaveBeenCalledWith({ customer: "cus_1", status: "all", limit: 10 });
+			expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
+		});
+		it("goes ahead when every subscription Stripe has for the customer has ended", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "canceled", plan: "free" }));
+			priceIdsByKey();
+			stripe.subscriptions.list.mockResolvedValue({ data: [{ id: "sub_1", status: "canceled" }, { id: "sub_0", status: "incomplete_expired" }] });
+			stripe.checkout.sessions.create.mockResolvedValue({ url: "https://checkout.stripe.test/s" });
+			expect((await call(CHECKOUT, { ...o1, body: { plan: "team" } })).statusCode).toBe(200);
+		});
+		it.each([undefined, "false", "1"])("refuses checkout and plan changes while paid plans are switched off (%s)", async (flag) => {
+			if (flag === undefined) delete process.env.BILLING_CHECKOUT_ENABLED;
+			else process.env.BILLING_CHECKOUT_ENABLED = flag;
+			accounts.getProfile.mockResolvedValue(paidProfile("team"));
+			billingStore.getBilling.mockResolvedValue(null);
+			for (const route of [CHECKOUT, CHANGE]) {
+				const res = await call(route, { ...o1, body: { plan: "pro" } });
+				expect(res.statusCode, route).toBe(403);
+				expect(parse(res)).toEqual({ error: "paid plans aren't available yet" });
+			}
+			expect(stripeModule.getStripe).not.toHaveBeenCalled();
 		});
 		it("keeps one customer across checkouts before any webhook, and expires the earlier open session first", async () => {
 			// BILLING starts empty; rememberCustomer then creates it, as the real store does.
@@ -769,6 +826,14 @@ describe("billing", () => {
 			expect(res.statusCode).toBe(409);
 			expect(parse(res)).toEqual({ error: "no billing account yet" });
 			expect(stripe.billingPortal.sessions.create).not.toHaveBeenCalled();
+		});
+		it("opens the portal for a free org that still has a customer, so a downgraded org can settle or cancel", async () => {
+			billingStore.getBilling.mockResolvedValue(billingRecord({ status: "unpaid", plan: "free" }));
+			stripeModule.findPortalConfigId.mockResolvedValue("bpc_1");
+			stripe.billingPortal.sessions.create.mockResolvedValue({ url: "https://billing.stripe.test/p2" });
+			const res = await call(PORTAL, o1);
+			expect(res.statusCode).toBe(200);
+			expect(stripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: "cus_1" }));
 		});
 		it("opens a portal session on the maintained configuration", async () => {
 			billingStore.getBilling.mockResolvedValue(billingRecord());

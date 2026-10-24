@@ -26,6 +26,8 @@ export interface BillingProps {
 	// The console's billing routes call Stripe too (Checkout, Customer Portal, plan changes).
 	// A NodejsFunction rather than IFunction, because it gets STRIPE_SECRET_ARN added.
 	consoleFn: NodejsFunction;
+	// Sets BILLING_CHECKOUT_ENABLED on the console, which otherwise refuses Checkout and plan changes.
+	checkoutEnabled: boolean;
 }
 
 // Stripe Billing: the secret holding the Stripe keys, the webhook that applies subscription
@@ -84,6 +86,7 @@ export class Billing extends Construct {
 			}),
 		);
 		props.consoleFn.addEnvironment("STRIPE_SECRET_ARN", this.secret.secretArn);
+		if (props.checkoutEnabled) props.consoleFn.addEnvironment("BILLING_CHECKOUT_ENABLED", "true");
 		this.secret.grantRead(props.consoleFn);
 
 		// Hourly keeps each org's Stripe usage at most an hour behind; Stripe bills it at period end.

@@ -26,6 +26,12 @@ const STATUSES = {
 };
 // States in which the subscription can be switched to another plan (the API's own rule).
 const SWITCHABLE = new Set(["active", "trialing", "past_due"]);
+// Held open by Stripe but not paid for: Manage billing sorts these out, and Checkout refuses until it has.
+const PAYMENT_PROBLEM = new Set(["past_due", "unpaid", "incomplete"]);
+const CLOSED_NOTE = "Paid plans aren't available yet.";
+// The API's exact 409 answers to a Checkout it won't start.
+const ALREADY_SUBSCRIBED = "already subscribed, use Manage billing";
+const PAYMENT_PROBLEM_REFUSAL = "there's a payment problem on your subscription — use Manage billing";
 
 const POLL_MS = 5000;
 const POLLS = 6;
@@ -53,6 +59,32 @@ export function billingSummary(b) {
 	return { planLabel: LABELS[b.plan] ?? b.plan, usageLine, overageLine, renewalLine };
 }
 
+// Which controls an owner gets. Pure, for tests. Manage billing shows whenever Stripe has a customer for
+// the org, even on Free, so a downgraded org can still pay or cancel what it owes. `settingUp` is true
+// while a finished Checkout waits for the webhook, when a second upgrade would only be refused.
+export function billingActions(b, owner, { settingUp = false } = {}) {
+	if (!owner) return { manage: false, switchTo: null, upgrade: false, note: null };
+	const manage = !!b.billing_account;
+	const open = b.checkout_enabled !== false;
+	if (isPaid(b)) {
+		const switchable = SWITCHABLE.has(b.status);
+		return { manage, switchTo: open && switchable ? (b.plan === "team" ? "pro" : "team") : null, upgrade: false, note: !open && switchable ? "Switching plans isn't available yet." : null };
+	}
+	if (b.plan !== "free") return { manage, switchTo: null, upgrade: false, note: null };
+	if (PAYMENT_PROBLEM.has(b.subscription_status)) return { manage, switchTo: null, upgrade: false, note: "There's a payment problem on your subscription. Use Manage billing to pay or cancel it before choosing a plan." };
+	if (!open) return { manage, switchTo: null, upgrade: false, note: CLOSED_NOTE };
+	return { manage, switchTo: null, upgrade: !settingUp, note: null };
+}
+
+// What a refused Checkout means for the screen. Only the exact "already subscribed" answer is a
+// subscription on its way (paid, webhook pending); a payment problem needs Manage billing instead.
+export function checkoutRefusal(err) {
+	if (err?.status !== 409) return null;
+	if (err.message === ALREADY_SUBSCRIBED) return "setting-up";
+	if (err.message === PAYMENT_PROBLEM_REFUSAL) return "payment-problem";
+	return null;
+}
+
 // Only ever follow a checkout or portal address over https.
 function leaveTo(url) {
 	let target = null;
@@ -78,15 +110,18 @@ export async function render(root, ctx) {
 		notice.hidden = !text;
 	};
 	let drawn = "";
+	// True while a finished Checkout waits for the webhook: the plan cards stay hidden, so nobody pays twice.
+	let settingUp = false;
 	const draw = (b) => {
 		billing = b;
 		drawn = JSON.stringify(b);
-		body.replaceChildren(planCard(b), ...(b.plan === "free" ? [planOptions()] : []), ...(owner && isPaid(b) ? [spendCapCard(b)] : []));
+		body.replaceChildren(planCard(b), ...(b.plan === "free" && !settingUp ? [planOptions(b)] : []), ...(owner && isPaid(b) ? [spendCapCard(b)] : []));
 	};
 
 	// Billing changes arrive by webhook, a few seconds after the action: look again every few seconds
-	// until `done` says the screen has caught up, and give up after a bounded number of tries.
-	function watch(done, finished) {
+	// until `done` says the screen has caught up, and give up after a bounded number of tries. `ended`
+	// runs once polling stops, either way.
+	function watch(done, finished, ended = () => {}) {
 		const mine = ++watching;
 		let tries = 0;
 		const tick = async () => {
@@ -99,15 +134,30 @@ export async function render(root, ctx) {
 				if (done(b)) {
 					say(finished(b));
 					ctx.refreshBanners?.();
+					ended();
 					return;
 				}
 			} catch (err) {
 				if (err.name === "AuthError") return;
 			}
-			if (tries >= POLLS) say("Still waiting for the update. Reload this page in a minute.");
-			else setTimeout(tick, POLL_MS);
+			if (tries >= POLLS) {
+				say("Still waiting for the update. Reload this page in a minute.");
+				ended();
+			} else setTimeout(tick, POLL_MS);
 		};
 		setTimeout(tick, POLL_MS);
+	}
+
+	// After Checkout (or a Checkout refused because Stripe already has the subscription): wait for the
+	// webhook to move the org, with the plan cards out of the way.
+	function awaitSubscription(text) {
+		settingUp = true;
+		say(text);
+		draw(billing);
+		watch(isPaid, (b) => `Thanks, you're now on ${LABELS[b.plan]}.`, () => {
+			settingUp = false;
+			draw(billing);
+		});
 	}
 
 	// ---- Cards --------------------------------------------------------------------------
@@ -116,7 +166,7 @@ export async function render(root, ctx) {
 		const s = billingSummary(b);
 		const status = STATUSES[b.status];
 		const share = b.included_events > 0 ? Math.min(1, b.events_this_period / b.included_events) : 0;
-		const actions = owner && isPaid(b) ? paidActions(b) : null;
+		const actions = accountActions(b);
 		return el(
 			"section",
 			{ class: "card plan-card" },
@@ -133,20 +183,14 @@ export async function render(root, ctx) {
 	}
 
 	// Switching between Team and Pro happens here, through our own route; the portal is for payment
-	// methods, invoices and cancelling.
-	function paidActions(b) {
-		const other = b.plan === "team" ? "pro" : "team";
-		const target = PLAN_DETAILS[other];
+	// methods, invoices and cancelling, and shows for any org Stripe has a customer for.
+	function accountActions(b) {
+		const allowed = billingActions(b, owner, { settingUp });
 		const error = errorLine();
-		const portal = el("button", { class: "button", type: "button" }, "Manage billing");
-		portal.addEventListener("click", () =>
-			run(portal, error, async () => {
-				const { url } = await ctx.api.post(`${base}/portal`, {});
-				leaveTo(url);
-			}),
-		);
 		const buttons = [];
-		if (SWITCHABLE.has(b.status)) {
+		if (allowed.switchTo) {
+			const other = allowed.switchTo;
+			const target = PLAN_DETAILS[other];
 			const swap = el("button", { class: "button primary", type: "button" }, `Switch to ${target.name}`);
 			swap.addEventListener("click", async () => {
 				const ok = await confirmDialog({
@@ -166,7 +210,27 @@ export async function render(root, ctx) {
 			});
 			buttons.push(swap);
 		}
-		return el("div", { class: "plan-actions" }, el("div", { class: "actions start" }, ...buttons, portal), el("p", { class: "hint" }, "Manage billing opens Stripe, for payment methods, invoices and cancelling."), error);
+		if (allowed.manage) {
+			const portal = el("button", { class: "button", type: "button" }, "Manage billing");
+			portal.addEventListener("click", () =>
+				run(portal, error, async () => {
+					const { url } = await ctx.api.post(`${base}/portal`, {});
+					leaveTo(url);
+				}),
+			);
+			buttons.push(portal);
+		}
+		// On Free the note sits with the plan cards instead.
+		const note = isPaid(b) ? allowed.note : null;
+		if (buttons.length === 0 && !note) return null;
+		return el(
+			"div",
+			{ class: "plan-actions" },
+			buttons.length ? el("div", { class: "actions start" }, ...buttons) : null,
+			note ? el("p", { class: "hint" }, note) : null,
+			allowed.manage ? el("p", { class: "hint" }, "Manage billing opens Stripe, for payment methods, invoices and cancelling.") : null,
+			error,
+		);
 	}
 
 	// Cap on overage spend: a number or empty (no cap). The API validates 0 to 100,000.
@@ -198,7 +262,8 @@ export async function render(root, ctx) {
 	}
 
 	// Free orgs choose a paid plan; Checkout is Stripe's page, and it sends them back here.
-	function planOptions() {
+	function planOptions(b) {
+		const allowed = billingActions(b, owner, { settingUp });
 		return el(
 			"section",
 			{ class: "plan-options", "aria-label": "Upgrade" },
@@ -211,11 +276,15 @@ export async function render(root, ctx) {
 						try {
 							({ url } = await ctx.api.post(`${base}/checkout`, { plan: id }));
 						} catch (err) {
-							// Already subscribed means the webhook hasn't landed yet: wait for it rather than point at
-							// a Manage billing button this screen doesn't show yet.
-							if (err.status !== 409 || !/already subscribed/i.test(err.message)) throw err;
-							say("Your subscription is being set up — this page will update shortly.");
-							watch(isPaid, (b) => `Thanks, you're now on ${LABELS[b.plan]}.`);
+							const refusal = checkoutRefusal(err);
+							// Stripe already has the subscription and the webhook hasn't landed yet: wait for it.
+							if (refusal === "setting-up") return awaitSubscription("Your subscription is being set up — this page will update shortly.");
+							if (refusal !== "payment-problem") throw err;
+							// Redraw so Manage billing (and the note) show, then say where to go.
+							try {
+								draw(await ctx.api.get(base));
+							} catch {}
+							showError(error, "There's a payment problem on your subscription. Use Manage billing above to pay or cancel it.");
 							return;
 						}
 						leaveTo(url);
@@ -234,10 +303,12 @@ export async function render(root, ctx) {
 						el("li", {}, `${p.retention_days} days of hot retention`),
 						el("li", {}, `Up to ${p.max_members} members`),
 					),
-					owner ? el("div", { class: "actions start" }, upgrade) : el("p", { class: "hint" }, "Ask an owner of this organization to upgrade."),
-					owner ? error : null,
+					allowed.upgrade ? el("div", { class: "actions start" }, upgrade) : null,
+					!owner && b.checkout_enabled !== false ? el("p", { class: "hint" }, "Ask an owner of this organization to upgrade.") : null,
+					allowed.upgrade ? error : null,
 				);
 			}),
+			allowed.note ? el("p", { class: "hint plan-note" }, allowed.note) : !owner && b.checkout_enabled === false ? el("p", { class: "hint plan-note" }, CLOSED_NOTE) : null,
 			el("p", { class: "hint plan-compare" }, el("a", { href: "../pricing.html" }, "Compare all plans")),
 		);
 	}
@@ -251,9 +322,6 @@ export async function render(root, ctx) {
 		// Back from Checkout: drop the query so a reload doesn't start the wait again.
 		history.replaceState(null, "", `${location.pathname}${location.search}#/billing`);
 		if (isPaid(billing)) say(`Thanks, you're now on ${LABELS[billing.plan]}.`);
-		else {
-			say("Thanks, your plan updates within a minute");
-			watch(isPaid, (b) => `Thanks, you're now on ${LABELS[b.plan]}.`);
-		}
+		else awaitSubscription("Thanks, your plan updates within a minute");
 	}
 }

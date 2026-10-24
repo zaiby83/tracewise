@@ -516,6 +516,18 @@ describe("TracewiseStack", () => {
 			for (const name of ["BillingWebhookErrors", "BillingWebhookFailures", "BillingMeterErrors", "BillingMeterStale"]) expect(ids.some((id) => id.includes(name)), name).toBe(true);
 		});
 
+		it("keeps Checkout and plan changes switched off unless the deploy turns them on", () => {
+			const consoleEnv = (t: Template) => {
+				const [, f] = Object.entries(t.findResources("AWS::Lambda::Function")).find(([id]) => /^ConsoleFn[A-F0-9]{8}$/.test(id))!;
+				return f.Properties.Environment.Variables as Record<string, unknown>;
+			};
+			expect(consoleEnv(template)).not.toHaveProperty("BILLING_CHECKOUT_ENABLED");
+			// Only the console sells plans; nothing else gets the flag.
+			for (const [id, f] of ownFunctions()) expect(Object.keys(f.Properties.Environment?.Variables ?? {}), id).not.toContain("BILLING_CHECKOUT_ENABLED");
+			const on = Template.fromStack(new TracewiseStack(new App(), "CheckoutOn", { billingCheckout: true }));
+			expect(consoleEnv(on).BILLING_CHECKOUT_ENABLED).toBe("true");
+		}, 120_000);
+
 		it("outputs the secret's ARN and the URL to register with Stripe", () => {
 			const outputs = template.findOutputs("*");
 			expect(Object.keys(outputs)).toEqual(expect.arrayContaining(["StripeSecretArn", "StripeWebhookUrl", "QuotasTable"]));

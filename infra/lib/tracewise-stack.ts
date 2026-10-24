@@ -34,6 +34,9 @@ export interface TracewiseStackProps extends StackProps {
 	batchSize?: number;
 	// Maximum concurrent processor invocations. Bounded by the account's Lambda limit.
 	processorConcurrency?: number;
+	// Lets owners buy paid plans (Checkout and plan changes). Off by default, so a stack running on test
+	// keys, or one not ready to take payments, never sends anyone to Checkout.
+	billingCheckout?: boolean;
 	// Bedrock model (or cross-region inference profile) that grades sampled traces.
 	judgeModel?: string;
 	// Read-only key the public dashboard uses to show the demo tenant.
@@ -232,7 +235,14 @@ export class TracewiseStack extends Stack {
 		});
 
 		// ---- Billing ----------------------------------------------------------------
-		const billing = new StripeBilling(this, "Billing", { fn, accounts: accountsTable, quotas, alerts: alarms, consoleFn: accounts.consoleFn });
+		const billing = new StripeBilling(this, "Billing", {
+			fn,
+			accounts: accountsTable,
+			quotas,
+			alerts: alarms,
+			consoleFn: accounts.consoleFn,
+			checkoutEnabled: props.billingCheckout ?? false,
+		});
 
 		// ---- API --------------------------------------------------------------------
 		const api = new HttpApi(this, "Api", { description: "Tracewise ingest and query API" });

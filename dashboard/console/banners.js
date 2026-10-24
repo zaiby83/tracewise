@@ -4,6 +4,7 @@
 import { int } from "../shared/format.js";
 
 const WARN_AT = 0.8;
+const PAYMENT_PROBLEM = new Set(["past_due", "unpaid"]);
 
 // `billing` is GET /v1/orgs/{id}/billing. `usage` (GET /v1/orgs/{id}/usage) is optional: its
 // limits.monthly_events is the exact ceiling ingest enforces, which a spend cap moves.
@@ -16,6 +17,10 @@ export function bannersFor(billing, usage) {
 	// A failed payment is the most urgent thing, and the allowances below say nothing it doesn't.
 	if (billing.past_due) {
 		return [{ kind: "danger", text: "Your last payment failed. An owner needs to update the payment method within 7 days, or your organization moves to Free limits." }];
+	}
+	// Past the grace period the org is on Free, but Stripe still holds the subscription and its unpaid invoice.
+	if (PAYMENT_PROBLEM.has(billing.subscription_status)) {
+		return [{ kind: "danger", text: "There's a payment problem on your subscription, so your organization is on Free limits. An owner can pay the open invoice or cancel it in Manage billing on the Billing page." }];
 	}
 	if (!included) return [];
 

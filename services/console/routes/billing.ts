@@ -14,6 +14,12 @@ const PaidPlan = z.object({ plan: z.enum(["team", "pro"]) });
 const SpendCap = z.object({ spend_cap_usd: z.number().min(0).max(100_000).nullable() });
 
 const LIVE = new Set(["active", "trialing", "past_due"]);
+// Held open by Stripe but not being paid: the Customer Portal, not a second Checkout, sorts these out.
+const PAYMENT_PROBLEM = new Set(["past_due", "unpaid", "incomplete"]);
+// Paid plans are bought only once the operator turns them on (CDK context billingCheckout=true), so a
+// deployed test-mode stack doesn't take sign-ups into a Checkout nobody is collecting for.
+const checkoutEnabled = () => process.env.BILLING_CHECKOUT_ENABLED === "true";
+const closed = () => json(403, { error: "paid plans aren't available yet" });
 // Stripe accepts expiry 30 minutes to 24 hours after the session is created, so a little over 30 minutes
 // leaves room for the time the request takes.
 const CHECKOUT_TTL_SECONDS = 31 * 60;
@@ -42,8 +48,10 @@ async function pricesFor(stripe: Stripe, plan: Exclude<PlanId, "free">): Promise
 
 const paid = (profile: OrgProfile): profile is OrgProfile & { plan: "team" | "pro" } => profile.plan === "team" || profile.plan === "pro";
 
-// What the Billing screen shows. Free and custom orgs have no subscription to describe, whatever an
-// old BILLING row says. Customer, subscription and price ids never appear: nothing here needs them.
+// What the Billing screen shows. The plan's own fields describe a subscription only on a paid plan,
+// whatever an old BILLING row says; billing_account and subscription_status report the record itself,
+// so an org downgraded to Free can still reach Manage billing and see a payment problem. Customer,
+// subscription and price ids never appear: nothing here needs them.
 async function billingView(profile: OrgProfile, billing: BillingRecord | null) {
 	const used = await readCounter(counterIds.period(profile.org_id, periodBounds(profile).start));
 	const plan = paid(profile) ? PLANS[profile.plan] : null;
@@ -59,6 +67,9 @@ async function billingView(profile: OrgProfile, billing: BillingRecord | null) {
 		estimated_overage_usd: plan ? Math.round(estimatedOverageUsd(plan, used) * 100) / 100 : 0,
 		spend_cap_usd: sub?.spend_cap_usd ?? null,
 		past_due: sub?.status === "past_due",
+		billing_account: !!billing?.customer_id,
+		subscription_status: billing?.status ?? "none",
+		checkout_enabled: checkoutEnabled(),
 	};
 }
 
@@ -69,19 +80,21 @@ export const billingRoutes: RouteTable = {
 		access: "member",
 		run: async (ctx) => {
 			const profile = ctx.profile!;
-			return json(200, await billingView(profile, paid(profile) ? (await currentBilling(profile.org_id)).billing : null));
+			return json(200, await billingView(profile, (await currentBilling(profile.org_id)).billing));
 		},
 	},
 
 	"POST /v1/orgs/{orgId}/billing/checkout": {
 		access: "owner",
 		run: async (ctx) => {
+			if (!checkoutEnabled()) return closed();
 			const { plan } = bodyOf(PaidPlan, ctx);
 			const { org_id, plan: current } = ctx.profile!;
 			// Custom plans are set by hand and the webhook never moves them, so a purchase would buy nothing.
 			if (current === "custom") return refuse("plan is managed by Tracewise, contact support");
 			// A record from the other Stripe mode counts as none: this key gets a customer of its own.
 			const { billing, mode } = await currentBilling(org_id);
+			if (billing && PAYMENT_PROBLEM.has(billing.status)) return refuse("there's a payment problem on your subscription — use Manage billing");
 			if (billing && HOLDS_SUBSCRIPTION.has(billing.status)) return refuse("already subscribed, use Manage billing");
 
 			const stripe = await getStripe();
@@ -95,6 +108,10 @@ export const billingRoutes: RouteTable = {
 				await linkCustomer(org_id, created.id, mode === "live");
 				customer = await rememberCustomer(org_id, created.id, mode === "live");
 			}
+			// A Checkout paid a moment ago has a subscription Stripe knows about before our webhook records it:
+			// a second one now would subscribe the org twice.
+			const subs = (await stripe.subscriptions.list({ customer, status: "all", limit: 10 })).data;
+			if (subs.some((s) => HOLDS_SUBSCRIPTION.has(s.status))) return refuse("already subscribed, use Manage billing");
 			// One open Checkout per org: a session left open (another tab, an abandoned try) could still be paid
 			// after this one and make a second subscription.
 			for (const open of (await stripe.checkout.sessions.list({ customer, status: "open", limit: 100 })).data) {
@@ -148,6 +165,7 @@ export const billingRoutes: RouteTable = {
 	"POST /v1/orgs/{orgId}/billing/change": {
 		access: "owner",
 		run: async (ctx) => {
+			if (!checkoutEnabled()) return closed();
 			const { plan } = bodyOf(PaidPlan, ctx);
 			const profile = ctx.profile!;
 			const { billing } = await currentBilling(profile.org_id);

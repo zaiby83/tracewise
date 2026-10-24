@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { FREE_LIMITS } from "../services/shared/accounts";
 import { curlQuickstart } from "../dashboard/console/views/overview.js";
 import { usageRows } from "../dashboard/console/views/usage.js";
-import { PLAN_DETAILS, billingSummary, roundCents } from "../dashboard/console/views/billing.js";
+import { PLAN_DETAILS, billingActions, billingSummary, checkoutRefusal, roundCents } from "../dashboard/console/views/billing.js";
 import { bannersFor } from "../dashboard/console/banners.js";
 import { PLANS } from "../services/billing/plans";
 
@@ -108,6 +108,16 @@ describe("billing screen helpers", () => {
 		}
 	});
 
+	it("tells a free org about a payment problem on the subscription it still has", () => {
+		for (const status of ["past_due", "unpaid"]) {
+			const banners = bannersFor({ plan: "free", past_due: false, subscription_status: status, events_this_period: 10, included_events: 50_000 }, {});
+			expect(banners, status).toEqual([{ kind: "danger", text: expect.stringContaining("Manage billing") }]);
+		}
+		expect(bannersFor({ plan: "free", subscription_status: "canceled", events_this_period: 10, included_events: 50_000 }, {})).toEqual([]);
+		// A paid org that is past due keeps the grace-period message.
+		expect(bannersFor({ plan: "team", past_due: true, subscription_status: "past_due", events_this_period: 0, included_events: 500_000 }, {})[0]!.text).toMatch(/7 days/);
+	});
+
 	it("raises the right banners", () => {
 		expect(bannersFor({ plan: "free", events_this_period: 41_000, included_events: 50_000 }, {}).map((b) => b.kind)).toEqual(["warn"]);
 		expect(bannersFor({ plan: "team", past_due: true, events_this_period: 0, included_events: 500_000 }, {}).map((b) => b.kind)).toEqual(["danger"]);
@@ -130,5 +140,54 @@ describe("billing screen helpers", () => {
 		// Over the allowance but under the ceiling the usage endpoint reports.
 		expect(bannersFor({ ...capped, estimated_overage_usd: 10, events_this_period: 700_000 }, { limits: { monthly_events: 900_000 } }).map((b) => b.kind)).toEqual(["info"]);
 		expect(bannersFor({ plan: "team", events_this_period: 100, included_events: 500_000, estimated_overage_usd: 0, spend_cap_usd: 0 }, {})).toEqual([]);
+	});
+});
+
+describe("billing screen actions", () => {
+	const view = (over: object = {}) => ({ plan: "free", status: "none", subscription_status: "none", billing_account: false, checkout_enabled: true, ...over });
+
+	it("offers a free owner the plan cards' upgrade buttons, and Manage billing only once there is an account", () => {
+		expect(billingActions(view(), true)).toEqual({ manage: false, switchTo: null, upgrade: true, note: null });
+		expect(billingActions(view({ billing_account: true, subscription_status: "canceled" }), true)).toMatchObject({ manage: true, upgrade: true });
+	});
+
+	it("shows Manage billing to a downgraded org with a payment problem, and no upgrade", () => {
+		const a = billingActions(view({ billing_account: true, subscription_status: "unpaid" }), true);
+		expect(a).toMatchObject({ manage: true, upgrade: false, switchTo: null });
+		expect(a.note).toMatch(/Manage billing/);
+	});
+
+	it("offers a paid owner the other plan while the subscription can switch", () => {
+		expect(billingActions(view({ plan: "team", status: "active", subscription_status: "active", billing_account: true }), true)).toEqual({ manage: true, switchTo: "pro", upgrade: false, note: null });
+		expect(billingActions(view({ plan: "pro", status: "past_due", subscription_status: "past_due", billing_account: true }), true)).toMatchObject({ switchTo: "team" });
+		expect(billingActions(view({ plan: "team", status: "canceled", subscription_status: "canceled", billing_account: true }), true)).toMatchObject({ switchTo: null, manage: true });
+	});
+
+	it("hides Upgrade and Switch with a short note while paid plans are switched off, keeping Manage billing", () => {
+		const free = billingActions(view({ checkout_enabled: false }), true);
+		expect(free).toMatchObject({ upgrade: false, switchTo: null });
+		expect(free.note).toMatch(/aren't available yet/);
+		expect(billingActions(view({ plan: "team", status: "active", subscription_status: "active", billing_account: true, checkout_enabled: false }), true)).toMatchObject({ manage: true, switchTo: null });
+	});
+
+	it("hides the upgrade while a finished Checkout is being confirmed", () => {
+		expect(billingActions(view(), true, { settingUp: true })).toMatchObject({ upgrade: false });
+	});
+
+	it("gives members no controls", () => {
+		expect(billingActions(view({ plan: "team", status: "active", subscription_status: "active", billing_account: true }), false)).toEqual({ manage: false, switchTo: null, upgrade: false, note: null });
+	});
+});
+
+describe("checkoutRefusal", () => {
+	const err = (status: number, message: string) => Object.assign(new Error(message), { status });
+	it("reads only the exact already-subscribed answer as a subscription being set up", () => {
+		expect(checkoutRefusal(err(409, "already subscribed, use Manage billing"))).toBe("setting-up");
+		expect(checkoutRefusal(err(409, "Already subscribed somewhere"))).toBeNull();
+		expect(checkoutRefusal(err(500, "already subscribed, use Manage billing"))).toBeNull();
+	});
+	it("tells a payment problem apart", () => {
+		expect(checkoutRefusal(err(409, "there's a payment problem on your subscription — use Manage billing"))).toBe("payment-problem");
+		expect(checkoutRefusal(err(409, "plan is managed by Tracewise, contact support"))).toBeNull();
 	});
 });
