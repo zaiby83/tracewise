@@ -7,7 +7,8 @@ const stripe = vi.hoisted(() => ({
 	billing: { meterEvents: { create: vi.fn() } },
 	subscriptions: { retrieve: vi.fn() },
 }));
-vi.mock("../services/billing/stripe", () => ({ getStripe: async () => stripe }));
+const mode = vi.hoisted(() => ({ current: "test" as "test" | "live" }));
+vi.mock("../services/billing/stripe", () => ({ getStripe: async () => stripe, stripeMode: async () => mode.current }));
 const cw = vi.hoisted(() => ({ send: vi.fn() }));
 vi.mock("@aws-sdk/client-cloudwatch", () => ({
 	CloudWatchClient: class {
@@ -87,6 +88,7 @@ function world(counters: Record<string, number>, initial: Billing[] = [], opts: 
 	subs.applySubscription.mockReset();
 	cw.send.mockReset();
 	cw.send.mockResolvedValue({});
+	mode.current = "test";
 	return { state, events };
 }
 const sent = () => stripe.billing.meterEvents.create.mock.calls.map(([p]) => p);
@@ -295,6 +297,23 @@ describe("meter handler", () => {
 			"sk = :b AND (#s IN (:active, :trialing, :pastDue) OR attribute_exists(#pend) OR attribute_exists(flush_due))",
 		);
 		expect(scan.input.ExpressionAttributeNames).toEqual({ "#s": "status", "#pend": "pending" });
+	});
+
+	it("skips records from the other Stripe mode: a test customer means nothing to a live key", async () => {
+		world(counters, [org("a", { livemode: false }), org("b"), org("c", { livemode: true })]);
+		mode.current = "live";
+		const log = vi.spyOn(console, "info").mockImplementation(() => {});
+		await handler();
+		expect(sent().map((p) => p.payload.stripe_customer_id)).toEqual(["cus_c"]);
+		expect(metrics()).toMatchObject({ MeterOrgsReported: 1, MeterFailures: 0 });
+		expect(log.mock.calls.map((c) => JSON.parse(String(c[0])))).toContainEqual({ level: "info", msg: "skipped billing records from the other Stripe mode", orgs: 2 });
+		log.mockRestore();
+	});
+
+	it("meters test-mode records while the key is a test key", async () => {
+		world(counters, [org("a", { livemode: false }), org("b")]);
+		await handler();
+		expect(stripe.billing.meterEvents.create).toHaveBeenCalledTimes(2);
 	});
 
 	describe("flush_due", () => {

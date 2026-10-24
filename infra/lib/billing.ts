@@ -14,6 +14,8 @@ import { Construct } from "constructs";
 // The lines services/billing/webhook.ts logs whenever it answers Stripe with a 500 (no secret to
 // verify with, or an event that failed). The stack spec checks the handler still logs exactly these.
 export const WEBHOOK_FAILURE_MESSAGES = ["stripe webhook could not be verified", "stripe event failed"] as const;
+// The line it logs when a delivery fails the signature check (after one re-read of the secret).
+export const WEBHOOK_SIGNATURE_REJECTED = "stripe webhook signature rejected";
 
 export interface BillingProps {
 	// Builds a Lambda the same way the rest of the stack does.
@@ -118,6 +120,24 @@ export class Billing extends Construct {
 			alarmDescription: "Stripe webhook events are failing (answered 500): subscription changes aren't being applied",
 			metric: webhookFailures.metric({ period: Duration.minutes(5), statistic: Stats.SUM }),
 			threshold: 1,
+			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+			evaluationPeriods: 1,
+			treatMissingData: TreatMissingData.NOT_BREACHING,
+		}).addAlarmAction(notify);
+
+		// A wrong webhook_secret answers every real delivery 400, which Errors and the filter above never
+		// see. A few rejections in 15 minutes is that, or someone probing the public URL; either is worth a look.
+		const signatureRejected = new MetricFilter(this, "WebhookSignatureFilter", {
+			logGroup: this.webhookFn.logGroup,
+			filterPattern: FilterPattern.anyTerm(WEBHOOK_SIGNATURE_REJECTED),
+			metricNamespace: "Tracewise/Billing",
+			metricName: "WebhookSignatureRejected",
+			metricValue: "1",
+		});
+		new Alarm(this, "BillingWebhookSignatureRejected", {
+			alarmDescription: "Stripe webhook deliveries are failing the signature check: check webhook_secret in the Stripe secret matches the endpoint's signing secret",
+			metric: signatureRejected.metric({ period: Duration.minutes(15), statistic: Stats.SUM }),
+			threshold: 3,
 			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
 			evaluationPeriods: 1,
 			treatMissingData: TreatMissingData.NOT_BREACHING,

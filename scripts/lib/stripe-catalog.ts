@@ -183,15 +183,43 @@ export async function ensureStripeCatalog(stripe: Stripe): Promise<{ meterId: st
 	return { meterId, prices, portalConfigId };
 }
 
-const USAGE = "usage: STRIPE_SECRET_KEY=sk_test_... pnpm exec tsx scripts/stripe-setup.ts [--live]";
+// Checkout runs with automatic_tax, which Stripe refuses (and the console answers 500) until Stripe Tax
+// is set up in that mode. Only reads; nothing here is configured on the operator's behalf.
+export async function checkStripeTax(stripe: Stripe): Promise<{ ok: true } | { ok: false; message: string }> {
+	const settings = await stripe.tax.settings.retrieve();
+	if (settings.status === "active") return { ok: true };
+	const mode = settings.livemode ? "live" : "test";
+	const missing = settings.status_details?.pending?.missing_fields ?? [];
+	const steps = [
+		...(settings.head_office ? [] : ["- the head office address (the business's own address, which Stripe Tax calculates from)"]),
+		...(settings.defaults?.tax_behavior ? [] : ["- the default tax behaviour: whether prices include tax (inclusive) or have it added (exclusive)"]),
+	];
+	return {
+		ok: false,
+		message: [
+			`Stripe Tax is not active in ${mode} mode (status ${settings.status}${missing.length ? `; missing: ${missing.join(", ")}` : ""}).`,
+			"Checkout uses automatic tax, so every Checkout fails until this is done. In the Stripe Dashboard",
+			`(${mode} mode), open Settings > Tax and set:`,
+			...(steps.length ? steps : ["- whatever the Tax settings page still asks for"]),
+			"Then add a registration wherever you have to collect tax, and run this again.",
+			"To finish the rest of the setup first, rerun with --skip-tax-check.",
+		].join("\n"),
+	};
+}
+
+const USAGE = "usage: STRIPE_SECRET_KEY=sk_test_... pnpm exec tsx scripts/stripe-setup.ts [--live] [--skip-tax-check]";
+const FLAGS = new Set(["--live", "--skip-tax-check"]);
 
 // Checked before any network call. Never repeats the key it was given.
-export function validateSetupArgs(argv: string[], env: Record<string, string | undefined>): { ok: true } | { ok: false; message: string } {
-	const unknown = argv.filter((a) => a !== "--live");
+export function validateSetupArgs(
+	argv: string[],
+	env: Record<string, string | undefined>,
+): { ok: true; live: boolean; skipTaxCheck: boolean } | { ok: false; message: string } {
+	const unknown = argv.filter((a) => !FLAGS.has(a));
 	if (unknown.length) return { ok: false, message: `unknown argument ${unknown[0]}\n${USAGE}` };
 	const key = env.STRIPE_SECRET_KEY;
 	if (!key) return { ok: false, message: `STRIPE_SECRET_KEY is not set\n${USAGE}` };
 	if (!/^[sr]k_(test|live)_/.test(key)) return { ok: false, message: `STRIPE_SECRET_KEY is not a Stripe secret key (expected sk_test_... or sk_live_...)\n${USAGE}` };
 	if (/^[sr]k_live_/.test(key) && !argv.includes("--live")) return { ok: false, message: `refusing to run against live mode without --live\n${USAGE}` };
-	return { ok: true };
+	return { ok: true, live: argv.includes("--live"), skipTaxCheck: argv.includes("--skip-tax-check") };
 }

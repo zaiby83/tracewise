@@ -2,7 +2,8 @@ import type Stripe from "stripe";
 import { z } from "zod";
 import { PLANS, estimatedOverageUsd, periodBounds, type PlanId } from "../../billing/plans";
 import { findPortalConfigId, getStripe } from "../../billing/stripe";
-import { HOLDS_SUBSCRIPTION, getBilling, linkCustomer, rememberCustomer, setSpendCap, type BillingRecord } from "../../billing/subscriptions";
+import { currentBilling } from "../../billing/current";
+import { HOLDS_SUBSCRIPTION, linkCustomer, rememberCustomer, setSpendCap, type BillingRecord } from "../../billing/subscriptions";
 import { getProfile, type OrgProfile } from "../../shared/accounts";
 import { json, log } from "../../shared/http";
 import { counterIds, readCounter } from "../../shared/tenants";
@@ -68,7 +69,7 @@ export const billingRoutes: RouteTable = {
 		access: "member",
 		run: async (ctx) => {
 			const profile = ctx.profile!;
-			return json(200, await billingView(profile, paid(profile) ? await getBilling(profile.org_id) : null));
+			return json(200, await billingView(profile, paid(profile) ? (await currentBilling(profile.org_id)).billing : null));
 		},
 	},
 
@@ -79,7 +80,8 @@ export const billingRoutes: RouteTable = {
 			const { org_id, plan: current } = ctx.profile!;
 			// Custom plans are set by hand and the webhook never moves them, so a purchase would buy nothing.
 			if (current === "custom") return refuse("plan is managed by Tracewise, contact support");
-			const billing = await getBilling(org_id);
+			// A record from the other Stripe mode counts as none: this key gets a customer of its own.
+			const { billing, mode } = await currentBilling(org_id);
 			if (billing && HOLDS_SUBSCRIPTION.has(billing.status)) return refuse("already subscribed, use Manage billing");
 
 			const stripe = await getStripe();
@@ -90,8 +92,8 @@ export const billingRoutes: RouteTable = {
 				// customer back, and rememberCustomer settles a race on whichever id was recorded first.
 				const created = await stripe.customers.create({ email: ctx.claims.email || undefined, metadata: { org_id } }, { idempotencyKey: `customer-${org_id}` });
 				// Throws if the customer is already tied to another org, so no session is created for it.
-				await linkCustomer(org_id, created.id);
-				customer = await rememberCustomer(org_id, created.id);
+				await linkCustomer(org_id, created.id, mode === "live");
+				customer = await rememberCustomer(org_id, created.id, mode === "live");
 			}
 			// One open Checkout per org: a session left open (another tab, an abandoned try) could still be paid
 			// after this one and make a second subscription.
@@ -126,7 +128,7 @@ export const billingRoutes: RouteTable = {
 		access: "owner",
 		run: async (ctx) => {
 			const { org_id } = ctx.profile!;
-			const customer = (await getBilling(org_id))?.customer_id;
+			const customer = (await currentBilling(org_id)).billing?.customer_id;
 			if (!customer) return refuse("no billing account yet");
 			const stripe = await getStripe();
 			// The configuration `stripe-setup` maintains. Falling back to Stripe's default would show a
@@ -148,7 +150,7 @@ export const billingRoutes: RouteTable = {
 		run: async (ctx) => {
 			const { plan } = bodyOf(PaidPlan, ctx);
 			const profile = ctx.profile!;
-			const billing = await getBilling(profile.org_id);
+			const { billing } = await currentBilling(profile.org_id);
 			if (!billing?.subscription_id || !LIVE.has(billing.status)) return refuse("no active subscription");
 
 			const stripe = await getStripe();
@@ -182,7 +184,7 @@ export const billingRoutes: RouteTable = {
 				if (!profile || profile.status !== "active") return json(404, { error: "not found" });
 				if (!paid(profile)) return refuse("spend caps apply to paid plans");
 				if (await setSpendCap(profile.org_id, profile.plan, spend_cap_usd)) {
-					return json(200, await billingView(profile, await getBilling(profile.org_id)));
+					return json(200, await billingView(profile, (await currentBilling(profile.org_id)).billing));
 				}
 			}
 			return refuse("billing changed, try again");

@@ -5,7 +5,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { PLANS } from "../../services/billing/plans";
 import { CONSOLE_ROUTES, JWT_DATA_ROUTES } from "../../services/console/route-keys";
 import { MAX_RETENTION_DAYS } from "../../services/shared/keys";
-import { WEBHOOK_FAILURE_MESSAGES } from "../lib/billing";
+import { WEBHOOK_FAILURE_MESSAGES, WEBHOOK_SIGNATURE_REJECTED } from "../lib/billing";
 import { TracewiseStack } from "../lib/tracewise-stack";
 
 // Assertions on the synthesized CloudFormation: the guarantees the design doc makes
@@ -97,7 +97,7 @@ describe("TracewiseStack", () => {
 	});
 
 	it("alarms on dead letters, backlog, ingest errors, failed deletions, global caps, failed eval runs and billing, and emails them", () => {
-		template.resourceCountIs("AWS::CloudWatch::Alarm", 11);
+		template.resourceCountIs("AWS::CloudWatch::Alarm", 12);
 		for (const cap of ["orgs", "judge"])
 			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
 				Namespace: "Tracewise/Limits",
@@ -417,10 +417,15 @@ describe("TracewiseStack", () => {
 			expect(consoleFn.Properties.Timeout).toBe(29);
 		});
 
+		const webhookFilter = (metricName: string) => {
+			const filters = Object.values(template.findResources("AWS::Logs::MetricFilter")).filter((f) => JSON.stringify(f.Properties.MetricTransformations).includes(`"${metricName}"`));
+			expect(filters, metricName).toHaveLength(1);
+			return filters[0]!;
+		};
+
 		it("alarms on webhook events the handler answers with a 500", () => {
-			const filters = Object.values(template.findResources("AWS::Logs::MetricFilter"));
-			expect(filters).toHaveLength(1);
-			const [filter] = filters;
+			expect(Object.values(template.findResources("AWS::Logs::MetricFilter"))).toHaveLength(2);
+			const filter = webhookFilter("WebhookFailures");
 			expect(JSON.stringify(filter!.Properties.LogGroupName)).toMatch(/BillingWebhookLogs/);
 			expect(filter!.Properties.MetricTransformations).toEqual([
 				expect.objectContaining({ MetricNamespace: "Tracewise/Billing", MetricName: "WebhookFailures", MetricValue: "1" }),
@@ -446,6 +451,32 @@ describe("TracewiseStack", () => {
 				TreatMissingData: "notBreaching",
 				AlarmActions: [Match.anyValue()],
 			});
+		});
+
+		it("alarms when Stripe's deliveries keep failing the signature check, as a wrong signing secret would", () => {
+			const filter = webhookFilter("WebhookSignatureRejected");
+			expect(JSON.stringify(filter.Properties.LogGroupName)).toMatch(/BillingWebhookLogs/);
+			expect(filter.Properties.MetricTransformations).toEqual([
+				expect.objectContaining({ MetricNamespace: "Tracewise/Billing", MetricName: "WebhookSignatureRejected", MetricValue: "1" }),
+			]);
+			const pattern = filter.Properties.FilterPattern as string;
+			expect(pattern).not.toContain("$.");
+			expect(pattern).toContain(`"${WEBHOOK_SIGNATURE_REJECTED}"`);
+			const handler = readFileSync(new URL("../../services/billing/webhook.ts", import.meta.url), "utf8");
+			expect(handler).toContain(`log("warn", "${WEBHOOK_SIGNATURE_REJECTED}")`);
+			template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+				Namespace: "Tracewise/Billing",
+				MetricName: "WebhookSignatureRejected",
+				Statistic: "Sum",
+				Period: 900,
+				Threshold: 3,
+				ComparisonOperator: "GreaterThanOrEqualToThreshold",
+				EvaluationPeriods: 1,
+				TreatMissingData: "notBreaching",
+				AlarmActions: [Match.anyValue()],
+			});
+			const ids = Object.keys(template.findResources("AWS::CloudWatch::Alarm"));
+			expect(ids.some((id) => id.includes("BillingWebhookSignatureRejected"))).toBe(true);
 		});
 
 		it("reports usage hourly and alarms when metering stalls or fails", () => {

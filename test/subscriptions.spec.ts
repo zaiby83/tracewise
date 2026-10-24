@@ -283,6 +283,48 @@ describe("applySubscription", () => {
 	});
 });
 
+describe("test and live mode", () => {
+	const live = (s: Stripe.Subscription) => ({ ...s, livemode: true }) as Stripe.Subscription;
+
+	it("records the subscription's mode on BILLING", async () => {
+		setup({ profile: profile(), billing: null });
+		await applySubscription("o1", live(sub("active", "team_monthly")), NOW);
+		expect(tx().billing!.UpdateExpression).toContain("livemode = :lm");
+		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":lm": true });
+		setup({ profile: profile(), billing: null });
+		await applySubscription("o1", sub("active", "team_monthly"), NOW);
+		expect(tx().billing!.ExpressionAttributeValues).toMatchObject({ ":lm": false });
+	});
+
+	it("leaves the stored mode alone for a deletion, which has no subscription to read it from", async () => {
+		setup({ profile: profile({ plan: "team" }), billing: billing({ livemode: true }) });
+		await applySubscription("o1", null, NOW);
+		expect(tx().billing!.UpdateExpression).not.toContain("livemode");
+	});
+
+	it("starts afresh over a BILLING record test mode left, ignoring its cap, counters and owed periods", async () => {
+		const pending = { identifier: "o1:2026-10-10:5", value: "5", timestamp: 1, period: "2026-10-10" };
+		const stale = billing({ livemode: false, subscription_id: "sub_test", status: "active", spend_cap_usd: 20, reported_events: 900, pending, flush_due: { period: "2026-09-10", period_end: "x" } });
+		setup({ profile: profile({ plan: "team" }), billing: stale });
+		const res = await applySubscription("o1", live({ ...sub("canceled", "team_monthly"), id: "sub_live" } as Stripe.Subscription), NOW);
+		// Not mistaken for a stale event for an older subscription: the test-mode one is nothing to this key.
+		expect(res).toMatchObject({ applied: true, previous: null, periodChanged: false });
+		const b = tx().billing!;
+		expect(b.ConditionExpression).toBe("(attribute_not_exists(livemode) OR livemode <> :lm)");
+		expect(b.UpdateExpression).toContain("spend_cap_usd = :cap, reported_events = :zero, reported_period = :none");
+		expect(b.UpdateExpression).toContain("REMOVE #pend, flush_due");
+		expect(b.UpdateExpression).not.toContain("if_not_exists");
+		expect(b.ExpressionAttributeValues).toMatchObject({ ":cap": null, ":zero": 0, ":none": null, ":lm": true });
+		expect(b.ExpressionAttributeValues).not.toHaveProperty(":fd");
+	});
+
+	it("applies a live subscription over a test record with a fresh, uncapped limit", async () => {
+		setup({ profile: profile(), billing: billing({ spend_cap_usd: 20 }) });
+		await applySubscription("o1", live(sub("active", "team_monthly")), NOW);
+		expect((tx().profile!.ExpressionAttributeValues![":limits"] as { monthly_events: number | null }).monthly_events).toBeNull();
+	});
+});
+
 describe("deleting a subscription that may have been superseded", () => {
 	const stripeGone = (e = "sub_1") => applySubscription("o1", null, NOW, e);
 
@@ -345,10 +387,10 @@ describe("billing records", () => {
 		ddb.send.mockReset().mockResolvedValueOnce({ Item: { pk: "STRIPE#cus_1", sk: "CUSTOMER", org_id: "o1" } }).mockResolvedValueOnce({});
 		expect(await orgForCustomer("cus_1")).toBe("o1");
 		expect(ddb.send.mock.calls[0]![0].input).toMatchObject({ Key: { pk: "STRIPE#cus_1", sk: "CUSTOMER" } });
-		await linkCustomer("o1", "cus_1");
+		await linkCustomer("o1", "cus_1", true);
 		expect(ddb.send.mock.calls[1]![0].input).toMatchObject({
 			TableName: "accounts",
-			Item: { pk: "STRIPE#cus_1", sk: "CUSTOMER", org_id: "o1" },
+			Item: { pk: "STRIPE#cus_1", sk: "CUSTOMER", org_id: "o1", livemode: true },
 			ConditionExpression: "attribute_not_exists(pk) OR org_id = :org",
 			ExpressionAttributeValues: { ":org": "o1" },
 		});
@@ -360,10 +402,10 @@ describe("billing records", () => {
 describe("linkCustomer", () => {
 	it("refuses to move a customer to a different org, without naming ids", async () => {
 		ddb.send.mockReset().mockRejectedValueOnce(Object.assign(new Error("cond"), { name: "ConditionalCheckFailedException" }));
-		const err = await linkCustomer("o2", "cus_1").catch((e) => e);
+		const err = await linkCustomer("o2", "cus_1", false).catch((e) => e);
 		expect(err.message).toBe("Stripe customer is already linked to a different org");
 		ddb.send.mockReset().mockRejectedValueOnce(new Error("throttled"));
-		await expect(linkCustomer("o2", "cus_1")).rejects.toThrow("throttled");
+		await expect(linkCustomer("o2", "cus_1", false)).rejects.toThrow("throttled");
 	});
 });
 
@@ -491,24 +533,48 @@ describe("setSpendCap", () => {
 });
 
 describe("rememberCustomer", () => {
-	const update = () => ddb.send.mock.calls.map(([c]) => c).find((c) => c instanceof UpdateCommand) as UpdateCommand;
+	const updates = () => ddb.send.mock.calls.map(([c]) => c).filter((c): c is UpdateCommand => c instanceof UpdateCommand);
+	const conditionFailed = () => Object.assign(new Error("cond"), { name: "ConditionalCheckFailedException" });
 	it("records the customer only if BILLING has none, creating an inert item when the webhook has not", async () => {
-		ddb.send.mockReset().mockResolvedValue({ Attributes: { customer_id: "cus_1" } });
-		await expect(rememberCustomer("o1", "cus_1")).resolves.toBe("cus_1");
-		const { input } = update();
+		ddb.send.mockReset().mockRejectedValueOnce(conditionFailed()).mockResolvedValue({ Attributes: { customer_id: "cus_1" } });
+		await expect(rememberCustomer("o1", "cus_1", false)).resolves.toBe("cus_1");
+		const { input } = updates()[1]!;
 		expect(input.Key).toEqual({ pk: "ORG#o1", sk: "BILLING" });
 		expect(input.UpdateExpression).toContain("customer_id = if_not_exists(customer_id, :cus)");
 		// Nothing that overwrites what the webhook or the console wrote: every field but org_id is only initialised.
 		const assignments = String(input.UpdateExpression).replace(/^SET /, "").replace(/if_not_exists\([^)]*\)/g, "INIT").split(", ");
 		expect(assignments.filter((x) => !x.endsWith("= INIT"))).toEqual(["org_id = :org"]);
-		expect(input.ExpressionAttributeValues).toMatchObject({ ":cus": "cus_1", ":org": "o1", ":none": "none", ":free": "free", ":null": null, ":zero": 0 });
+		expect(input.ExpressionAttributeValues).toMatchObject({ ":cus": "cus_1", ":org": "o1", ":none": "none", ":free": "free", ":null": null, ":zero": 0, ":lm": false });
+		expect(input.UpdateExpression).toContain("livemode = if_not_exists(livemode, :lm)");
 		expect(input.ReturnValues).toBe("ALL_NEW");
 		// Status "none" and no subscription: not live, so the meter and the stale-subscription guard skip it.
 		expect(input.UpdateExpression).toContain("#s = if_not_exists(#s, :none)");
 		expect(input.UpdateExpression).toContain("subscription_id = if_not_exists(subscription_id, :null)");
 	});
 	it("returns the id that was already recorded when another checkout won", async () => {
-		ddb.send.mockReset().mockResolvedValue({ Attributes: { customer_id: "cus_winner" } });
-		await expect(rememberCustomer("o1", "cus_mine")).resolves.toBe("cus_winner");
+		ddb.send.mockReset().mockRejectedValueOnce(conditionFailed()).mockResolvedValue({ Attributes: { customer_id: "cus_winner" } });
+		await expect(rememberCustomer("o1", "cus_mine", true)).resolves.toBe("cus_winner");
+	});
+	it("replaces a customer from the other Stripe mode with an inert record for the new one", async () => {
+		ddb.send.mockReset().mockResolvedValue({});
+		await expect(rememberCustomer("o1", "cus_live", true)).resolves.toBe("cus_live");
+		expect(updates()).toHaveLength(1);
+		const { input } = updates()[0]!;
+		expect(input.ConditionExpression).toBe("attribute_exists(customer_id) AND (attribute_not_exists(livemode) OR livemode <> :lm)");
+		expect(input.UpdateExpression).toContain("customer_id = :cus");
+		expect(input.UpdateExpression).toContain("#s = :none, #p = :free, subscription_id = :null");
+		expect(input.UpdateExpression).toContain("spend_cap_usd = :null");
+		expect(input.UpdateExpression).toContain("reported_events = :zero, reported_period = :null, livemode = :lm");
+		expect(input.UpdateExpression).toContain("REMOVE #pend, flush_due");
+		expect(input.ExpressionAttributeValues).toMatchObject({ ":cus": "cus_live", ":lm": true });
+	});
+	it("treats a record with no stored mode as test mode", async () => {
+		ddb.send.mockReset().mockRejectedValueOnce(conditionFailed()).mockResolvedValue({ Attributes: { customer_id: "cus_1" } });
+		await rememberCustomer("o1", "cus_1", false);
+		expect(updates()[0]!.input.ConditionExpression).toBe("attribute_exists(customer_id) AND livemode <> :lm");
+	});
+	it("rethrows a failure that is not a failed condition", async () => {
+		ddb.send.mockReset().mockRejectedValueOnce(new Error("throttled"));
+		await expect(rememberCustomer("o1", "cus_1", true)).rejects.toThrow("throttled");
 	});
 });

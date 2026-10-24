@@ -1,6 +1,6 @@
 import type Stripe from "stripe";
 import { describe, expect, it, vi } from "vitest";
-import { ensureStripeCatalog, validateSetupArgs } from "../scripts/lib/stripe-catalog";
+import { checkStripeTax, ensureStripeCatalog, validateSetupArgs } from "../scripts/lib/stripe-catalog";
 
 // A hand-written stand-in for the parts of the Stripe client the setup uses. Lists return what
 // was seeded; creates mint ids and record the call.
@@ -264,11 +264,40 @@ describe("validateSetupArgs", () => {
 		expect(JSON.stringify(r)).not.toContain("supersecret");
 	});
 	it("accepts a live key with --live and a test key without it", () => {
-		expect(validateSetupArgs(["--live"], { STRIPE_SECRET_KEY: "sk_live_x" })).toEqual({ ok: true });
-		expect(validateSetupArgs([], { STRIPE_SECRET_KEY: KEY })).toEqual({ ok: true });
+		expect(validateSetupArgs(["--live"], { STRIPE_SECRET_KEY: "sk_live_x" })).toEqual({ ok: true, live: true, skipTaxCheck: false });
+		expect(validateSetupArgs([], { STRIPE_SECRET_KEY: KEY })).toEqual({ ok: true, live: false, skipTaxCheck: false });
+	});
+	it("accepts --skip-tax-check", () => {
+		expect(validateSetupArgs(["--skip-tax-check"], { STRIPE_SECRET_KEY: KEY })).toEqual({ ok: true, live: false, skipTaxCheck: true });
 	});
 	it("rejects a value that is not a Stripe secret key, and unknown flags", () => {
 		expect(validateSetupArgs([], { STRIPE_SECRET_KEY: "pk_test_publishable" }).ok).toBe(false);
 		expect(validateSetupArgs(["--wat"], { STRIPE_SECRET_KEY: KEY }).ok).toBe(false);
+	});
+});
+
+describe("checkStripeTax", () => {
+	const withTax = (settings: object) => ({ tax: { settings: { retrieve: vi.fn().mockResolvedValue(settings) } } }) as unknown as Stripe;
+
+	it("passes when Stripe Tax is active", async () => {
+		expect(await checkStripeTax(withTax({ status: "active", status_details: { active: {} }, head_office: { address: { country: "GB" } }, defaults: { tax_behavior: "exclusive" } }))).toEqual({ ok: true });
+	});
+
+	it("says what to set up when Stripe Tax is pending, naming the missing fields and the mode", async () => {
+		const r = await checkStripeTax(withTax({ status: "pending", livemode: false, status_details: { pending: { missing_fields: ["head_office"] } }, head_office: null, defaults: { tax_behavior: null } }));
+		expect(r.ok).toBe(false);
+		const message = !r.ok ? r.message : "";
+		expect(message).toMatch(/not active/);
+		expect(message).toMatch(/test mode/);
+		expect(message).toMatch(/head office address/);
+		expect(message).toMatch(/default tax behavio(u)?r/);
+		expect(message).toMatch(/missing: head_office/);
+		expect(message).toMatch(/--skip-tax-check/);
+	});
+
+	it("still asks for a default tax behaviour Stripe doesn't list as missing", async () => {
+		const r = await checkStripeTax(withTax({ status: "pending", livemode: true, status_details: { pending: { missing_fields: null } }, head_office: { address: { country: "GB" } }, defaults: { tax_behavior: null } }));
+		expect(!r.ok && r.message).toMatch(/live mode/);
+		expect(!r.ok && r.message).toMatch(/default tax behavio(u)?r/);
 	});
 });

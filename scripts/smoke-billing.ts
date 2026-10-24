@@ -159,7 +159,7 @@ try {
 	const card = await stripe.paymentMethods.attach("pm_card_visa", { customer: customer.id });
 	await stripe.customers.update(customer.id, { invoice_settings: { default_payment_method: card.id } });
 	// Written directly, as the console does at Checkout, so the webhook can find the org from the customer.
-	await linkCustomer(orgId, customer.id);
+	await linkCustomer(orgId, customer.id, customer.livemode);
 	const subscription = await stripe.subscriptions.create({
 		customer: customer.id,
 		items: [{ price: baseId }, { price: meteredId }],
