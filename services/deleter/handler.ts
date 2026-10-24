@@ -34,8 +34,9 @@ const RUN_TIME_BUDGET_MS = 40_000;
 // Day offsets back from the anchor. Traces expire at most MAX_RETENTION_DAYS (the longest
 // plan) after their event. Partitions use the client's own date (ts.slice(0, 10)), and the
 // processor keeps events up to MAX_RETENTION_DAYS + 1 days old, so a -12:00 stamp can sit
-// one more day back. The two extra days cover that margin and the "tomorrow" edge, which
-// leaves about one day for TTL lag. An event stamped with a +14:00 offset already lands on
+// one more day back. The two extra days reach exactly that oldest partition and leave no
+// margin for TTL lag: a trace past its expiry that TTL hasn't removed yet, one day further
+// back, is left for TTL to delete. An event stamped with a +14:00 offset already lands on
 // tomorrow (-1), which is checked last.
 const TRACE_DAYS = [...Array.from({ length: MAX_RETENTION_DAYS + 3 }, (_, i) => i), -1];
 // The sweep re-checks the days around the anchor for writes that landed after the first pass.

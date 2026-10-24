@@ -177,13 +177,15 @@ try {
 	const events = await ingest(secret, 25);
 	check("ingest accepted 25 events", events === 25);
 
-	// 5. The meter, run here with the operator's credentials rather than waiting for the hourly schedule.
+	// 5. The meter, run here with the operator's credentials rather than waiting for the hourly schedule. The
+	// hourly run may already have sent some of these events, so what this run sent proves nothing on its
+	// own: Stripe's summary for the customer (step 6) is the check.
 	const billing = await getBilling(orgId);
 	if (!billing?.current_period_start || !billing.current_period_end) throw new Error("BILLING has no period");
 	const periodStart = periodKey(billing.current_period_start);
 	const periodStartSec = Math.floor(Date.parse(billing.current_period_start) / 1000);
 	const reported = await reportOrgUsage(billing, { periodStart, timestamp: clampTimestamp(Date.now() / 1000, billing.current_period_end) });
-	check("meter reported the ingested events", reported.sent === events, `${reported.sent} sent`);
+	console.log(`  meter run sent ${reported.sent} of the ${events} events (the hourly meter may have sent the rest)`);
 
 	// 6. Stripe aggregates meter events asynchronously, so poll its summary for the customer.
 	const meter = (await stripe.billing.meters.list({ status: "active", limit: 100 })).data.find((m) => m.event_name === METER_EVENT_NAME);
@@ -193,16 +195,18 @@ try {
 		const { data } = await stripe.billing.meters.listEventSummaries(meter.id, { customer: customer.id, start_time: Math.floor(periodStartSec / 60) * 60, end_time: end });
 		return data.reduce((total, s) => total + s.aggregated_value, 0);
 	};
-	const seen = await waitFor(90_000, 5_000, async () => ((await summed()) === events ? events : undefined));
-	check("Stripe's meter summary matches the ingested count", seen === events, `${await summed()} of ${events}`);
+	const summaryReaches = async (want: number, ms: number) => waitFor(ms, 5_000, async () => ((await summed()) === want ? want : undefined));
+	const seen = await summaryReaches(events, 90_000);
+	check("Stripe's meter summary for the customer matches the ingested count", seen === events, `${await summed()} of ${events}`);
 
 	// 7. Optional: really cross the included allowance, so the overage line has something to price.
 	let total = events;
 	if (overage) {
 		console.log("--overage: ingesting 500,001 events, paced by the per-minute limit (about 90 minutes)...");
 		total += await ingest(secret, PLANS.team.included_events + 1 - events);
-		const again = await reportOrgUsage((await getBilling(orgId))!, { periodStart, timestamp: clampTimestamp(Date.now() / 1000, billing.current_period_end) });
-		check("meter reported the rest", again.sent === total - events, `${again.sent} sent`);
+		await reportOrgUsage((await getBilling(orgId))!, { periodStart, timestamp: clampTimestamp(Date.now() / 1000, billing.current_period_end) });
+		const all = await summaryReaches(total, 5 * 60_000);
+		check("Stripe's meter summary for the customer matches the full count", all === total, `${await summed()} of ${total}`);
 	}
 
 	// 8. Move the clock past the period end, plus the hour Stripe waits before it finalizes the invoice.

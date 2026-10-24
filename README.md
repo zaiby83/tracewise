@@ -65,7 +65,7 @@ Ingest answers `429` at a cap, with `x-tracewise-limit: minute`, `month` (Free's
 
 An event's `ts` is set by the client. Events stamped further back than the org's hot retention (7, 30 or 90 days by plan, plus a day) or more than a day ahead go to the analytics lake only, not the hot store, so the Traces view and evaluations don't see them.
 
-Three global caps protect the whole service: one person can own at most **3 organisations**, at most **100 organisations** can be created per UTC day, and the nightly evaluation makes at most **2,000 judge calls** in total. A `GlobalCapHit` alarm tells the operator when the sign-up cap is reached. An operator can set one org's limits by hand with `set-limits` (see [Run it](#run-it)).
+Three global caps protect the whole service: one person can own at most **3 organisations**, at most **100 organisations** can be created per UTC day, and the nightly evaluation makes at most **2,000 judge calls** for Free orgs, shared equally, plus at most **1,000** for paid, custom and legacy orgs together (scaled down in proportion when their allowances add up to more, until the eval-scaling work moves the run to a Distributed Map). A `GlobalCapHit` alarm tells the operator when the sign-up cap is reached. An operator can set one org's limits by hand with `set-limits` (see [Run it](#run-it)).
 
 **Email limit.** Cognito's built-in email sender allows **50 emails a day** for the whole user pool, and verification and password-reset emails count against it. The console's app client is public, so anyone can call `SignUp` about 50 times in a day and use up the quota, and real users then get no verification or reset codes until it resets. So this is an abuse risk, not only a capacity limit. Before a public launch, send through Amazon SES (a verified domain and SES production access), or put a WAF rate limit on the user pool, or both. Invites aren't emailed: the owner copies a link.
 
@@ -100,7 +100,9 @@ Plans are billed monthly in US dollars. The public pricing page is [`dashboard/p
 - **Plan changes happen in the console.** The owner subscribes through Stripe Checkout and switches between Team and Pro with the console's plan-change route (`POST /v1/orgs/{id}/billing/change`). The Stripe Customer Portal ("Manage billing") handles payment methods, invoices and cancellation, not plan switching. The Stripe webhook is the only thing that changes an org's plan.
 - **Downgrades never delete data**, keys or members. They only block new ones above the new limits, and traces already stored keep the retention they were written with.
 - **Enterprise ("Contact us") and custom orgs.** There is no self-serve Enterprise plan. An operator sets those orgs up by hand with `set-limits`: plan `custom`, 30-day retention, and no subscription. The "Contact us" text is plain text for now: a contact address is still to be decided and isn't in the product yet.
-- **Past due** keeps the paid plan for 7 days, then the org gets Free limits.
+- **Past due** keeps the paid plan for 7 days, then the org gets Free limits. Its owner can still reach Manage billing to pay or cancel, and the console shows a payment-problem banner until that's done.
+- **Paid plans are switched off by default.** Checkout and plan changes answer `403` until the stack is deployed with `--context billingCheckout=true` (see step 9 below). The Billing screen then hides the upgrade and switch buttons.
+- **Deleting an organisation** is refused while it has a Stripe subscription that is active, trialing, past due, unpaid or incomplete: the owner cancels it in Manage billing first, because deleting the org doesn't stop Stripe charging.
 
 How it works is in the [billing spec](docs/superpowers/specs/2026-10-23-billing-and-plans-design.md), including its "Changes during planning and implementation" section.
 
@@ -108,40 +110,57 @@ How it works is in the [billing spec](docs/superpowers/specs/2026-10-23-billing-
 
 Do this in Stripe **test mode** first, in order. The values called "outputs" below are the `Tracewise` stack's outputs (`aws cloudformation describe-stacks --stack-name Tracewise --query "Stacks[0].Outputs"`). The secret is named by CDK, so always use the `StripeSecretArn` output, never a fixed name.
 
-1. **Create the Stripe objects.** This makes the meter (`tracewise_events`), the Team and Pro products and prices, and the Customer Portal configuration, or confirms they exist. It is safe to rerun, prints object ids only, and refuses a live key without `--live`.
+1. **Create the Stripe objects.** This makes the meter (`tracewise_events`), the Team and Pro products and prices, and the Customer Portal configuration, or confirms they exist. It is safe to rerun, prints object ids only, and refuses a live key without `--live`. It then checks Stripe Tax (step 2) and exits non-zero, saying what to configure, until Stripe Tax is active. Pass `--skip-tax-check` to create the objects first and set up tax afterwards.
 
    ```sh
    STRIPE_SECRET_KEY=sk_test_... pnpm exec tsx scripts/stripe-setup.ts
    ```
 
-2. **Put the keys in the secret.** The stack creates it with placeholder values. Replace them with your test secret key and, for now, a placeholder webhook secret (step 3 gives you the real one):
+2. **Set up Stripe Tax, in test mode now and again in live mode before going live.** Checkout runs with automatic tax, and Stripe refuses every Checkout session (the console answers 500) until Stripe Tax is active in that mode. In the Stripe Dashboard open Settings > Tax and set the head office address and the default tax behaviour (whether prices include tax or have it added), then add a registration wherever you must collect tax. Rerun `stripe-setup` until it reports "Stripe Tax is active".
+
+3. **Put the keys in the secret.** The stack creates it with placeholder values. Replace them with your test secret key and, for now, a placeholder webhook secret (step 4 gives you the real one):
 
    ```sh
    aws secretsmanager put-secret-value --secret-id <StripeSecretArn output> \
      --secret-string '{"secret_key":"sk_test_...","webhook_secret":"whsec_placeholder"}'
    ```
 
-3. **Register the webhook.** In the Stripe Dashboard (test mode) add an endpoint at the `StripeWebhookUrl` output, listening to exactly these events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid` and `invoice.payment_failed`. Copy the endpoint's signing secret (`whsec_...`) and put it into the secret from step 2 with the same `put-secret-value` command.
+4. **Register the webhook.** In the Stripe Dashboard (test mode) add an endpoint at the `StripeWebhookUrl` output, listening to exactly these events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid` and `invoice.payment_failed`. Copy the endpoint's signing secret (`whsec_...`) and put it into the secret from step 3 with the same `put-secret-value` command.
 
-4. **Force a cold start.** Each Lambda reads the secret once and caches it for the life of the instance, so a changed secret isn't seen until the functions restart. The recommended way is to redeploy (`pnpm run deploy`, with the environment variables from [Run it](#run-it)). The manual alternative is to change an environment variable on each of the BillingWebhook, BillingMeter and console functions (names from `aws lambda list-functions`), which recycles their running execution environments. Be careful: `aws lambda update-function-configuration --environment` replaces **all** the function's variables. Read the current ones first with `aws lambda get-function-configuration --function-name <name> --query Environment`, and pass every one of them plus your extra variable, or the function loses its configuration and stops working. The next `pnpm run deploy` resets the environment to the stack's values.
+5. **No redeploy needed for new keys.** The billing functions and the console re-read the secret at most 5 minutes after it changes, and the webhook re-reads it straight away when a delivery fails the signature check, so a new `webhook_secret` works on Stripe's next delivery (Stripe retries failed ones). A webhook secret that still doesn't match raises the `BillingWebhookSignatureRejected` alarm (3 or more rejections in 15 minutes): check that `webhook_secret` is the endpoint's signing secret for the same mode as `secret_key`.
 
-5. **Expect `BillingMeterStale` to fire.** The alarm goes off when the hourly meter hasn't reported a successful run for 3 hours, and it counts missing data as breaching, so it fires on a fresh deploy until the first hourly run succeeds. Wait for that run (or invoke the BillingMeter function once) and it clears.
+6. **Expect `BillingMeterStale` to fire.** The alarm goes off when the hourly meter hasn't reported a successful run for 3 hours, and it counts missing data as breaching, so it fires on a fresh deploy until the first hourly run succeeds. Wait for that run (or invoke the BillingMeter function once) and it clears.
 
-6. **Run the smoke test.** It needs the stack deployed with the smoke client (see `smoke-selfserve` below), and is test mode only (live keys are refused). Your AWS credentials need `cloudformation:DescribeStacks` on the stack, Cognito admin on its user pool (`AdminCreateUser`, `AdminSetUserPassword`, `AdminInitiateAuth`, `AdminDeleteUser`), and read and write access to the Accounts table and read access to the Quotas table:
+7. **Run the smoke test.** It needs the stack deployed with the smoke client (see `smoke-selfserve` below), and is test mode only (live keys are refused). Your AWS credentials need `cloudformation:DescribeStacks` on the stack, Cognito admin on its user pool (`AdminCreateUser`, `AdminSetUserPassword`, `AdminInitiateAuth`, `AdminDeleteUser`), and read and write access to the Accounts table and read access to the Quotas table:
 
    ```sh
    STRIPE_SECRET_KEY=sk_test_... pnpm exec tsx scripts/smoke-billing.ts
    ```
 
-   It creates a throwaway user and org, a Stripe test clock with a customer and a Team subscription, and checks that the webhook moved the org to Team, that ingest and the meter agree with Stripe's meter summary, that the invoice after advancing the clock has the $29 base line and the metered line, and that cancelling returns the org to Free. It cleans up afterwards, even on failure: it deletes the test clock (and so its customer and subscription) and the Cognito user, and requests the org's deletion, which the deleter then finishes in the background. If a cleanup step fails it says what to remove by hand and the run fails. `--overage` also ingests 500,001 events to price a real overage line: it is paced by Team's 6,000 events a minute limit, so it takes about 90 minutes and costs about $1.50 of AWS. Then click through Checkout and the Customer Portal once by hand in the console.
+   It creates a throwaway user and org, a Stripe test clock with a customer and a Team subscription, and checks that the webhook moved the org to Team, that Stripe's meter summary for the customer matches what was ingested, that the invoice after advancing the clock has the $29 base line and the metered line, and that cancelling returns the org to Free. It cleans up afterwards, even on failure: it deletes the test clock (and so its customer and subscription) and the Cognito user, and requests the org's deletion, which the deleter then finishes in the background. If a cleanup step fails it says what to remove by hand and the run fails. `--overage` also ingests 500,001 events to price a real overage line: it is paced by Team's 6,000 events a minute limit, so it takes about 90 minutes and costs about $1.50 of AWS. To click through Checkout and the Customer Portal by hand in the console, deploy with `--context billingCheckout=true` on the test stack first.
 
-7. **Before going live (the owner's side):**
+8. **Before going live (the owner's side):**
    - Check in test mode what Stripe answers for a **duplicate meter-event identifier**. The meter treats a recognised duplicate as success (it retries an unconfirmed send with the same identifier), so the error's shape has to match what `isDuplicateIdentifier` in `services/billing/meter.ts` recognises. Send the same event twice with the Stripe CLI or API and confirm.
    - Activate the Stripe account.
-   - Register for tax where Stripe Tax shows thresholds.
+   - Set up Stripe Tax in live mode (step 2) and register for tax where Stripe Tax shows thresholds.
    - Publish terms of service, privacy and refund policy pages, and link them from Checkout and the console.
    - Preferably move to a real domain.
-   - Then put the **live** keys in the secret, rerun `STRIPE_SECRET_KEY=sk_live_... pnpm exec tsx scripts/stripe-setup.ts --live`, create the live webhook endpoint at the same URL and update `webhook_secret`, and force a cold start again (step 4).
+   - Then put the **live** keys in the secret, rerun `STRIPE_SECRET_KEY=sk_live_... pnpm exec tsx scripts/stripe-setup.ts --live`, create the live webhook endpoint at the same URL and update `webhook_secret`. The functions pick the keys up within 5 minutes (step 5). Delete the test-mode endpoint, or leave it: the webhook answers events from the other mode with a 200 and ignores them.
+
+9. **Test-to-live reset, then turn on paid plans.** Once the secret holds the live key, every BILLING and `STRIPE#` row written in test mode is ignored automatically: Checkout makes the org a new live customer, the meter skips it, the webhook ignores test events and the Billing screen shows no subscription. What isn't automatic is the plan an org was upgraded to in test mode, so move those orgs back to Free. The script never calls Stripe (the key only proves live mode), prints what it would change, and writes only with `--apply`:
+
+   ```sh
+   STRIPE_SECRET_KEY=sk_live_... pnpm exec tsx scripts/reset-test-billing.ts           # dry run
+   STRIPE_SECRET_KEY=sk_live_... pnpm exec tsx scripts/reset-test-billing.ts --apply   # move them to Free
+   ```
+
+   It moves every active Team or Pro org that no live subscription holds open to Free, the way a cancellation would; free, custom and non-active orgs are left alone. Then redeploy with `--context billingCheckout=true` so owners can buy plans, and keep passing it on every later deploy: a deploy without it switches paid plans off again (existing subscriptions are unaffected).
+
+**Runbook notes.**
+
+- **A meter event left `pending`** on a BILLING row is re-sent by the next hourly run with the same identifier. Stripe deduplicates meter-event identifiers for at least 24 hours, so a re-send is safe within that window; a `pending` older than a few hours means sends keep failing (check the BillingMeter logs and the `BillingMeterErrors` alarm) and should be investigated before the 24 hours run out, or the event could be billed twice.
+- **Cancelling a subscription by hand** (Stripe Dashboard or API) should use `invoice_now: true`, so the usage of the unfinished period is invoiced now rather than lost. The meter's final flush still reports it; `invoice_now` makes Stripe bill it.
+- **Meter errors Stripe raises asynchronously** (for example a meter event for a customer it can't find) arrive as `v1.billing.meter.error_report_triggered` events. Subscribing the webhook endpoint to them, and alarming on them, is a follow-up; until then check the meter's error reports in the Stripe Dashboard after a deploy or a key change.
 
 ## The SDK
 
@@ -195,12 +214,14 @@ pnpm exec tsx scripts/migrate-accounts.ts [--owner you@example.com]   # turn exi
 pnpm exec tsx scripts/apply-plan-limits.ts                # move existing free orgs to the new Free limits and 7-day retention
 pnpm exec tsx scripts/smoke-selfserve.ts                  # sign-up to deletion, end to end (about 20 minutes, up to 30, mostly waiting for the delayed sweep)
 pnpm exec tsx scripts/set-limits.ts "<org name or id>" monthly_events=200000 max_members=10   # custom limits for one org
+STRIPE_SECRET_KEY=sk_live_... pnpm exec tsx scripts/reset-test-billing.ts [--apply]   # once, after the switch to live Stripe keys
 ```
 
 - **`migrate-accounts`** creates an org for each existing tenant, with its current rate as the per-minute limit and no monthly cap, so the public demo and load tests keep working. Running it again changes nothing already migrated. With `--owner`, the Cognito user with that email (they must have signed up first) becomes owner of every active org that has no owner yet, not only the ones this run creates. Keys of orgs that are deleting, deleted or suspended are retired as revoked, so unsuspending an org later doesn't restore them. Create new keys instead.
 - **`apply-plan-limits`** moves every active `free` org to the Free plan's current limits (a monthly cap, 2 members, 3 keys, 2 pending invites) and sets 7-day retention for the traces it writes from then on. It leaves `custom`, paid and non-active orgs alone, writes each change conditionally on the org still being active and free, and prints counts. Running it again changes nothing already current. New Free orgs get the new limits at sign-up, so this only matters for orgs created before billing. Run it once the billing deploy is live, after `migrate-accounts`.
 - **`smoke-selfserve`** creates two throwaway Cognito users and an org, ingests, checks that the key's `last_used_at` was stamped, queries, invites, checks permissions, revokes the key, then deletes the org. It waits (up to 25 minutes) for the deleter to tombstone the org's profile, then checks that the org's lake prefix and today's trace partitions are empty. It deletes the users afterwards, even on failure. It needs your operator credentials, including `s3:ListBucket` on the lake and read access to the Accounts and Traces tables. It creates one real org, so it counts toward the daily sign-up cap.
-- **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`, with 30-day retention (unless it was already custom, in which case its retention is left as set). Unnamed limits keep their value. `monthly_events=null` removes the monthly cap. A custom org is never moved by the Stripe webhook.
+- **`set-limits`** takes `key=value` pairs for any of the limits above and marks the org's plan `custom`, with 30-day retention (unless it was already custom, in which case its retention is left as set). Unnamed limits keep their value. `monthly_events=null` removes the monthly cap. It also drops any Stripe period from the profile, so the org counts usage by calendar month. A custom org is never moved by the Stripe webhook, so `set-limits` refuses an org whose Stripe subscription is still active, trialing, past due, unpaid or incomplete: cancel the Stripe subscription first.
+- **`reset-test-billing`** is described in [Stripe setup](#stripe-setup), step 9.
 - **`smoke-billing`** is described in [Stripe setup](#stripe-setup).
 
 ```sh
