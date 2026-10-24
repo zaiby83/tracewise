@@ -136,6 +136,9 @@ const conditionFailedAt = (e: unknown, index: number) => {
 };
 
 const LIVE = new Set(["active", "trialing", "past_due"]);
+// Statuses in which Stripe still holds the subscription open and may charge (or try to charge) the
+// customer: the live ones, plus unpaid and incomplete, which only the Customer Portal resolves.
+export const HOLDS_SUBSCRIPTION: ReadonlySet<string> = new Set([...LIVE, "unpaid", "incomplete"]);
 const TERMINAL = new Set(["canceled", "unpaid", "incomplete_expired"]);
 
 export interface ApplyResult {

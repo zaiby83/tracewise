@@ -2,6 +2,7 @@ import { CloudWatchClient, PutMetricDataCommand } from "@aws-sdk/client-cloudwat
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { z } from "zod";
 import { GLOBAL_ORGS_PER_DAY, MAX_OWNED_ORGS, getProfile, listUserOrgs } from "../../shared/accounts";
+import { HOLDS_SUBSCRIPTION, getBilling } from "../../billing/subscriptions";
 import { json, log } from "../../shared/http";
 import { consumeCounter, counterIds } from "../../shared/tenants";
 import type { Ctx, RouteTable } from "../handler";
@@ -84,6 +85,9 @@ export const orgRoutes: RouteTable = {
 			const { confirm_name } = bodyOf(Delete, ctx);
 			if (confirm_name !== ctx.profile!.name) return json(400, { error: "confirm_name does not match the organisation name" });
 			const orgId = ctx.profile!.org_id;
+			// The deleter never touches Stripe, so a subscription left open would keep charging an org that no longer exists.
+			const billing = await getBilling(orgId);
+			if (billing && HOLDS_SUBSCRIPTION.has(billing.status)) return json(409, { error: "cancel your subscription in Manage billing before deleting this organisation" });
 			// False means another request already moved the org out of active.
 			if (!(await startDeletion(orgId))) return notFound();
 			try {

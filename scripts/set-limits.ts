@@ -1,8 +1,10 @@
 // Sets an org's limits and marks its plan custom (30-day retention, unless it was custom already). Unnamed limits keep their current value.
+// Refuses an org that still has an open Stripe subscription: cancel that first.
 // Usage: pnpm exec tsx scripts/set-limits.ts "<org name or id>" key=value [key=value...]
+import { getBilling } from "../services/billing/subscriptions";
 import { updateProfile, findOrgByName } from "../services/console/store";
 import { FREE_LIMITS, getProfile } from "../services/shared/accounts";
-import { customPatch, parseLimitOverrides } from "./lib/limits";
+import { customPatch, parseLimitOverrides, setLimitsRefusal } from "./lib/limits";
 import { stackOutputs } from "./lib/stack";
 
 const [target, ...pairs] = process.argv.slice(2);
@@ -17,6 +19,12 @@ parseLimitOverrides(pairs, FREE_LIMITS);
 await stackOutputs();
 const org = (await getProfile(target)) ?? (await findOrgByName(target));
 if (!org || org.status === "deleting" || org.status === "deleted") throw new Error(`no org named or numbered "${target}"`);
+
+const refusal = setLimitsRefusal(await getBilling(org.org_id));
+if (refusal) {
+	console.error(`Not changed: ${refusal}.`);
+	process.exit(1);
+}
 
 const limits = parseLimitOverrides(pairs, org.limits);
 const updated = await updateProfile(org.org_id, customPatch(limits, org.plan));

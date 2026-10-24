@@ -284,6 +284,26 @@ describe("orgs", () => {
 		]);
 		err.mockRestore();
 	});
+	it.each(["active", "trialing", "past_due", "unpaid", "incomplete"])("refuses to delete an org whose Stripe subscription is %s", async (status) => {
+		store.startDeletion.mockResolvedValue(true);
+		billingStore.getBilling.mockResolvedValue({ org_id: "o1", customer_id: "cus_1", subscription_id: "sub_1", status, plan: "team" });
+		const res = await call("DELETE /v1/orgs/{orgId}", { params: { orgId: "o1" }, body: { confirm_name: "Acme" } });
+		expect(res.statusCode).toBe(409);
+		expect(parse(res)).toEqual({ error: "cancel your subscription in Manage billing before deleting this organisation" });
+		expect(store.startDeletion).not.toHaveBeenCalled();
+		expect(sqsSend).not.toHaveBeenCalled();
+	});
+	it.each([
+		["no billing record", null],
+		["a billing account with no subscription", { org_id: "o1", customer_id: "cus_1", subscription_id: null, status: "none", plan: "free" }],
+		["a canceled subscription", { org_id: "o1", customer_id: "cus_1", subscription_id: "sub_1", status: "canceled", plan: "free" }],
+		["an expired checkout", { org_id: "o1", customer_id: "cus_1", subscription_id: "sub_1", status: "incomplete_expired", plan: "free" }],
+	])("deletes an org with %s", async (_name, record) => {
+		store.startDeletion.mockResolvedValue(true);
+		billingStore.getBilling.mockResolvedValue(record);
+		expect((await call("DELETE /v1/orgs/{orgId}", { params: { orgId: "o1" }, body: { confirm_name: "Acme" } })).statusCode).toBe(202);
+		expect(store.startDeletion).toHaveBeenCalledWith("o1");
+	});
 	it("doesn't queue a second deletion when the org already left active", async () => {
 		store.startDeletion.mockResolvedValue(false);
 		const res = await call("DELETE /v1/orgs/{orgId}", { params: { orgId: "o1" }, body: { confirm_name: "Acme" } });

@@ -72,15 +72,20 @@ export function planForLookupKey(key: string): PlanId | null {
 	return null;
 }
 
+// Team and Pro: the plans with a Stripe subscription behind them.
+export const isPaidPlan = (plan: string): plan is "team" | "pro" => plan === "team" || plan === "pro";
+
 const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
-// Free orgs bill on the UTC calendar month. Paid and custom orgs use the Stripe period stored
-// on the profile, falling back to the calendar month until the first webhook has written it.
+// Paid orgs use the Stripe period stored on the profile, falling back to the calendar month until
+// the first webhook has written it. Everything else (free, custom, anything unknown) bills on the
+// UTC calendar month, even if an old Stripe period is still on the profile: an org made custom
+// mid-period would otherwise count against a period nothing renews.
 export function periodBounds(
 	profile: { plan: string; period_start?: string; period_end?: string },
 	now = Date.now(),
 ): { start: string; end: string } {
-	if (profile.plan !== "free" && profile.period_start && profile.period_end) return { start: profile.period_start, end: profile.period_end };
+	if (isPaidPlan(profile.plan) && profile.period_start && profile.period_end) return { start: profile.period_start, end: profile.period_end };
 	const d = new Date(now);
 	return { start: isoDate(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)), end: isoDate(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)) };
 }

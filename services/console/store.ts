@@ -121,25 +121,34 @@ export async function createOrg(input: {
 
 export async function updateProfile(
 	orgId: string,
-	patch: { name?: string; rubric?: string | null; evals_enabled?: boolean; limits?: Limits; plan?: "free" | "custom"; retention_days?: number },
+	patch: {
+		name?: string;
+		rubric?: string | null;
+		evals_enabled?: boolean;
+		limits?: Limits;
+		plan?: "free" | "custom";
+		retention_days?: number;
+		// Fields to drop in the same write: set-limits clears the Stripe period when an org goes custom.
+		remove?: readonly ("period_start" | "period_end")[];
+	},
 ): Promise<OrgProfile> {
 	const names: Record<string, string> = {};
 	const values: Record<string, unknown> = {};
 	const sets: string[] = [];
-	for (const [field, value] of Object.entries(patch)) {
+	const { remove = [], ...fields } = patch;
+	for (const [field, value] of Object.entries(fields)) {
 		if (value === undefined) continue;
 		names[`#${field}`] = field;
 		values[`:${field}`] = value;
 		sets.push(`#${field} = :${field}`);
 	}
-	if (sets.length === 0) return (await getProfile(orgId)) as OrgProfile;
+	if (sets.length === 0 && remove.length === 0) return (await getProfile(orgId)) as OrgProfile;
 	const profile = {
 		TableName: accounts(),
 		Key: profileKey(orgId),
-		UpdateExpression: `SET ${sets.join(", ")}`,
+		UpdateExpression: [sets.length ? `SET ${sets.join(", ")}` : "", remove.length ? `REMOVE ${remove.join(", ")}` : ""].filter(Boolean).join(" "),
 		ConditionExpression: "attribute_exists(pk)",
-		ExpressionAttributeNames: names,
-		ExpressionAttributeValues: values,
+		...(sets.length ? { ExpressionAttributeNames: names, ExpressionAttributeValues: values } : {}),
 	};
 	try {
 		if (patch.name === undefined) {

@@ -2,7 +2,7 @@ import type Stripe from "stripe";
 import { z } from "zod";
 import { PLANS, estimatedOverageUsd, periodBounds, type PlanId } from "../../billing/plans";
 import { findPortalConfigId, getStripe } from "../../billing/stripe";
-import { getBilling, linkCustomer, rememberCustomer, setSpendCap, type BillingRecord } from "../../billing/subscriptions";
+import { HOLDS_SUBSCRIPTION, getBilling, linkCustomer, rememberCustomer, setSpendCap, type BillingRecord } from "../../billing/subscriptions";
 import { getProfile, type OrgProfile } from "../../shared/accounts";
 import { json, log } from "../../shared/http";
 import { counterIds, readCounter } from "../../shared/tenants";
@@ -13,9 +13,6 @@ const PaidPlan = z.object({ plan: z.enum(["team", "pro"]) });
 const SpendCap = z.object({ spend_cap_usd: z.number().min(0).max(100_000).nullable() });
 
 const LIVE = new Set(["active", "trialing", "past_due"]);
-// States in which Checkout would start a second subscription: the live ones, plus unpaid and incomplete,
-// which Stripe still holds open and which the portal (not a new Checkout) resolves.
-const HOLDS_SUBSCRIPTION = new Set([...LIVE, "unpaid", "incomplete"]);
 // Stripe accepts expiry 30 minutes to 24 hours after the session is created, so a little over 30 minutes
 // leaves room for the time the request takes.
 const CHECKOUT_TTL_SECONDS = 31 * 60;
