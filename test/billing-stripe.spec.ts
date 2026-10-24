@@ -13,7 +13,7 @@ vi.mock("stripe", () => ({
 }));
 
 const SECRET = { secret_key: "sk_test_from_secrets_manager", webhook_secret: "whsec_from_secrets_manager" };
-const ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:tracewise/stripe-AbCdEf";
+const ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:Tracewise-StripeSecret-AbCdEf";
 
 // The module caches per instance, so each test imports a fresh copy.
 const load = async () => {
@@ -77,6 +77,66 @@ describe("stripe client and secret access", () => {
 		await expect(getStripe()).rejects.toThrow("throttled");
 		await getStripe();
 		expect(send).toHaveBeenCalledTimes(2);
+	});
+
+	it("re-reads the secret once it is 5 minutes old, and builds a client with the new key", async () => {
+		vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-10-23T12:00:00Z") });
+		const { getStripe, getWebhookSecret } = await load();
+		const first = await getStripe();
+		vi.setSystemTime(Date.parse("2026-10-23T12:04:59Z"));
+		await getWebhookSecret();
+		expect(send).toHaveBeenCalledTimes(1);
+
+		send.mockResolvedValue({ SecretString: JSON.stringify({ secret_key: "sk_live_rotated", webhook_secret: "whsec_rotated" }) } as never);
+		vi.setSystemTime(Date.parse("2026-10-23T12:05:00Z"));
+		expect(await getWebhookSecret()).toBe("whsec_rotated");
+		const second = (await getStripe()) as unknown as { key: string };
+		expect(send).toHaveBeenCalledTimes(2);
+		expect(second).not.toBe(first);
+		expect(second.key).toBe("sk_live_rotated");
+		vi.useRealTimers();
+	});
+
+	it("keeps the last good secret when a re-read after expiry fails, and tries again next time", async () => {
+		vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-10-23T12:00:00Z") });
+		const { getWebhookSecret } = await load();
+		await getWebhookSecret();
+		send.mockRejectedValueOnce(new Error("throttled") as never);
+		vi.setSystemTime(Date.parse("2026-10-23T12:06:00Z"));
+		expect(await getWebhookSecret()).toBe(SECRET.webhook_secret);
+		expect(await getWebhookSecret()).toBe(SECRET.webhook_secret);
+		expect(send).toHaveBeenCalledTimes(3);
+		vi.useRealTimers();
+	});
+
+	it("forces a re-read on demand, at most once every 30 seconds", async () => {
+		vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-10-23T12:00:00Z") });
+		const { getWebhookSecret, refreshStripeSecret } = await load();
+		await getWebhookSecret();
+		expect(refreshStripeSecret()).toBe(true);
+		await getWebhookSecret();
+		expect(send).toHaveBeenCalledTimes(2);
+		vi.setSystemTime(Date.parse("2026-10-23T12:00:29Z"));
+		expect(refreshStripeSecret()).toBe(false);
+		await getWebhookSecret();
+		expect(send).toHaveBeenCalledTimes(2);
+		vi.setSystemTime(Date.parse("2026-10-23T12:00:31Z"));
+		expect(refreshStripeSecret()).toBe(true);
+		await getWebhookSecret();
+		expect(send).toHaveBeenCalledTimes(3);
+		vi.useRealTimers();
+	});
+
+	it("tells test keys from live ones", async () => {
+		const { stripeMode } = await load();
+		expect(await stripeMode()).toBe("test");
+		send.mockResolvedValue({ SecretString: JSON.stringify({ secret_key: "rk_live_abc", webhook_secret: "whsec_x" }) } as never);
+		const fresh = await load();
+		expect(await fresh.stripeMode()).toBe("live");
+		vi.stubEnv("STRIPE_SECRET_KEY", "sk_live_from_env");
+		expect(await fresh.stripeMode()).toBe("live");
+		vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_from_env");
+		expect(await fresh.stripeMode()).toBe("test");
 	});
 
 	it("rejects a secret missing a field without echoing its contents", async () => {

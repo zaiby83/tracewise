@@ -106,12 +106,12 @@ Plan {
 | `pro_metered` | each one after | $0.00003 |
 
   A subscription is the monthly base price plus the monthly metered price.
-- **Customer Portal configuration:** plan switching between Team and Pro, cancellation at period end, payment method updates and invoice history.
-- **Stripe Tax** enabled. Checkout uses `automatic_tax`.
+- **Customer Portal configuration:** ~~plan switching between Team and Pro,~~ cancellation at period end, payment method updates and invoice history. *(Superseded: plan switching moved to a console route — see Changes.)*
+- **Stripe Tax** enabled. Checkout uses `automatic_tax`. *(`stripe-setup` now checks it is active — see Changes.)*
 
 Secrets go in Secrets Manager:
-- `tracewise/stripe` holds `{ secret_key, webhook_secret }`.
-- Billing functions read it once per cold start.
+- A Secrets Manager secret, named by CDK and found through the `StripeSecretArn` stack output, holds `{ secret_key, webhook_secret }`.
+- Billing functions read it once per cold start. *(Superseded: re-read every 5 minutes — see Changes.)*
 - Only those functions get `secretsmanager:GetSecretValue` on it.
 
 New runtime dependency: the official `stripe` npm package, pinned to an exact version.
@@ -213,7 +213,7 @@ New runtime dependency: the official `stripe` npm package, pinned to an exact ve
 
 New resources:
 - the `billing-webhook` and `billing-meter` Lambdas
-- the `tracewise/stripe` secret
+- the Stripe secret (CDK-named; the `StripeSecretArn` output)
 - the hourly schedule
 - the meter alarms
 - the public webhook route
@@ -247,12 +247,12 @@ CDK assertions:
 **Live test in Stripe test mode:** `scripts/smoke-billing.ts`
 1. Create a test org with a Stripe test clock, a customer with `pm_card_visa`, and a Team subscription created through the API.
 2. Check that the webhook moved the org to Team limits.
-3. Ingest 600k events (scaled down: `--included` can override the plan for this test only), then run the meter.
+3. Ingest 600k events ~~(scaled down: `--included` can override the plan for this test only)~~, then run the meter. *(Superseded: there is no `--included`; `--overage` ingests 500,001 real events — see Changes.)*
 4. Advance the test clock past the period.
 5. Check that the finalized invoice has base plus overage for 100k events at $5.
 6. Cancel, check the org returns to Free limits, then clean up.
 
-Checkout and the Portal are clicked through once by hand.
+Checkout and the Portal are clicked through once by hand. *(The Portal no longer switches plans — see Changes.)*
 
 ## 14. Rollout
 
@@ -272,3 +272,45 @@ Checkout and the Portal are clicked through once by hand.
 - Annual plans (a yearly meter or prepaid event credits).
 - Enterprise: invoicing, contracts, SSO.
 - Tracking where an org's DynamoDB writes go when its items are smaller than 3 KB, to tighten cost estimates.
+
+## Changes during planning and implementation
+
+What changed from the sections above, one line each.
+
+- **`PROFILE` also carries `period_end`**, which ingest needs for `retry-after`; §6's table lists only `period_start`.
+- **The stale-meter alarm** works from a `MeterLastSuccessAgeMinutes = 0` datapoint the meter publishes after each fully successful run, and fires when none arrives for 3 hours (missing data breaching), instead of a gauge that counts up.
+- **`smoke-billing` doesn't override plans**: its overage check is an opt-in `--overage` flag that really ingests 500,001 events, replacing §13's `--included`.
+- **New free orgs get the new Free allowances right away** (2 members, 3 keys, 2 pending invites); existing free orgs move only when `apply-plan-limits` runs.
+- **Monthly-only:** there are no annual prices or plans anywhere.
+- **Custom orgs keep their legacy limits and 30-day retention**, including orgs an operator marks custom with `set-limits`, which now also sets `retention_days` to 30.
+- **The period counter is released on any enqueue failure**, not only some, so a client's retry isn't charged twice.
+- **`retention_days` is kept out of stored traces:** ingest stamps it on the queued event and the processor strips it before the hot store, query API and lake see it.
+- **Deleter time budget and window** now reach `MAX_RETENTION_DAYS` + 2 days back, so 90-day Pro data is covered.
+- **Plan switching moved from the Customer Portal to a console route** (`POST /v1/orgs/{id}/billing/change`); the Portal handles payment methods, invoices and cancellation.
+- **The portal configuration is tagged and converged by `stripe-setup`**, which finds it by its metadata tag and adopts an older plan-switching one.
+- **Stale and superseded subscription guards:** a late event for an old, terminal subscription, or a deletion of a superseded one, is ignored while the org holds a newer live subscription.
+- **`paused` maps to Free**, since collection is paused and nothing is being paid for.
+- **A spend-cap race guard:** BILLING's cap and PROFILE's derived `monthly_events` are written together, and the webhook re-reads if the cap changed under it.
+- **The meter claims, then sends:** it records a `pending` event on BILLING before calling Stripe and re-sends exactly that event first on the next run; `reported_period` only moves forward; metering follows the Stripe period; event timestamps are clamped to the period end.
+- **A durable `flush_due` marker** is written with the move off a period (or off a paid plan), so the final usage of a period can't be forgotten after a failed flush.
+- **The webhook event record is a lease** (a retry gets 409 while one is in progress), and a missing subscription (404) is read as "deleted" only for deletion events.
+- **One Stripe customer per org, and open Checkout sessions expire:** the first Checkout creates the customer (idempotent), and each new Checkout expires the org's other open sessions.
+- **Timeouts:** the webhook Lambda runs for 60 s and the console's billing routes for 29 s.
+- **The webhook-failure alarm uses a text log filter**, because Lambda's default log format isn't JSON.
+- **The Stripe secret's name is CDK-generated** (a fixed name would collide with the retained secret on redeploy); operators use the `StripeSecretArn` output.
+- **Deleting an org is refused while its subscription is open** (active, trialing, past_due, unpaid or incomplete): the deleter never touches Stripe, so the owner cancels in Manage billing first. The delete dialog says so.
+- **`set-limits` refuses an org with an open subscription** ("cancel the Stripe subscription first") and removes `period_start`/`period_end` from PROFILE when marking it custom; `periodBounds` uses stored period fields only on Team and Pro, so custom and free orgs always count by UTC calendar month.
+- **The Stripe secret is re-read every 5 minutes** (a failed re-read keeps the last good value), and the webhook forces one re-read on a signature mismatch before answering 400 (at most one forced re-read per 30 s per instance). No redeploy is needed for new keys.
+- **`BillingWebhookSignatureRejected` alarm:** a text-term metric filter on "stripe webhook signature rejected", firing at 3 or more in 15 minutes, catches a wrong `webhook_secret`, which answers 400 and so never reaches the 500-based failure alarm.
+- **BILLING and `STRIPE#…/CUSTOMER` record `livemode`;** records without it count as test mode. A record whose mode differs from the configured key's (`sk_test_` vs `sk_live_`) is treated as absent: Checkout creates a new customer (replacing the old record with an inert one), the meter skips it, GET billing shows no account, the portal and plan change refuse, and org deletion isn't blocked by it. The webhook answers events whose `livemode` differs from the key's with a 200 and ignores them. `applySubscription` replaces an other-mode BILLING record instead of carrying over its cap, counters, `pending` or `flush_due`.
+- **Test-to-live reset:** `scripts/reset-test-billing.ts` (live key required, dry run unless `--apply`) moves every active Team or Pro org that no live subscription holds open to Free with `applySubscription(org, null)`. Its planner and argument checks are unit tested.
+- **Paid plans are gated by `BILLING_CHECKOUT_ENABLED`**, set on the console Lambda only by CDK context `billingCheckout=true` (off by default). While off, Checkout and plan change answer 403 "paid plans aren't available yet", GET billing reports `checkout_enabled: false`, and the console hides the Upgrade and Switch buttons with a short note.
+- **`stripe-setup` checks Stripe Tax** (`tax.settings.retrieve()`) and exits non-zero with what to configure (head office address, default tax behaviour) unless it is active or `--skip-tax-check` is given.
+- **GET billing also returns `billing_account` and `subscription_status`** (the mode-matching BILLING record's, whatever the profile plan), so an org downgraded to Free can reach Manage billing and see a payment-problem banner. The portal opens for any org with a mode-matching customer.
+- **Checkout's 409s:** BILLING `past_due`, `unpaid` or `incomplete` answers "there's a payment problem on your subscription — use Manage billing"; `active` or `trialing` answers "already subscribed, use Manage billing", as does any subscription Stripe lists for the customer in those five states (checked before each session, so a second Checkout can't be paid before the webhook lands). The console treats only the exact "already subscribed" answer as a subscription being set up, and hides the plan cards while it waits.
+- **Paid judge ceiling:** paid, custom and legacy orgs together get at most `PAID_JUDGE_CALLS_PER_NIGHT` (1,000) judge calls a night, each scaled down in proportion (rounded down) when their allowances add up to more, with `GlobalCapHit` (`Cap=judge_paid`) and its own alarm. It exists for the single Step Functions execution's history limit; a Distributed Map (the eval-scaling follow-up) removes it.
+- **Paid usage has its own counter:** `<org>#paid#<start>` for Team and Pro, `<org>#month#<start>` for free and custom. Ingest picks it from the tenant's plan, the meter always reads the paid one, and the usage route and GET billing from the profile's plan. Deploy this before any live paid org exists: a paid org's counter for the current period restarts at zero.
+- **A NULL spend cap is matched by type:** `applySubscription`'s BILLING condition uses `attribute_not_exists(spend_cap_usd) OR attribute_type(spend_cap_usd, NULL)` when it read no cap, since DynamoDB never finds a stored NULL equal to a value.
+- **`smoke-billing` checks Stripe's meter summary for the customer**, not what its own meter run sent (the hourly meter may already have sent some events); `--overage` waits for the summary to reach the full count.
+- **Runbook notes** (README): investigate a meter `pending` older than a few hours (Stripe dedupes identifiers for at least 24 h); operator cancellations use `invoice_now: true`; subscribing the webhook to `v1.billing.meter.error_report_triggered` is a follow-up.
+- **Open:** the Enterprise "Contact us" has no contact address yet; it stays plain text until one is decided.

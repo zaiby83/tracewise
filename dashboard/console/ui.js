@@ -118,13 +118,14 @@ export function secretDialog({ title, intro, secret, label, note = "This is the 
 	);
 }
 
-// Resolves true when confirmed, false when cancelled.
-export function confirmDialog({ title, body, confirm }) {
+// Resolves true when confirmed, false when cancelled. The confirm button is red unless the
+// action is not destructive (`danger: false`).
+export function confirmDialog({ title, body, confirm, danger = true }) {
 	return modal(
 		title,
 		(close) => [
 			el("p", {}, body),
-			el("div", { class: "actions" }, el("button", { class: "button", type: "button", onclick: () => close(false) }, "Cancel"), el("button", { class: "button danger", type: "button", onclick: () => close(true) }, confirm)),
+			el("div", { class: "actions" }, el("button", { class: "button", type: "button", onclick: () => close(false) }, "Cancel"), el("button", { class: danger ? "button danger" : "button primary", type: "button", onclick: () => close(true) }, confirm)),
 		],
 		{ dismissible: true },
 	);

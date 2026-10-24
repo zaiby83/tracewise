@@ -2,6 +2,7 @@ import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand, UpdateComm
 import type Stripe from "stripe";
 import { k, getProfile } from "../shared/accounts";
 import { ddb } from "../shared/ddb";
+import { sameMode } from "./mode";
 import { PLANS, deriveMonthlyEvents, planForLookupKey, type PlanId } from "./plans";
 
 export interface BillingRecord {
@@ -27,6 +28,9 @@ export interface BillingRecord {
 	// `period`) by whoever has reported that period. It outlives a failed flush, so the final usage of a
 	// period can't be forgotten once BILLING no longer shows it.
 	flush_due?: FlushDue;
+	// The Stripe mode the customer and subscription live in. Absent on records written before it was
+	// stored, which all came from test mode. A record from the other mode is treated as no record.
+	livemode?: boolean;
 }
 
 export interface FlushDue {
@@ -63,13 +67,16 @@ export async function orgForCustomer(customerId: string): Promise<string | null>
 	return (Item?.org_id as string | undefined) ?? null;
 }
 
+// A record from the other Stripe mode: livemode differs, and an absent one counts as test mode.
+const otherModeCondition = (livemode: boolean) => (livemode ? "(attribute_not_exists(livemode) OR livemode <> :lm)" : "livemode <> :lm");
+
 // A customer belongs to one org for good: relinking it to another would send that customer's billing events to the wrong org.
-export async function linkCustomer(orgId: string, customerId: string): Promise<void> {
+export async function linkCustomer(orgId: string, customerId: string, livemode: boolean): Promise<void> {
 	try {
 		await ddb.send(
 			new PutCommand({
 				TableName: table(),
-				Item: { ...customerKey(customerId), org_id: orgId },
+				Item: { ...customerKey(customerId), org_id: orgId, livemode },
 				ConditionExpression: "attribute_not_exists(pk) OR org_id = :org",
 				ExpressionAttributeValues: { ":org": orgId },
 			}),
@@ -136,6 +143,9 @@ const conditionFailedAt = (e: unknown, index: number) => {
 };
 
 const LIVE = new Set(["active", "trialing", "past_due"]);
+// Statuses in which Stripe still holds the subscription open and may charge (or try to charge) the
+// customer: the live ones, plus unpaid and incomplete, which only the Customer Portal resolves.
+export const HOLDS_SUBSCRIPTION: ReadonlySet<string> = new Set([...LIVE, "unpaid", "incomplete"]);
 const TERMINAL = new Set(["canceled", "unpaid", "incomplete_expired"]);
 
 export interface ApplyResult {
@@ -165,7 +175,12 @@ export async function applySubscription(
 
 // Returns null when the spend cap changed under us and a fresh read may still succeed.
 async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: number, mayRetry: boolean, expectedSubscriptionId?: string): Promise<ApplyResult | null> {
-	const [previous, profile] = await Promise.all([getBilling(orgId), getProfile(orgId)]);
+	const [stored, profile] = await Promise.all([getBilling(orgId), getProfile(orgId)]);
+	// BILLING left by the other Stripe mode (test, after the switch to live) describes a customer and
+	// subscription this one can't see: its cap, counters and owed periods are dropped, not carried over.
+	const livemode = sub ? sub.livemode === true : undefined;
+	const otherMode = !!stored && livemode !== undefined && !sameMode(stored, livemode ? "live" : "test");
+	const previous = otherMode ? null : stored;
 	// A late event for an old subscription (say its final invoice after a cancel and resubscribe) is
 	// re-fetched as canceled; applying it would downgrade the org's newer live subscription.
 	if (previous?.subscription_id && sub && sub.id !== previous.subscription_id && LIVE.has(previous.status) && TERMINAL.has(sub.status)) {
@@ -231,20 +246,28 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 				TableName: table(),
 				Key: billingKey(orgId),
 				// limits above were derived from the cap we read; if the console changed it since, redo the read.
-				// A deletion also needs the org to still be on the subscription that was deleted.
-				ConditionExpression:
-					"(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)" +
-					(guardDeletion
-						? " AND (attribute_not_exists(subscription_id) OR attribute_type(subscription_id, :nullType) OR subscription_id = :expected)"
-						: ""),
-				// The cap and the meter's counters belong to other writers, so they are only initialised here.
+				// A deletion also needs the org to still be on the subscription that was deleted. Replacing an
+				// other-mode record only needs it to still be one.
+				ConditionExpression: otherMode
+					? otherModeCondition(livemode!)
+					: // A stored NULL never equals :readCap, so "no cap" is matched by type, not value.
+						(readCap === null ? "(attribute_not_exists(spend_cap_usd) OR attribute_type(spend_cap_usd, :nullType))" : "(attribute_not_exists(spend_cap_usd) OR spend_cap_usd = :readCap)") +
+						(guardDeletion
+							? " AND (attribute_not_exists(subscription_id) OR attribute_type(subscription_id, :nullType) OR subscription_id = :expected)"
+							: ""),
+				// The cap and the meter's counters belong to other writers, so they are only initialised here
+				// (or reset, over an other-mode record).
 				UpdateExpression:
 					"SET customer_id = :cus, subscription_id = :sub, #s = :status, #p = :plan, current_period_start = :cps, current_period_end = :cpe, " +
 					"cancel_at_period_end = :cancel, past_due_since = :pd, org_id = :org, " +
-					"spend_cap_usd = if_not_exists(spend_cap_usd, :cap), reported_events = if_not_exists(reported_events, :zero), reported_period = if_not_exists(reported_period, :none)" +
+					(otherMode
+						? "spend_cap_usd = :cap, reported_events = :zero, reported_period = :none"
+						: "spend_cap_usd = if_not_exists(spend_cap_usd, :cap), reported_events = if_not_exists(reported_events, :zero), reported_period = if_not_exists(reported_period, :none)") +
 					// An older period still owed keeps its place: the meter settles it first.
-					(flushDue ? ", flush_due = if_not_exists(flush_due, :fd)" : ""),
-				ExpressionAttributeNames: { "#s": "status", "#p": "plan" },
+					(flushDue ? ", flush_due = if_not_exists(flush_due, :fd)" : "") +
+					(livemode !== undefined ? ", livemode = :lm" : "") +
+					(otherMode ? " REMOVE #pend, flush_due" : ""),
+				ExpressionAttributeNames: { "#s": "status", "#p": "plan", ...(otherMode ? { "#pend": "pending" } : {}) },
 				ExpressionAttributeValues: {
 					":org": orgId,
 					":cus": customerId,
@@ -256,10 +279,11 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 					":cancel": sub?.cancel_at_period_end ?? false,
 					":pd": pastDueSince,
 					":cap": null,
-					":readCap": readCap,
+					...(otherMode ? {} : readCap === null ? { ":nullType": "NULL" } : { ":readCap": readCap }),
 					":zero": 0,
 					":none": null,
-					...(guardDeletion ? { ":nullType": "NULL", ":expected": expectedSubscriptionId } : {}),
+					...(livemode !== undefined ? { ":lm": livemode } : {}),
+					...(guardDeletion && !otherMode ? { ":nullType": "NULL", ":expected": expectedSubscriptionId } : {}),
 					...(flushDue ? { ":fd": flushDue } : {}),
 				},
 			},
@@ -277,11 +301,54 @@ async function tryApply(orgId: string, sub: Stripe.Subscription | null, now: num
 	return { plan, periodChanged, previous, applied: true };
 }
 
+// One Stripe customer per org from the first Checkout on: records the customer on BILLING (creating the item
+// if the webhook hasn't yet) unless one is already there, and returns whichever id won, so two racing
+// checkouts end up on the same customer. The item is created in a state nothing treats as live (status
+// "none", no subscription), so the meter, the webhook's stale-subscription guard and the plan logic skip it.
+// A customer from the other Stripe mode doesn't count as one: the record is replaced with an inert one.
+export async function rememberCustomer(orgId: string, customerId: string, livemode: boolean): Promise<string> {
+	try {
+		await ddb.send(
+			new UpdateCommand({
+				TableName: table(),
+				Key: billingKey(orgId),
+				ConditionExpression: `attribute_exists(customer_id) AND ${otherModeCondition(livemode)}`,
+				UpdateExpression:
+					"SET customer_id = :cus, org_id = :org, #s = :none, #p = :free, subscription_id = :null, current_period_start = :null, " +
+					"current_period_end = :null, cancel_at_period_end = :false, spend_cap_usd = :null, past_due_since = :null, " +
+					"reported_events = :zero, reported_period = :null, livemode = :lm REMOVE #pend, flush_due",
+				ExpressionAttributeNames: { "#s": "status", "#p": "plan", "#pend": "pending" },
+				ExpressionAttributeValues: { ":cus": customerId, ":org": orgId, ":none": "none", ":free": "free", ":null": null, ":false": false, ":zero": 0, ":lm": livemode },
+			}),
+		);
+		return customerId;
+	} catch (e) {
+		// No record, or one from this mode: the ordinary first-writer-wins path below.
+		if ((e as { name?: string }).name !== "ConditionalCheckFailedException") throw e;
+	}
+	const { Attributes } = await ddb.send(
+		new UpdateCommand({
+			TableName: table(),
+			Key: billingKey(orgId),
+			UpdateExpression:
+				"SET customer_id = if_not_exists(customer_id, :cus), org_id = :org, #s = if_not_exists(#s, :none), #p = if_not_exists(#p, :free), " +
+				"subscription_id = if_not_exists(subscription_id, :null), current_period_start = if_not_exists(current_period_start, :null), " +
+				"current_period_end = if_not_exists(current_period_end, :null), cancel_at_period_end = if_not_exists(cancel_at_period_end, :false), " +
+				"spend_cap_usd = if_not_exists(spend_cap_usd, :null), past_due_since = if_not_exists(past_due_since, :null), " +
+				"reported_events = if_not_exists(reported_events, :zero), reported_period = if_not_exists(reported_period, :null), livemode = if_not_exists(livemode, :lm)",
+			ExpressionAttributeNames: { "#s": "status", "#p": "plan" },
+			ExpressionAttributeValues: { ":cus": customerId, ":org": orgId, ":none": "none", ":free": "free", ":null": null, ":false": false, ":zero": 0, ":lm": livemode },
+			ReturnValues: "ALL_NEW",
+		}),
+	);
+	return (Attributes?.customer_id as string | undefined) ?? customerId;
+}
+
 // The console's spend cap: BILLING keeps the cap and PROFILE the monthly limit derived from it, written together
 // so ingest never enforces a limit the cap no longer matches. Conditioned on the plan the caller read, so a
 // downgrade that landed meanwhile isn't overwritten with a paid limit. False means a condition failed (the
 // plan moved, or there is no BILLING item) and the caller should re-read.
-export async function setSpendCap(orgId: string, plan: Exclude<PlanId, "free">, capUsd: number | null): Promise<boolean> {
+export async function setSpendCap(orgId: string, plan: "team" | "pro", capUsd: number | null): Promise<boolean> {
 	try {
 		await ddb.send(
 			new TransactWriteCommand({

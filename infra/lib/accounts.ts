@@ -100,7 +100,10 @@ export class Accounts extends Construct {
 		});
 
 		// ---- Console --------------------------------------------------------------
-		this.consoleFn = props.fn("ConsoleFn", "console/handler.ts", { timeout: Duration.seconds(10) });
+		// The billing routes call Stripe, so the console gets just under API Gateway's 30 s integration
+		// limit. That covers the common slow call, not every retry chain: the SDK's worst case (10 s x 3
+		// attempts plus backoff) can still exceed 30 s, and the caller then sees a 503.
+		this.consoleFn = props.fn("ConsoleFn", "console/handler.ts", { timeout: Duration.seconds(29) });
 		this.consoleFn.addEnvironment("ACCOUNTS_TABLE", props.accounts.tableName);
 		this.consoleFn.addEnvironment("TENANTS_TABLE", props.keyIndex.tableName);
 		this.consoleFn.addEnvironment("QUOTAS_TABLE", props.quotas.tableName);
@@ -157,7 +160,7 @@ export class Accounts extends Construct {
 			treatMissingData: TreatMissingData.NOT_BREACHING,
 		}).addAlarmAction(notify);
 
-		const capHit = (cap: "orgs" | "judge") =>
+		const capHit = (cap: "orgs" | "judge" | "judge_paid") =>
 			new Metric({
 				namespace: "Tracewise/Limits",
 				metricName: "GlobalCapHit",
@@ -168,6 +171,14 @@ export class Accounts extends Construct {
 		new Alarm(this, "GlobalOrgCap", {
 			alarmDescription: "The service-wide cap on new orgs per day was hit: sign-ups are being turned away",
 			metric: capHit("orgs"),
+			threshold: 1,
+			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+			evaluationPeriods: 1,
+			treatMissingData: TreatMissingData.NOT_BREACHING,
+		}).addAlarmAction(notify);
+		new Alarm(this, "GlobalPaidJudgeCap", {
+			alarmDescription: "Paid orgs' nightly judge allowances were scaled down to fit the 1,000-call ceiling: time for the Distributed Map follow-up",
+			metric: capHit("judge_paid"),
 			threshold: 1,
 			comparisonOperator: ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
 			evaluationPeriods: 1,

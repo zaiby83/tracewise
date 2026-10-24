@@ -21,6 +21,10 @@ export const FREE_LIMITS: Limits = PLANS.free.limits;
 export const MAX_OWNED_ORGS = 3;
 export const GLOBAL_ORGS_PER_DAY = 100;
 export const GLOBAL_JUDGE_CALLS_PER_NIGHT = 2000;
+// Ceiling on the judge calls paid, custom and legacy orgs share in one night. The nightly run is one
+// Step Functions standard execution, whose 25,000-event history the per-call states would outgrow well
+// before every Pro org's 500 samples fit. A Distributed Map (the eval-scaling follow-up) removes it.
+export const PAID_JUDGE_CALLS_PER_NIGHT = 1000;
 export const INVITE_TTL_DAYS = 7;
 
 // Tenants that existed before self-serve keep today's behaviour: the free defaults would

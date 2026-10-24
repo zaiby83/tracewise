@@ -5,7 +5,8 @@ import { ddb } from "../shared/ddb";
 import { log } from "../shared/http";
 import { periodBounds } from "./plans";
 import { clampTimestamp, periodKey, reportOrgUsage } from "./meter";
-import { getStripe } from "./stripe";
+import { sameMode } from "./mode";
+import { getStripe, stripeMode } from "./stripe";
 import { applySubscription, clearFlushDue, getBilling, type BillingRecord } from "./subscriptions";
 
 const cloudwatch = new CloudWatchClient({});
@@ -125,7 +126,12 @@ async function meterOrg(b: BillingRecord, periodStart: string, now: number): Pro
 
 export async function handler(): Promise<void> {
 	const now = Date.now();
-	const billings = await liveBilling();
+	// Records from the other Stripe mode (test mode's, once the key is live) name customers this key can't
+	// see: Stripe would reject their events, and a test subscription bills nobody.
+	const mode = await stripeMode();
+	const scanned = await liveBilling();
+	const billings = scanned.filter((b) => sameMode(b, mode));
+	if (billings.length < scanned.length) log("info", "skipped billing records from the other Stripe mode", { orgs: scanned.length - billings.length });
 	let reported = 0;
 	let meterFailures = 0;
 

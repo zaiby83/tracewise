@@ -86,6 +86,8 @@ export async function render(root, ctx) {
 			{ class: "card danger-zone" },
 			cardHead("Danger zone"),
 			el("p", {}, "Deleting the organization removes its keys, traces and members for good. This can't be undone."),
+			// The API refuses while a subscription is open: deleting the org doesn't stop Stripe charging it.
+			el("p", { class: "hint" }, "On a paid plan? Cancel your subscription in Manage billing on the Billing page first."),
 			field(`Type "${org.name}" to confirm`, confirm),
 			failed,
 			el("div", { class: "actions start" }, remove),

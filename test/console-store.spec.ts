@@ -68,6 +68,13 @@ describe("updateProfile", () => {
 		expect(Object.values(input.ExpressionAttributeValues!)).toEqual([null, false]);
 		expect(sent(TransactWriteCommand)).toHaveLength(0);
 	});
+	it("removes the named period fields in the same update", async () => {
+		fresh().mockResolvedValueOnce({ Attributes: { org_id: "o1", plan: "custom" } });
+		await updateProfile("o1", { plan: "custom", remove: ["period_start", "period_end"] });
+		const input = sent(UpdateCommand)[0]!.input;
+		expect(input.UpdateExpression).toBe("SET #plan = :plan REMOVE period_start, period_end");
+		expect(input.ExpressionAttributeValues).toEqual({ ":plan": "custom" });
+	});
 	it("renaming updates org_name on every member's USER item", async () => {
 		fresh()
 			.mockResolvedValueOnce({ Items: [{ sub: "u1" }, { sub: "u2" }] }) // listMembers

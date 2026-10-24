@@ -7,7 +7,8 @@ const stripe = vi.hoisted(() => ({
 	billing: { meterEvents: { create: vi.fn() } },
 	subscriptions: { retrieve: vi.fn() },
 }));
-vi.mock("../services/billing/stripe", () => ({ getStripe: async () => stripe }));
+const mode = vi.hoisted(() => ({ current: "test" as "test" | "live" }));
+vi.mock("../services/billing/stripe", () => ({ getStripe: async () => stripe, stripeMode: async () => mode.current }));
 const cw = vi.hoisted(() => ({ send: vi.fn() }));
 vi.mock("@aws-sdk/client-cloudwatch", () => ({
 	CloudWatchClient: class {
@@ -87,11 +88,12 @@ function world(counters: Record<string, number>, initial: Billing[] = [], opts: 
 	subs.applySubscription.mockReset();
 	cw.send.mockReset();
 	cw.send.mockResolvedValue({});
+	mode.current = "test";
 	return { state, events };
 }
 const sent = () => stripe.billing.meterEvents.create.mock.calls.map(([p]) => p);
 const metrics = () => Object.fromEntries((cw.send.mock.calls[0]?.[0].input.MetricData ?? []).map((m: { MetricName: string; Value: number }) => [m.MetricName, m.Value]));
-const reportedKey = { "o1#month#2026-10-15": 750_000 };
+const reportedKey = { "o1#paid#2026-10-15": 750_000 };
 
 afterEach(() => vi.useRealTimers());
 
@@ -131,7 +133,7 @@ describe("reportOrgUsage", () => {
 	});
 
 	it("starts from zero when the period changed", async () => {
-		world({ "o1#month#2026-10-15": 40_000 }, [billing({ reported_period: "2026-09-15", reported_events: 900_000 })]);
+		world({ "o1#paid#2026-10-15": 40_000 }, [billing({ reported_period: "2026-09-15", reported_events: 900_000 })]);
 		const res = await reportOrgUsage(billing({ reported_period: "2026-09-15", reported_events: 900_000 }), { periodStart: "2026-10-15", timestamp: 1 });
 		expect(res).toEqual({ sent: 40_000 });
 		expect(sent()[0].payload.value).toBe("40000");
@@ -139,13 +141,13 @@ describe("reportOrgUsage", () => {
 
 	it("starts from zero when nothing was ever reported", async () => {
 		const b = billing({ reported_period: null, reported_events: 0 });
-		const { state } = world({ "o1#month#2026-10-15": 7 }, [b]);
+		const { state } = world({ "o1#paid#2026-10-15": 7 }, [b]);
 		expect(await reportOrgUsage(b, { periodStart: "2026-10-15", timestamp: 1 })).toEqual({ sent: 7 });
 		expect(state.get("o1")!.reported_period).toBe("2026-10-15");
 	});
 
 	it("sends nothing when there's nothing new", async () => {
-		world({ "o1#month#2026-10-15": 500_000 }, [billing()]);
+		world({ "o1#paid#2026-10-15": 500_000 }, [billing()]);
 		expect(await reportOrgUsage(billing(), { periodStart: "2026-10-15", timestamp: 1 })).toEqual({ sent: 0 });
 		expect(stripe.billing.meterEvents.create).not.toHaveBeenCalled();
 		expect(ddb.send.mock.calls.filter(([c]) => c instanceof UpdateCommand)).toHaveLength(0);
@@ -153,7 +155,7 @@ describe("reportOrgUsage", () => {
 
 	it("flushes the previous period with a timestamp inside it", async () => {
 		const b = billing({ reported_period: "2026-09-15", reported_events: 600_000 });
-		world({ "o1#month#2026-09-15": 620_000 }, [b]);
+		world({ "o1#paid#2026-09-15": 620_000 }, [b]);
 		const periodEnd = Date.parse("2026-10-15T00:00:00Z") / 1000;
 		expect(await reportOrgUsage(b, { periodStart: "2026-09-15", timestamp: periodEnd - 1 })).toEqual({ sent: 20_000 });
 		expect(sent()[0]).toMatchObject({ timestamp: periodEnd - 1, identifier: "o1:2026-09-15:620000" });
@@ -170,7 +172,7 @@ describe("reportOrgUsage", () => {
 
 	it("does not resend a finished period when reported_period is already newer", async () => {
 		const b = billing({ reported_period: "2026-10-15", reported_events: 1_000 });
-		world({ "o1#month#2026-09-15": 620_000 }, [b]);
+		world({ "o1#paid#2026-09-15": 620_000 }, [b]);
 		expect(await reportOrgUsage(b, { periodStart: "2026-09-15", timestamp: 1 })).toEqual({ sent: 0 });
 		expect(stripe.billing.meterEvents.create).not.toHaveBeenCalled();
 		expect(ddb.send).not.toHaveBeenCalled();
@@ -186,7 +188,7 @@ describe("reportOrgUsage", () => {
 
 	it("refuses a stale writer, so BILLING never moves back to an older period", async () => {
 		// The meter has advanced to October; a flush holding an old read still shows September.
-		const { state } = world({ "o1#month#2026-09-15": 620_000 }, [billing({ reported_period: "2026-10-15", reported_events: 3_000 })]);
+		const { state } = world({ "o1#paid#2026-09-15": 620_000 }, [billing({ reported_period: "2026-10-15", reported_events: 3_000 })]);
 		const stale = billing({ reported_period: "2026-09-15", reported_events: 600_000 });
 		await expect(reportOrgUsage(stale, { periodStart: "2026-09-15", timestamp: 1 })).resolves.toEqual({ sent: 0 });
 		expect(stripe.billing.meterEvents.create).not.toHaveBeenCalled();
@@ -195,7 +197,7 @@ describe("reportOrgUsage", () => {
 
 	it("refuses a writer whose view predates a pending claim", async () => {
 		const pending = { identifier: "o1:2026-10-15:750000", value: "250000", timestamp: 1, period: "2026-10-15" };
-		world({ "o1#month#2026-10-15": 800_000 }, [billing({ reported_events: 750_000, pending })]);
+		world({ "o1#paid#2026-10-15": 800_000 }, [billing({ reported_events: 750_000, pending })]);
 		await expect(reportOrgUsage(billing(), { periodStart: "2026-10-15", timestamp: 1 })).resolves.toEqual({ sent: 0 });
 		expect(stripe.billing.meterEvents.create).not.toHaveBeenCalled();
 	});
@@ -214,7 +216,7 @@ describe("reportOrgUsage", () => {
 		expect(state.get("o1")).toMatchObject({ reported_events: 750_000 });
 
 		// Next run: the counter has moved on, and the view comes from BILLING.
-		world({ "o1#month#2026-10-15": 760_000 }, [state.get("o1")!]);
+		world({ "o1#paid#2026-10-15": 760_000 }, [state.get("o1")!]);
 		const next = await reportOrgUsage(state.get("o1")!, { periodStart: "2026-10-15", timestamp: 1_700_003_600 });
 		expect(sent().map((p) => [p.identifier, p.payload.value, p.timestamp])).toEqual([
 			["o1:2026-10-15:750000", "250000", 1_700_000_000],
@@ -227,7 +229,7 @@ describe("reportOrgUsage", () => {
 	it("clears the pending claim after re-sending it, before claiming anything new", async () => {
 		const pending = { identifier: "o1:2026-10-15:750000", value: "250000", timestamp: 5, period: "2026-10-15" };
 		const b = billing({ reported_events: 750_000, pending });
-		const { state, events } = world({ "o1#month#2026-10-15": 760_000 }, [b]);
+		const { state, events } = world({ "o1#paid#2026-10-15": 760_000 }, [b]);
 		await reportOrgUsage(b, { periodStart: "2026-10-15", timestamp: 9 });
 		expect(events).toEqual(["send", "clear", "claim", "send", "clear"]);
 		expect(state.get("o1")!.pending).toBeUndefined();
@@ -237,7 +239,7 @@ describe("reportOrgUsage", () => {
 	it("treats Stripe's duplicate-identifier refusal on a re-send as delivered", async () => {
 		const pending = { identifier: "o1:2026-10-15:750000", value: "250000", timestamp: 5, period: "2026-10-15" };
 		const b = billing({ reported_events: 750_000, pending });
-		const { state } = world({ "o1#month#2026-10-15": 750_000 }, [b]);
+		const { state } = world({ "o1#paid#2026-10-15": 750_000 }, [b]);
 		stripe.billing.meterEvents.create.mockRejectedValueOnce(duplicate());
 		await expect(reportOrgUsage(b, { periodStart: "2026-10-15", timestamp: 9 })).resolves.toEqual({ sent: 250_000 });
 		expect(state.get("o1")!.pending).toBeUndefined();
@@ -246,7 +248,7 @@ describe("reportOrgUsage", () => {
 	it("keeps the claim when a re-send fails for any other reason", async () => {
 		const pending = { identifier: "o1:2026-10-15:750000", value: "250000", timestamp: 5, period: "2026-10-15" };
 		const b = billing({ reported_events: 750_000, pending });
-		const { state } = world({ "o1#month#2026-10-15": 900_000 }, [b]);
+		const { state } = world({ "o1#paid#2026-10-15": 900_000 }, [b]);
 		stripe.billing.meterEvents.create.mockRejectedValue(Object.assign(new Error("Too many requests"), { type: "StripeRateLimitError", statusCode: 429 }));
 		await expect(reportOrgUsage(b, { periodStart: "2026-10-15", timestamp: 9 })).rejects.toThrow("Too many");
 		expect(state.get("o1")!.pending).toBeDefined();
@@ -273,7 +275,7 @@ describe("clampTimestamp", () => {
 
 describe("meter handler", () => {
 	const org = (id: string, over: object = {}) => billing({ org_id: id, customer_id: `cus_${id}`, reported_events: 0, ...over });
-	const counters = { "a#month#2026-10-15": 5, "b#month#2026-10-15": 6, "c#month#2026-10-15": 7 };
+	const counters = { "a#paid#2026-10-15": 5, "b#paid#2026-10-15": 6, "c#paid#2026-10-15": 7 };
 
 	it("scans live BILLING items and reports each org for its own period", async () => {
 		world(counters, [org("a"), org("b")]);
@@ -297,6 +299,23 @@ describe("meter handler", () => {
 		expect(scan.input.ExpressionAttributeNames).toEqual({ "#s": "status", "#pend": "pending" });
 	});
 
+	it("skips records from the other Stripe mode: a test customer means nothing to a live key", async () => {
+		world(counters, [org("a", { livemode: false }), org("b"), org("c", { livemode: true })]);
+		mode.current = "live";
+		const log = vi.spyOn(console, "info").mockImplementation(() => {});
+		await handler();
+		expect(sent().map((p) => p.payload.stripe_customer_id)).toEqual(["cus_c"]);
+		expect(metrics()).toMatchObject({ MeterOrgsReported: 1, MeterFailures: 0 });
+		expect(log.mock.calls.map((c) => JSON.parse(String(c[0])))).toContainEqual({ level: "info", msg: "skipped billing records from the other Stripe mode", orgs: 2 });
+		log.mockRestore();
+	});
+
+	it("meters test-mode records while the key is a test key", async () => {
+		world(counters, [org("a", { livemode: false }), org("b")]);
+		await handler();
+		expect(stripe.billing.meterEvents.create).toHaveBeenCalledTimes(2);
+	});
+
 	describe("flush_due", () => {
 		const month = new Date().toISOString().slice(0, 8) + "01";
 		const flushDue = { period: "2026-09-15", period_end: "2026-10-15T00:00:00Z" };
@@ -306,13 +325,13 @@ describe("meter handler", () => {
 		it("reports a canceled org's final period, clears the marker, and never reads the calendar month", async () => {
 			vi.useFakeTimers({ toFake: ["Date"] });
 			vi.setSystemTime(new Date("2026-10-23T10:00:00Z"));
-			const { state, events } = world({ "a#month#2026-09-15": 250, [`a#month#${month}`]: 30_000 }, [canceled({ current_period_start: null, current_period_end: null })]);
+			const { state, events } = world({ "a#paid#2026-09-15": 250, [`a#paid#${month}`]: 30_000 }, [canceled({ current_period_start: null, current_period_end: null })]);
 			await handler();
 			expect(sent().map((p) => [p.identifier, p.payload.value, p.timestamp])).toEqual([["a:2026-09-15:250", "150", Date.parse("2026-10-15T00:00:00Z") / 1000 - 1]]);
 			expect(events).toEqual(["claim", "send", "clear", "clearDue"]);
 			expect(state.get("a")!.flush_due).toBeUndefined();
 			const windows = ddb.send.mock.calls.map(([c]) => c.input?.Key?.window).filter(Boolean);
-			expect(windows).toEqual(["a#month#2026-09-15"]);
+			expect(windows).toEqual(["a#paid#2026-09-15"]);
 		});
 
 		it("settles it before the live period, for an org that rolled over", async () => {
@@ -322,7 +341,7 @@ describe("meter handler", () => {
 				reported_period: "2026-09-15", reported_events: 100, flush_due: flushDue,
 				current_period_start: "2026-10-15T00:00:00.000Z", current_period_end: "2026-11-15T00:00:00.000Z",
 			});
-			const { state, events } = world({ "a#month#2026-09-15": 250, "a#month#2026-10-15": 40 }, [b]);
+			const { state, events } = world({ "a#paid#2026-09-15": 250, "a#paid#2026-10-15": 40 }, [b]);
 			await handler();
 			expect(sent().map((p) => p.identifier)).toEqual(["a:2026-09-15:250", "a:2026-10-15:40"]);
 			expect(events.indexOf("clearDue")).toBeLessThan(events.lastIndexOf("claim"));
@@ -330,7 +349,7 @@ describe("meter handler", () => {
 		});
 
 		it("keeps the marker when the report fails, so the next run tries again", async () => {
-			const { state } = world({ "a#month#2026-09-15": 250 }, [canceled()]);
+			const { state } = world({ "a#paid#2026-09-15": 250 }, [canceled()]);
 			stripe.billing.meterEvents.create.mockRejectedValue(new Error("boom"));
 			await expect(handler()).rejects.toThrow("all 1 orgs");
 			expect(state.get("a")!.flush_due).toEqual(flushDue);
@@ -339,14 +358,14 @@ describe("meter handler", () => {
 
 		it("sends only a pending claim for a canceled org, never a new period", async () => {
 			const pending = { identifier: "a:2026-09-15:9", value: "9", timestamp: 77, period: "2026-09-15" };
-			const { state } = world({ "a#month#2026-09-15": 9, [`a#month#${month}`]: 500 }, [canceled({ flush_due: undefined, reported_events: 9, pending })]);
+			const { state } = world({ "a#paid#2026-09-15": 9, [`a#paid#${month}`]: 500 }, [canceled({ flush_due: undefined, reported_events: 9, pending })]);
 			await handler();
 			expect(sent().map((p) => [p.identifier, p.timestamp])).toEqual([["a:2026-09-15:9", 77]]);
 			expect(state.get("a")!.pending).toBeUndefined();
 		});
 
 		it("leaves a canceled org with nothing owed alone", async () => {
-			world({ [`a#month#${month}`]: 500 }, [canceled({ flush_due: undefined })]);
+			world({ [`a#paid#${month}`]: 500 }, [canceled({ flush_due: undefined })]);
 			await handler();
 			expect(stripe.billing.meterEvents.create).not.toHaveBeenCalled();
 		});
@@ -360,7 +379,7 @@ describe("meter handler", () => {
 
 	it("uses the calendar month only when BILLING has no period dates, as ingest does then", async () => {
 		const month = new Date().toISOString().slice(0, 8) + "01";
-		world({ [`a#month#${month}`]: 3 }, [org("a", { current_period_start: null, current_period_end: null, reported_period: null })]);
+		world({ [`a#paid#${month}`]: 3 }, [org("a", { current_period_start: null, current_period_end: null, reported_period: null })]);
 		await handler();
 		expect(sent()[0].identifier).toBe(`a:${month}:3`);
 	});
@@ -389,7 +408,7 @@ describe("meter handler", () => {
 
 	it("never runs more than 5 orgs at once", async () => {
 		const items = Array.from({ length: 12 }, (_, i) => org(`o${i}`));
-		world(Object.fromEntries(items.map((b) => [`${b.org_id}#month#2026-10-15`, 1])), items);
+		world(Object.fromEntries(items.map((b) => [`${b.org_id}#paid#2026-10-15`, 1])), items);
 		let running = 0;
 		let peak = 0;
 		stripe.billing.meterEvents.create.mockImplementation(async () => {
@@ -411,7 +430,7 @@ describe("meter handler", () => {
 
 	it("re-sends a claim left pending by an earlier run before anything new", async () => {
 		const pending = { identifier: "a:2026-10-15:5", value: "5", timestamp: 77, period: "2026-10-15" };
-		const { state } = world({ "a#month#2026-10-15": 9 }, [org("a", { reported_events: 5, pending })]);
+		const { state } = world({ "a#paid#2026-10-15": 9 }, [org("a", { reported_events: 5, pending })]);
 		await handler();
 		expect(sent().map((p) => [p.identifier, p.payload.value, p.timestamp])).toEqual([
 			["a:2026-10-15:5", "5", 77],
@@ -423,7 +442,7 @@ describe("meter handler", () => {
 	it("meters a grace-expired org on its Stripe period, never the Free calendar month", async () => {
 		const month = new Date().toISOString().slice(0, 8) + "01";
 		const b = org("a", { plan: "free", status: "past_due", past_due_since: new Date(Date.now() - 9 * 86_400_000).toISOString(), reported_events: 400_000 });
-		const { state } = world({ "a#month#2026-10-15": 450_000, [`a#month#${month}`]: 30_000 }, [b]);
+		const { state } = world({ "a#paid#2026-10-15": 450_000, [`a#paid#${month}`]: 30_000 }, [b]);
 		await handler();
 		expect(sent().map((p) => [p.identifier, p.payload.value])).toEqual([["a:2026-10-15:450000", "50000"]]);
 		expect(state.get("a")).toMatchObject({ reported_period: "2026-10-15", reported_events: 450_000 });
@@ -431,7 +450,7 @@ describe("meter handler", () => {
 		await handler();
 		expect(sent()).toHaveLength(1);
 		const windows = ddb.send.mock.calls.map(([c]) => c.input?.Key?.window).filter(Boolean);
-		expect(windows).not.toContain(`a#month#${month}`);
+		expect(windows).not.toContain(`a#paid#${month}`);
 	});
 
 	describe("event timestamps", () => {
@@ -440,7 +459,7 @@ describe("meter handler", () => {
 		it("never stamps a late event after its period's end", async () => {
 			vi.useFakeTimers({ toFake: ["Date"] });
 			vi.setSystemTime(new Date("2026-11-15T00:40:00Z"));
-			world({ "a#month#2026-10-15": 5 }, [org("a")]);
+			world({ "a#paid#2026-10-15": 5 }, [org("a")]);
 			await handler();
 			expect(sent()[0].timestamp).toBe(endSeconds - 1);
 		});
@@ -448,7 +467,7 @@ describe("meter handler", () => {
 		it("uses the current time inside the period", async () => {
 			vi.useFakeTimers({ toFake: ["Date"] });
 			vi.setSystemTime(new Date("2026-10-23T10:00:00Z"));
-			world({ "a#month#2026-10-15": 5 }, [org("a")]);
+			world({ "a#paid#2026-10-15": 5 }, [org("a")]);
 			await handler();
 			expect(sent()[0].timestamp).toBe(Date.parse("2026-10-23T10:00:00Z") / 1000);
 		});
@@ -506,7 +525,7 @@ describe("meter handler", () => {
 describe("period rollover", () => {
 	const newStart = Date.parse("2026-10-15T00:00:00Z") / 1000;
 	const old = () => billing({ reported_period: "2026-09-15", reported_events: 600_000 });
-	const counters = { "o1#month#2026-09-15": 620_000, "o1#month#2026-10-15": 3_000 };
+	const counters = { "o1#paid#2026-09-15": 620_000, "o1#paid#2026-10-15": 3_000 };
 
 	it("flushes the old period's remainder, then reports the new one, and ends on the new period", async () => {
 		const { state } = world(counters, [old()]);

@@ -17,6 +17,8 @@ import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
 import { Accounts } from "./accounts";
 import { Analytics } from "./analytics";
+// Aliased: Billing is also DynamoDB's billing-mode class, used for the tables above.
+import { Billing as StripeBilling } from "./billing";
 import { Dashboard } from "./dashboard";
 import { Evals } from "./evals";
 
@@ -32,6 +34,9 @@ export interface TracewiseStackProps extends StackProps {
 	batchSize?: number;
 	// Maximum concurrent processor invocations. Bounded by the account's Lambda limit.
 	processorConcurrency?: number;
+	// Lets owners buy paid plans (Checkout and plan changes). Off by default, so a stack running on test
+	// keys, or one not ready to take payments, never sends anyone to Checkout.
+	billingCheckout?: boolean;
 	// Bedrock model (or cross-region inference profile) that grades sampled traces.
 	judgeModel?: string;
 	// Read-only key the public dashboard uses to show the demo tenant.
@@ -229,6 +234,16 @@ export class TracewiseStack extends Stack {
 			smokeClient: props.smokeClient ?? false,
 		});
 
+		// ---- Billing ----------------------------------------------------------------
+		const billing = new StripeBilling(this, "Billing", {
+			fn,
+			accounts: accountsTable,
+			quotas,
+			alerts: alarms,
+			consoleFn: accounts.consoleFn,
+			checkoutEnabled: props.billingCheckout ?? false,
+		});
+
 		// ---- API --------------------------------------------------------------------
 		const api = new HttpApi(this, "Api", { description: "Tracewise ingest and query API" });
 		api.addRoutes({ path: "/v1/traces", methods: [HttpMethod.POST], integration: new HttpLambdaIntegration("IngestRoute", ingest) });
@@ -240,6 +255,13 @@ export class TracewiseStack extends Stack {
 		});
 		api.addRoutes({ path: "/v1/evals", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("EvalsRoute", evalsApi) });
 		api.addRoutes({ path: "/v1/me", methods: [HttpMethod.GET], integration: new HttpLambdaIntegration("MeRoute", query) });
+		// No authorizer: Stripe calls this directly, and the handler verifies Stripe's signature
+		// over the raw body instead. The billing console routes are JWT, via CONSOLE_ROUTES.
+		api.addRoutes({
+			path: "/v1/stripe/webhook",
+			methods: [HttpMethod.POST],
+			integration: new HttpLambdaIntegration("StripeWebhookRoute", billing.webhookFn),
+		});
 
 		const dashboard = new Dashboard(this, "Dashboard", { api, authDomainUrl: accounts.authDomainUrl });
 		const { clientId, smokeClientId } = accounts.connect(api, `https://${dashboard.distribution.distributionDomainName}`, { query, summary, evalsApi });
@@ -297,6 +319,11 @@ export class TracewiseStack extends Stack {
 		new CfnOutput(this, "ConsoleClientId", { value: clientId });
 		if (smokeClientId) new CfnOutput(this, "SmokeClientId", { value: smokeClientId });
 		new CfnOutput(this, "AccountsTable", { value: accountsTable.tableName });
+		// smoke-billing reads the period counter the meter reports from.
+		new CfnOutput(this, "QuotasTable", { value: quotas.tableName });
 		new CfnOutput(this, "DeletionQueue", { value: accounts.deletionQueue.queueUrl });
+		new CfnOutput(this, "StripeSecretArn", { value: billing.secret.secretArn });
+		// Register this endpoint with Stripe (the API Gateway URL, not CloudFront).
+		new CfnOutput(this, "StripeWebhookUrl", { value: `${api.apiEndpoint}/v1/stripe/webhook` });
 	}
 }

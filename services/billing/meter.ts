@@ -99,7 +99,8 @@ export async function reportOrgUsage(
 	// so an older period is already final: reporting it again would bill it twice.
 	if (reportedPeriod && periodStart < reportedPeriod) return { sent };
 
-	const counter = await readCounter(counterIds.period(view.org_id, periodStart));
+	// Only paid usage is billed, so the meter reads the paid counter whatever plan the org is on now.
+	const counter = await readCounter(counterIds.period(view.org_id, periodStart, true));
 	// reported_events belongs to whichever period was reported last; another period starts over.
 	const base = reportedPeriod === periodStart ? view.reported_events : 0;
 	const delta = counter - base;

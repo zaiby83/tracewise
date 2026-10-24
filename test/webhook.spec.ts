@@ -7,7 +7,8 @@ const retrieve = vi.hoisted(() => vi.fn());
 const real = new Stripe("sk_test_x");
 const stripe = { webhooks: real.webhooks, subscriptions: { retrieve } };
 const SECRET = "whsec_test";
-vi.mock("../services/billing/stripe", () => ({ getStripe: async () => stripe, getWebhookSecret: async () => SECRET }));
+const keys = vi.hoisted(() => ({ getWebhookSecret: vi.fn(), refreshStripeSecret: vi.fn(), stripeMode: vi.fn() }));
+vi.mock("../services/billing/stripe", () => ({ getStripe: async () => stripe, ...keys }));
 const subs = vi.hoisted(() => ({
 	applySubscription: vi.fn(),
 	orgForCustomer: vi.fn(),
@@ -47,7 +48,10 @@ const due = (over: object = {}) => ({ period: "2026-09-15", period_end: "2026-10
 beforeEach(() => {
 	vi.useFakeTimers({ toFake: ["Date"] });
 	vi.setSystemTime(NOW);
-	for (const m of [retrieve, meter.reportOrgUsage, ...Object.values(subs)]) m.mockReset();
+	for (const m of [retrieve, meter.reportOrgUsage, ...Object.values(subs), ...Object.values(keys)]) m.mockReset();
+	keys.getWebhookSecret.mockResolvedValue(SECRET);
+	keys.refreshStripeSecret.mockReturnValue(true);
+	keys.stripeMode.mockResolvedValue("test");
 	subs.recordEventOnce.mockResolvedValue("claimed");
 	subs.orgForCustomer.mockResolvedValue("o1");
 	subs.applySubscription.mockResolvedValue(apply());
@@ -84,6 +88,64 @@ describe("signature", () => {
 		expect(subs.recordEventOnce).not.toHaveBeenCalled();
 		expect(subs.applySubscription).not.toHaveBeenCalled();
 		expect(retrieve).not.toHaveBeenCalled();
+	});
+});
+
+describe("a rotated signing secret", () => {
+	it("re-reads the secret once on a signature mismatch and accepts the event signed with the new one", async () => {
+		keys.getWebhookSecret.mockResolvedValueOnce("whsec_old").mockResolvedValue(SECRET);
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const res = await call(evt("customer.subscription.updated", sub()));
+		expect(res.statusCode).toBe(200);
+		expect(keys.refreshStripeSecret).toHaveBeenCalledTimes(1);
+		expect(keys.getWebhookSecret).toHaveBeenCalledTimes(2);
+		expect(subs.applySubscription).toHaveBeenCalled();
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it("answers 400 and logs the stable rejection line when the new secret doesn't match either", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const payload = evt("customer.subscription.updated", sub());
+		const res = await call(payload, { header: signed(payload, { secret: "whsec_forged" }) });
+		expect(res.statusCode).toBe(400);
+		expect(keys.refreshStripeSecret).toHaveBeenCalledTimes(1);
+		expect(subs.recordEventOnce).not.toHaveBeenCalled();
+		expect(warn.mock.calls.map((c) => JSON.parse(String(c[0])))).toEqual([{ level: "warn", msg: "stripe webhook signature rejected" }]);
+	});
+
+	it("doesn't verify twice when a forced re-read was refused as too soon", async () => {
+		keys.refreshStripeSecret.mockReturnValue(false);
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const payload = evt("customer.subscription.updated", sub());
+		expect((await call(payload, { header: signed(payload, { secret: "whsec_forged" }) })).statusCode).toBe(400);
+		expect(keys.getWebhookSecret).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("test and live mode", () => {
+	it.each([
+		["a test event while the key is live", false, "live"],
+		["a live event while the key is test", true, "test"],
+	])("ignores %s, with a 200 so Stripe stops retrying", async (_name, livemode, mode) => {
+		keys.stripeMode.mockResolvedValue(mode);
+		const info = vi.spyOn(console, "info").mockImplementation(() => {});
+		const payload = JSON.stringify({ ...JSON.parse(evt("customer.subscription.updated", sub())), livemode });
+		const res = await call(payload);
+		expect(res.statusCode).toBe(200);
+		expect(JSON.parse(res.body as string)).toEqual({ ok: true, ignored: "other mode" });
+		expect(subs.recordEventOnce).not.toHaveBeenCalled();
+		expect(subs.applySubscription).not.toHaveBeenCalled();
+		expect(info.mock.calls.map((c) => JSON.parse(String(c[0])))).toEqual([expect.objectContaining({ level: "info", msg: "stripe event from the other mode ignored", event_id: "evt_1" })]);
+	});
+
+	it("handles a live event while the key is live, recording the customer link as live", async () => {
+		keys.stripeMode.mockResolvedValue("live");
+		vi.spyOn(console, "info").mockImplementation(() => {});
+		retrieve.mockResolvedValue(sub({ metadata: { org_id: "o1" }, livemode: true }));
+		const payload = JSON.stringify({ ...JSON.parse(evt("checkout.session.completed", { id: "cs_1", customer: "cus_1", subscription: "sub_1", client_reference_id: "o1" })), livemode: true });
+		expect((await call(payload)).statusCode).toBe(200);
+		expect(subs.linkCustomer).toHaveBeenCalledWith("o1", "cus_1", true);
+		expect(subs.applySubscription).toHaveBeenCalled();
 	});
 });
 
@@ -198,7 +260,7 @@ describe("checkout.session.completed", () => {
 		retrieve.mockResolvedValue(fresh);
 		const res = await call(evt("checkout.session.completed", { client_reference_id: "o1", customer: "cus_1", subscription: "sub_1" }));
 		expect(res.statusCode).toBe(200);
-		expect(subs.linkCustomer).toHaveBeenCalledWith("o1", "cus_1");
+		expect(subs.linkCustomer).toHaveBeenCalledWith("o1", "cus_1", false);
 		expect(retrieve).toHaveBeenCalledWith("sub_1");
 		expect(subs.applySubscription).toHaveBeenCalledWith("o1", fresh, NOW, undefined);
 	});
@@ -206,7 +268,7 @@ describe("checkout.session.completed", () => {
 	it("prefers the org on the re-fetched subscription when the session names none", async () => {
 		retrieve.mockResolvedValue(sub({ metadata: { org_id: "o5" } }));
 		await call(evt("checkout.session.completed", { client_reference_id: null, customer: "cus_1", subscription: "sub_1" }));
-		expect(subs.linkCustomer).toHaveBeenCalledWith("o5", "cus_1");
+		expect(subs.linkCustomer).toHaveBeenCalledWith("o5", "cus_1", false);
 		expect(subs.applySubscription).toHaveBeenCalledWith("o5", expect.anything(), NOW, undefined);
 	});
 
@@ -234,7 +296,7 @@ describe("checkout.session.completed", () => {
 	it("accepts expanded customer and subscription objects", async () => {
 		retrieve.mockResolvedValue(sub());
 		await call(evt("checkout.session.completed", { client_reference_id: "o1", customer: { id: "cus_1" }, subscription: { id: "sub_1" } }));
-		expect(subs.linkCustomer).toHaveBeenCalledWith("o1", "cus_1");
+		expect(subs.linkCustomer).toHaveBeenCalledWith("o1", "cus_1", false);
 		expect(retrieve).toHaveBeenCalledWith("sub_1");
 	});
 

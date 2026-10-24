@@ -9,6 +9,8 @@ export async function stackOutputs(): Promise<Record<string, string>> {
 	if (!outputs.TenantsTable || !outputs.AccountsTable) throw new Error("Tracewise stack not found: deploy it first");
 	process.env.ACCOUNTS_TABLE = outputs.AccountsTable;
 	process.env.TENANTS_TABLE = outputs.TenantsTable;
+	// Absent on a stack deployed before billing; only the billing scripts read it.
+	if (outputs.QuotasTable) process.env.QUOTAS_TABLE = outputs.QuotasTable;
 	if (outputs.DashboardUrl) process.env.CONSOLE_ORIGIN = outputs.DashboardUrl;
 	return outputs;
 }

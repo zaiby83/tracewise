@@ -4,7 +4,7 @@ import { PublishCommand, SNSClient } from "@aws-sdk/client-sns";
 import { GetCommand, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { log } from "../shared/http";
 import { partitionsForDay } from "../shared/keys";
-import { GLOBAL_JUDGE_CALLS_PER_NIGHT, getProfile, legacyLimits, listProfiles } from "../shared/accounts";
+import { GLOBAL_JUDGE_CALLS_PER_NIGHT, PAID_JUDGE_CALLS_PER_NIGHT, getProfile, legacyLimits, listProfiles } from "../shared/accounts";
 import { ddb } from "../shared/ddb";
 import { counterIds } from "../shared/tenants";
 import { DEFAULT_RUBRIC, isRegression, judgeMessages, parseScores, summarize, type Graded } from "./judge-prompt";
@@ -75,20 +75,32 @@ export async function listTenants(input: { day?: string }): Promise<{ tenants: T
 	// doesn't use isn't redistributed. Paid and custom orgs sit outside it, so they neither
 	// shrink the free share nor get shrunk by it. SAMPLE_SIZE still caps what one run judges.
 	const share = Math.floor(GLOBAL_JUDGE_CALLS_PER_NIGHT / Math.max(candidates.filter((c) => c.pooled).length, 1));
-	const tenants = candidates.map(({ limit, pooled, ...c }) => ({
-		...c,
-		day,
-		sample_budget: pooled ? Math.min(limit, share) : Math.min(limit, sampleSize()),
-		sample_limit: limit,
-	}));
+	// Everyone outside the pool together stays under PAID_JUDGE_CALLS_PER_NIGHT: when they ask for more,
+	// each gets the same fraction of what it asked for (rounded down), so the total never exceeds it.
+	// This ceiling exists only for the single execution's history limit; a Distributed Map (the
+	// eval-scaling follow-up) removes it.
+	const paidAsk = candidates.reduce((n, c) => n + (c.pooled ? 0 : Math.min(c.limit, sampleSize())), 0);
+	const paidCapped = paidAsk > PAID_JUDGE_CALLS_PER_NIGHT;
+	const tenants = candidates.map(({ limit, pooled, ...c }) => {
+		const own = Math.min(limit, sampleSize());
+		return {
+			...c,
+			day,
+			sample_budget: pooled ? Math.min(limit, share) : paidCapped ? Math.floor((own * PAID_JUDGE_CALLS_PER_NIGHT) / paidAsk) : own,
+			sample_limit: limit,
+		};
+	});
 
-	// The metric is about the free pool running short; a paid org trimmed by SAMPLE_SIZE isn't that.
-	if (candidates.some((c, i) => c.pooled && tenants[i]!.sample_budget < tenants[i]!.sample_limit)) {
+	// "judge" is about the free pool running short; a paid org trimmed by SAMPLE_SIZE isn't that.
+	// "judge_paid" is the paid ceiling above binding.
+	const freeShort = candidates.some((c, i) => c.pooled && tenants[i]!.sample_budget < tenants[i]!.sample_limit);
+	const caps = [...(freeShort ? ["judge"] : []), ...(paidCapped ? ["judge_paid"] : [])];
+	if (caps.length > 0) {
 		try {
 			await cloudwatch.send(
 				new PutMetricDataCommand({
 					Namespace: "Tracewise/Limits",
-					MetricData: [{ MetricName: "GlobalCapHit", Dimensions: [{ Name: "Cap", Value: "judge" }], Value: 1, Unit: "Count" }],
+					MetricData: caps.map((cap) => ({ MetricName: "GlobalCapHit", Dimensions: [{ Name: "Cap", Value: cap }], Value: 1, Unit: "Count" as const })),
 				}),
 			);
 		} catch (e) {

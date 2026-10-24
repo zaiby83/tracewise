@@ -121,6 +121,21 @@ describe("counters and quota", () => {
 		const team = { ...free, plan: "team", limits: { ...PLANS.team.limits, monthly_events: 900_000 } };
 		ddb.send.mockReset().mockResolvedValueOnce({}).mockRejectedValueOnce(ccf());
 		expect(await consumeQuota(team, 5)).toBe("spend_cap");
+		// Paid usage has its own counter, so a free month and a paid period starting the same day never share one.
+		expect(sentUpdates()[1]!.input.Key).toEqual({ window: "o1#paid#2026-10-01" });
+	});
+	it("keeps custom orgs on the month counter", async () => {
+		ddb.send.mockReset().mockResolvedValue({});
+		await consumeQuota({ ...tenant, plan: "custom", limits: { ...FREE_LIMITS, monthly_events: null } }, 1);
+		expect(sentUpdates()[1]!.input.Key).toEqual({ window: "o1#month#2026-10-01" });
+	});
+	it("releases from the same counter it consumed from", async () => {
+		const team = { ...tenant, plan: "team", limits: { ...PLANS.team.limits, monthly_events: null }, period_start: "2026-10-15", period_end: "2026-11-15" };
+		ddb.send.mockReset().mockResolvedValue({});
+		await consumeQuota(team, 3);
+		await releaseQuota(team, 3);
+		const keys = sentUpdates().map((u) => u.input.Key.window);
+		expect(keys.slice(1)).toEqual(["o1#paid#2026-10-15", "o1#paid#2026-10-15"]);
 	});
 	it("expires the period counter 40 days after the period ends", async () => {
 		ddb.send.mockReset().mockResolvedValue({});
@@ -169,7 +184,8 @@ describe("counters and quota", () => {
 	});
 	it("names counters by window", () => {
 		const now = Date.parse("2026-10-22T23:59:00Z");
-		expect(counterIds.period("o", "2026-10-15")).toBe("o#month#2026-10-15");
+		expect(counterIds.period("o", "2026-10-15", false)).toBe("o#month#2026-10-15");
+		expect(counterIds.period("o", "2026-10-15", true)).toBe("o#paid#2026-10-15");
 		expect("day" in counterIds).toBe(false);
 		expect(counterIds.athena("o", now)).toBe("o#athena#2026-10-22");
 		expect(counterIds.evals("o", "2026-10-22")).toBe("o#evals#2026-10-22");

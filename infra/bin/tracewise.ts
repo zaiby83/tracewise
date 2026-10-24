@@ -15,6 +15,8 @@ const stack = new TracewiseStack(app, "Tracewise", {
 	batchSize: numberContext(app, "batchSize"),
 	processorConcurrency: numberContext(app, "processorConcurrency"),
 	judgeModel: app.node.tryGetContext("judgeModel"),
+	// `-c billingCheckout=true` lets owners buy paid plans; leave it off until Stripe is live and ready.
+	billingCheckout: app.node.tryGetContext("billingCheckout") === "true",
 	// Read-only key for the public demo dashboard; from the environment, never the repo.
 	dashboardKey: process.env.TRACEWISE_DASHBOARD_KEY,
 	authDomainPrefix: app.node.tryGetContext("authDomainPrefix"),

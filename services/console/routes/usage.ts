@@ -1,4 +1,4 @@
-import { monthlyEventsFor, periodBounds } from "../../billing/plans";
+import { isPaidPlan, monthlyEventsFor, periodBounds } from "../../billing/plans";
 import { json } from "../../shared/http";
 import { counterIds, readCounter } from "../../shared/tenants";
 import type { RouteTable } from "../handler";
@@ -16,7 +16,7 @@ export const usageRoutes: RouteTable = {
 			const yesterday = new Date(now - 86_400_000).toISOString().slice(0, 10);
 			const [minute, events, athena, evals, keys, members, invites] = await Promise.all([
 				readCounter(counterIds.minute(org_id, now)),
-				readCounter(counterIds.period(org_id, period.start)),
+				readCounter(counterIds.period(org_id, period.start, isPaidPlan(profile.plan))),
 				readCounter(counterIds.athena(org_id, now)),
 				readCounter(counterIds.evals(org_id, yesterday)),
 				listKeys(org_id),

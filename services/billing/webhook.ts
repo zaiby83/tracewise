@@ -2,7 +2,8 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "
 import type Stripe from "stripe";
 import { json, log } from "../shared/http";
 import { clampTimestamp, reportOrgUsage } from "./meter";
-import { getStripe, getWebhookSecret } from "./stripe";
+import type { StripeMode } from "./mode";
+import { getStripe, getWebhookSecret, refreshStripeSecret, stripeMode } from "./stripe";
 import { applySubscription, clearFlushDue, completeEvent, forgetEvent, getBilling, linkCustomer, orgForCustomer, recordEventOnce } from "./subscriptions";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -67,7 +68,8 @@ async function dispatch(stripe: Stripe, event: Stripe.Event, now: number): Promi
 			}
 			const orgId = subOrg || session.client_reference_id;
 			if (!orgId || !customerId) return null;
-			await linkCustomer(orgId, customerId);
+			// The handler only lets through events from the key's own mode, so this is that mode.
+			await linkCustomer(orgId, customerId, event.livemode === true);
 			if (fresh) await applyAndFlush(orgId, fresh, now);
 			return orgId;
 		}
@@ -116,22 +118,48 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 	const body = event.body ?? "";
 	const raw = event.isBase64Encoded ? Buffer.from(body, "base64") : body;
 
+	const signature = event.headers?.["stripe-signature"] ?? "";
 	let stripe: Stripe;
 	let stripeEvent: Stripe.Event;
+	let mode: StripeMode;
 	try {
 		stripe = await getStripe();
+		const verify = (secret: string) => {
+			try {
+				return stripe.webhooks.constructEvent(raw, signature, secret);
+			} catch {
+				return null;
+			}
+		};
 		const secret = await getWebhookSecret();
-		try {
-			stripeEvent = stripe.webhooks.constructEvent(raw, event.headers?.["stripe-signature"] ?? "", secret);
-		} catch {
+		let verified = verify(secret);
+		// The signing secret may have been rotated since this instance read it: re-read once before
+		// turning Stripe away. refreshStripeSecret spaces these out, so forged requests can't hammer it.
+		if (!verified && refreshStripeSecret()) {
+			const fresh = await getWebhookSecret();
+			if (fresh !== secret) verified = verify(fresh);
+			// The secret key may have moved with it.
+			stripe = await getStripe();
+		}
+		if (!verified) {
 			// Never log the header or body: they are attacker-controlled and the header is a secret-derived value.
+			// The BillingWebhookSignatureRejected alarm counts this exact line.
 			log("warn", "stripe webhook signature rejected");
 			return json(400, { error: "bad signature" });
 		}
+		stripeEvent = verified;
+		mode = await stripeMode();
 	} catch (e) {
 		// No secret to verify with: Stripe should retry once that is fixed.
 		log("error", "stripe webhook could not be verified", { error: message(e) });
 		return json(500, { error: "webhook error" });
+	}
+
+	// A test-mode endpoint still registered after the switch to live (or the reverse) delivers events for
+	// objects this key can't see. A 200 stops Stripe retrying them.
+	if ((stripeEvent.livemode === true) !== (mode === "live")) {
+		log("info", "stripe event from the other mode ignored", { event_id: stripeEvent.id, type: stripeEvent.type, livemode: stripeEvent.livemode === true });
+		return json(200, { ok: true, ignored: "other mode" });
 	}
 
 	const { id, type } = stripeEvent;

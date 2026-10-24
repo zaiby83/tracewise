@@ -41,6 +41,12 @@ describe("plans", () => {
 		expect(periodBounds({ plan: "pro" }, Date.parse("2026-12-31T23:59:00Z"))).toEqual({ start: "2026-12-01", end: "2027-01-01" });
 		expect(periodBounds({ plan: "custom", period_start: "2026-10-15" }, Date.parse("2026-10-23T00:00:00Z"))).toEqual({ start: "2026-10-01", end: "2026-11-01" });
 	});
+	it("ignores stored period fields on anything but a paid plan, so a custom or free org counts by calendar month", () => {
+		const now = Date.parse("2026-10-23T00:00:00Z");
+		const stored = { period_start: "2026-10-15", period_end: "2026-11-15" };
+		for (const plan of ["custom", "free", "weird"]) expect(periodBounds({ plan, ...stored }, now), plan).toEqual({ start: "2026-10-01", end: "2026-11-01" });
+		expect(periodBounds({ plan: "pro", ...stored }, now)).toEqual({ start: "2026-10-15", end: "2026-11-15" });
+	});
 	it("keeps migrated tenants unlimited per month", () => expect(legacyLimits(6000)).toMatchObject({ events_per_minute: 6000, monthly_events: null }));
 	it.each([
 		["free", undefined, 7], ["team", undefined, 30], ["pro", undefined, 90], ["custom", undefined, 30], ["custom", 365, 365], ["pro", 14, 14], ["weird", undefined, 30],
